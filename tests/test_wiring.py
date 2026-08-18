@@ -80,7 +80,7 @@ def wired(monkeypatch, clock):
     m.config.WAKE_NOTICE_POLICY = "always"
     m.config.FALLBACK_PERSONA_NAME = "Bot"
     m.config.ANSWER_SCOPE = "offeree"
-    m.config.UNCLEAR_ANSWER = "ignore"
+    m.config.URGENT_KEYWORDS = ""
     m.config.MAX_OFFERS_PER_NIGHT = 3
     m.config.OFFER_COOLDOWN_MINUTES = 20
     m.config.SNOOZE_MINUTES = 30
@@ -263,12 +263,21 @@ class TestPersonaName:
 
 class TestWakeContext:
     async def _wake_up(self, plugin_mod, store, ctx):
+        """Call, answer, and then carry on — so the bot is properly awake.
+
+        The third message is what ends the decision round: the model replied,
+        the user said something else, and from here the injection describes an
+        awake bot in the middle of the night rather than one still deciding.
+        """
         await _put_asleep(store)
         await plugin_mod.plugin.on_user_message(
             ctx, ChatMessage(content="醒醒", chat_key=CHAT_KEY)
         )
         await plugin_mod.plugin.on_user_message(
             ctx, ChatMessage(content="要", chat_key=CHAT_KEY)
+        )
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="帮我看个东西", chat_key=CHAT_KEY)
         )
 
     async def test_context_survives_more_than_one_round(self, wired):
@@ -424,7 +433,7 @@ class TestWakeProtocolWiring:
             ctx, ChatMessage(content=text, chat_key=CHAT_KEY)
         )
 
-    async def test_saying_yes_wakes_the_bot(self, wired):
+    async def test_the_second_message_reaches_the_llm(self, wired):
         plugin_mod, store, ctx = wired
         await _put_asleep(store)
 
@@ -432,21 +441,63 @@ class TestWakeProtocolWiring:
         signal = await self._ask(plugin_mod, ctx, "要")
 
         assert signal == MsgSignal.FORCE_TRIGGER
-        assert store.get_cached(CHAT_KEY).status == SleepStatus.AWAKE_EARLY
+        state = store.get_cached(CHAT_KEY)
+        assert state.status == SleepStatus.AWAKE_EARLY
+        assert state.wake_decision_pending is True
 
-    async def test_saying_no_leaves_it_asleep(self, wired):
+    async def test_a_refusal_also_reaches_the_llm(self, wired):
+        """The plugin does not decide what 「算了你睡吧」 meant; the model does."""
         plugin_mod, store, ctx = wired
         await _put_asleep(store)
 
         await self._ask(plugin_mod, ctx)
         signal = await self._ask(plugin_mod, ctx, "算了你睡吧")
 
-        assert signal == MsgSignal.BLOCK_TRIGGER
+        assert signal == MsgSignal.FORCE_TRIGGER
+        assert store.get_cached(CHAT_KEY).wake_decision_pending is True
+        # Still only the question has been sent.
+        assert len(ctx.sent) == 1
+
+    async def test_the_model_declining_is_silent(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+        await self._ask(plugin_mod, ctx)
+        await self._ask(plugin_mod, ctx, "算了你睡吧")
+        ctx.sent.clear()
+
+        await plugin_mod.plugin.sandbox_methods["resume_sleep"](ctx)
+
+        assert ctx.sent == [], "declining the wake must not send anything"
         state = store.get_cached(CHAT_KEY)
         assert state.status == SleepStatus.ASLEEP
         assert state.snooze_until is not None
-        # Only the question was sent; declining gets no reply at all.
+
+    async def test_turning_in_after_a_real_conversation_announces(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+        await self._ask(plugin_mod, ctx)
+        await self._ask(plugin_mod, ctx, "要")
+        # The model replied and the user carried on, ending the decision round.
+        await self._ask(plugin_mod, ctx, "帮我查个东西")
+        ctx.sent.clear()
+
+        await plugin_mod.plugin.sandbox_methods["resume_sleep"](ctx)
+
         assert len(ctx.sent) == 1
+        assert "已睡下" in ctx.sent[0][0]
+
+    async def test_the_decision_round_gets_its_own_instructions(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+        await self._ask(plugin_mod, ctx)
+        await self._ask(plugin_mod, ctx, "嗯？")
+
+        text = await plugin_mod.plugin.prompt_injects["sleep_status"](ctx)
+
+        assert "要不要叫醒你" in text
+        assert "resume_sleep" in text
+        assert "不要输出任何内容" in text
+        assert PERSONA in text
 
     async def test_repeated_calls_do_not_spam_the_chat(self, wired, clock):
         plugin_mod, store, ctx = wired
@@ -464,6 +515,7 @@ class TestWakeProtocolWiring:
 
     async def test_urgent_message_skips_the_handshake(self, wired):
         plugin_mod, store, ctx = wired
+        m.config.URGENT_KEYWORDS = "紧急,急事,救命,出事了"
         await _put_asleep(store)
 
         signal = await self._ask(plugin_mod, ctx, "出事了 快醒醒")
@@ -476,6 +528,7 @@ class TestWakeProtocolWiring:
 
     async def test_urgent_wake_is_reflected_in_the_prompt(self, wired):
         plugin_mod, store, ctx = wired
+        m.config.URGENT_KEYWORDS = "紧急,急事,救命,出事了"
         await _put_asleep(store)
         # Urgent still has to be aimed at the bot: an @ or a call keyword.
         await plugin_mod.plugin.on_user_message(

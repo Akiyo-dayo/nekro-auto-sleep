@@ -205,11 +205,8 @@ def create_config_snapshot(
     *,
     near_wake_minutes: int = 60,
     sleep_target_hours: float = 8.0,
-    affirmative_keywords: str | list[str] = (),
-    negative_keywords: str | list[str] = (),
     urgent_keywords: str | list[str] = (),
     answer_scope: str = "offeree",
-    unclear_answer: str = "ignore",
     max_offers_per_night: int = 3,
     offer_cooldown_minutes: int = 20,
     snooze_minutes: int = 30,
@@ -234,11 +231,8 @@ def create_config_snapshot(
         quality_jitter_points=quality_jitter_points,
         near_wake_minutes=near_wake_minutes,
         sleep_target_hours=sleep_target_hours,
-        affirmative_keywords=parse_keyword_list(affirmative_keywords),
-        negative_keywords=parse_keyword_list(negative_keywords),
         urgent_keywords=parse_keyword_list(urgent_keywords),
         answer_scope=answer_scope,  # type: ignore[arg-type]
-        unclear_answer=unclear_answer,  # type: ignore[arg-type]
         max_offers_per_night=max_offers_per_night,
         offer_cooldown_minutes=offer_cooldown_minutes,
         snooze_minutes=snooze_minutes,

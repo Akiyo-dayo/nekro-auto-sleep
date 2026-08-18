@@ -243,8 +243,14 @@ def transition_to_awake(
 def transition_resume_sleep(
     state: ChatSleepState,
     now_utc: datetime,
+    merge_last_gap: bool = False,
 ) -> ChatSleepState:
-    """AWAKE_EARLY -> ASLEEP: bot or idle timeout goes back to sleep."""
+    """AWAKE_EARLY -> ASLEEP: bot or idle timeout goes back to sleep.
+
+    `merge_last_gap` re-opens the segment that was just closed instead of
+    starting a new one, so a few seconds spent deciding whether to get up does
+    not register as a broken night.
+    """
     state = state.model_copy(
         update={
             "status": SleepStatus.ASLEEP,
@@ -254,6 +260,11 @@ def transition_resume_sleep(
             "woken_reason": None,
         }
     )
+    if merge_last_gap and state.cycle and state.cycle.sleep_segments:
+        segments = list(state.cycle.sleep_segments)
+        segments[-1] = segments[-1].model_copy(update={"close_at": None})
+        state.cycle = state.cycle.model_copy(update={"sleep_segments": segments})
+        return state
     state = open_sleep_segment(state, now_utc)
     return state
 
@@ -263,10 +274,12 @@ def transition_resume_sleep(
 # ---------------------------------------------------------------------------
 
 
-AnswerIntent = Literal["yes", "no", "unclear"]
-
 # Trailing particles and punctuation that carry no meaning for a yes/no answer.
 # Stripping them is what turns 好的 / 要啊 / 嗯~ into the bare keyword.
+# Text folding for the optional urgent-keyword shortcut. There is deliberately
+# no keyword-based reading of the *answer* any more: whether the caller actually
+# wants the bot up is a judgement call, so the second message goes to the model,
+# which reads the sentence instead of scanning it for 要 / 算了.
 _TRAILING_NOISE = "的啊呀吧了哦喔噢呢嘛呗嘞哒~～!！?？。.,，、;；:：… "
 _PUNCTUATION = "!！?？。.,，、;；:：…()（）\"“”'‘’"
 
@@ -341,29 +354,6 @@ def _matches(folded: str, keywords: list[str]) -> bool:
         if _matches_whole_answer(folded, kw) or _matches_whole_answer(trimmed, kw):
             return True
     return any(_matches_inside(folded, kw) for kw in folded_keywords)
-
-
-def classify_answer(text: str, snap: ConfigSnapshot) -> AnswerIntent:
-    """Read a reply to "shall I wake X up?" as yes / no / neither.
-
-    Two passes. A short reply is matched as a whole, so bare 要 / 嗯 / 好的 work
-    without those characters being able to fire from the middle of an unrelated
-    sentence. Longer replies only match keywords of two characters or more (and
-    whole words for ASCII), which is what keeps 「我要睡了」 from reading as
-    consent.
-
-    Negatives win ties on purpose: 「不用叫醒了」 holds both a negative and an
-    affirmative keyword, and reading it as consent is how a refusal used to wake
-    the bot up.
-    """
-    folded = _fold(text)
-    if not folded:
-        return "unclear"
-    if _matches(folded, snap.negative_keywords):
-        return "no"
-    if _matches(folded, snap.affirmative_keywords):
-        return "yes"
-    return "unclear"
 
 
 def is_urgent(text: str, snap: ConfigSnapshot) -> bool:
@@ -453,11 +443,16 @@ def handle_message_while_asleep(
 ) -> tuple[ChatSleepState, SleepAction]:
     """Handle one inbound message while the chat is ASLEEP.
 
-    Two phases. With no question outstanding, a valid call gets one — subject to
-    a per-night cap, a cooldown and a snooze, so a chat that keeps saying the
-    wake word at 3am gets one reply, not one per message. With a question
-    outstanding, the message is read as an answer instead of as another call,
-    which is what makes plain "要" work and plain "算了" stop meaning yes.
+    Two phases, and neither tries to read the caller's mind with a keyword list.
+    With no question outstanding, a call directed at the bot gets one — subject
+    to a per-night cap, a cooldown and a snooze, so a chat that keeps calling at
+    3am gets one reply rather than one per message. With a question outstanding,
+    the next message from whoever was asked goes **straight to the LLM**:
+    hand-matching 要 / 算了 / 嗯 can only ever approximate what the model reads
+    for free, and it got 「我要睡了」 wrong in both directions.
+
+    The model then decides. Replying means the bot is up; calling `resume_sleep`
+    means the caller did not actually want it and the night continues silently.
     """
     if state.cycle is None:
         return state, ActionNone()
@@ -465,6 +460,8 @@ def handle_message_while_asleep(
     snap = state.cycle.config_snapshot
 
     if is_valid_call and is_urgent(text, snap):
+        # Optional keyword shortcut, disabled by default: skips the question and
+        # goes straight to a normal wake-up.
         state = _record_attempt(state, now_utc, user_id, confirmed=True)
         state = state.model_copy(update={"pending_offer": None})
         state = transition_to_awake_early(
@@ -476,31 +473,14 @@ def handle_message_while_asleep(
         if not _may_answer(state, user_id, snap):
             return state, ActionNone()
 
-        intent = classify_answer(text, snap)
-        if intent == "unclear" and snap.unclear_answer == "wake" and is_valid_call:
-            intent = "yes"
-
-        if intent == "yes":
-            state = _confirm_latest_attempt(state, now_utc)
-            state = transition_to_awake_early(
-                state, now_utc, user_id, snap.early_wake_idle_minutes
-            )
-            return state, ActionForceWake()
-
-        if intent == "no":
-            # Explicitly told to stay asleep: drop the question and stop asking
-            # for a while, rather than treating the refusal as consent.
-            state = state.model_copy(
-                update={
-                    "pending_offer": None,
-                    "snooze_until": now_utc
-                    + timedelta(minutes=max(0, snap.snooze_minutes)),
-                }
-            )
-            return state, ActionNone()
-
-        # Neither yes nor no: stay asleep, keep the question alive, say nothing.
-        return state, ActionNone()
+        # Whatever they said, the model reads it in context. The wake is
+        # provisional until that round decides.
+        state = _confirm_latest_attempt(state, now_utc)
+        state = transition_to_awake_early(
+            state, now_utc, user_id, snap.early_wake_idle_minutes, reason="deciding"
+        )
+        state = state.model_copy(update={"wake_decision_pending": True})
+        return state, ActionForceWake(reason="deciding")
 
     if not is_valid_call:
         return state, ActionNone()
@@ -538,6 +518,13 @@ def handle_message_while_asleep(
         prompt = f"【{persona_name}已经睡了 要叫醒{persona_name}吗？】"
 
     return state, ActionSendFixed(text=prompt, block_mode=snap.history_mode)
+
+
+def clear_wake_decision(state: ChatSleepState) -> ChatSleepState:
+    """The conversation continued, so the decision round is over."""
+    if not state.wake_decision_pending:
+        return state
+    return state.model_copy(update={"wake_decision_pending": False})
 
 
 # ---------------------------------------------------------------------------
@@ -666,7 +653,18 @@ def handle_resume_sleep(
     now_utc: datetime,
     persona_name: str,
 ) -> tuple[ChatSleepState, SleepAction]:
-    """AWAKE_EARLY -> ASLEEP: bot calls resume_sleep tool or idle timeout.
+    """AWAKE_EARLY -> ASLEEP, from the resume_sleep tool or an idle timeout.
+
+    Two different situations share this path:
+
+    - The model was still deciding whether the caller wanted it up, and decided
+      they did not. Nothing is announced, because nothing was ever said — the
+      night just continues — and a snooze keeps the next stretch quiet. The
+      rousing is demoted from a wake-up back to an unanswered call, and the
+      sleep segment is re-opened rather than split: a few seconds of deciding
+      is not a broken night.
+    - The bot was genuinely up, talked, and is now turning in. That announces
+      【persona已睡下】, which is what the original spec asks for.
 
     Raises ValueError if not AWAKE_EARLY or past planned wake.
     """
@@ -676,9 +674,37 @@ def handle_resume_sleep(
     if state.cycle and now_utc >= state.cycle.planned_wake_at:
         raise ValueError("Cannot resume sleep: already past planned wake time")
 
+    if state.wake_decision_pending:
+        snooze_minutes = (
+            state.cycle.config_snapshot.snooze_minutes if state.cycle else 0
+        )
+        state = _demote_latest_wake_to_call(state)
+        state = transition_resume_sleep(state, now_utc, merge_last_gap=True)
+        return state.model_copy(
+            update={
+                "wake_decision_pending": False,
+                "snooze_until": now_utc + timedelta(minutes=max(0, snooze_minutes)),
+            }
+        ), ActionNone()
+
     state = transition_resume_sleep(state, now_utc)
     text = f"【{persona_name}已睡下】"
     return state, ActionSendResumeSleep(text=text)
+
+
+def _demote_latest_wake_to_call(state: ChatSleepState) -> ChatSleepState:
+    """Undo the provisional confirmation of the most recent wake attempt."""
+    if state.cycle is None:
+        return state
+    attempts = list(state.cycle.wake_attempts)
+    for i in range(len(attempts) - 1, -1, -1):
+        if attempts[i].is_confirmed:
+            attempts[i] = attempts[i].model_copy(
+                update={"is_confirmed": False, "confirmed_at": None}
+            )
+            break
+    state.cycle = state.cycle.model_copy(update={"wake_attempts": attempts})
+    return state
 
 
 def handle_idle_sleep_back(

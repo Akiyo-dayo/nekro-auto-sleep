@@ -108,11 +108,8 @@ class ConfigSnapshot(BaseModel):
     # migrates in place instead of resetting the night.
     near_wake_minutes: int = 60
     sleep_target_hours: float = 8.0
-    affirmative_keywords: list[str] = Field(default_factory=list)
-    negative_keywords: list[str] = Field(default_factory=list)
     urgent_keywords: list[str] = Field(default_factory=list)
     answer_scope: Literal["offeree", "anyone"] = "offeree"
-    unclear_answer: Literal["ignore", "wake"] = "ignore"
     max_offers_per_night: int = 3
     offer_cooldown_minutes: int = 20
     snooze_minutes: int = 30
@@ -193,6 +190,11 @@ class ChatSleepState(BaseModel):
     woken_at: datetime | None = None
     woken_by: str | None = None
     woken_reason: str | None = None
+    # True for the single agent round that decides whether the caller actually
+    # wanted the bot up. The model answers by either replying (stay awake) or
+    # calling resume_sleep (go back to sleep, silently). Cleared as soon as the
+    # conversation continues.
+    wake_decision_pending: bool = False
 
     @field_validator(
         "last_seen_at",

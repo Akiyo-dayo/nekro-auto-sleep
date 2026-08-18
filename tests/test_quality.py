@@ -13,6 +13,7 @@ import pytest
 from zoneinfo import ZoneInfo
 
 from nekro_auto_sleep.engine import (
+    clear_wake_decision,
     close_timer_interval,
     compute_actual_sleep_seconds,
     open_timer_interval,
@@ -69,6 +70,8 @@ def _night(
         state, _ = handle_message_while_asleep(
             state, moment + timedelta(seconds=20), "u9", "要", "Bot", True
         )
+        # The model replied, so this is a real wake-up rather than a declined one.
+        state = clear_wake_decision(state)
         state = transition_resume_sleep(state, moment + timedelta(minutes=early_wake_minutes))
 
     wake_at = state.cycle.planned_wake_at

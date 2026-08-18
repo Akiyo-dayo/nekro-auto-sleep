@@ -31,6 +31,7 @@ from pydantic import Field
 
 from .engine import (
     ActionForceWake,
+    clear_wake_decision,
     close_timer_interval,
     open_timer_interval,
     ActionNone,
@@ -197,39 +198,17 @@ class SleepConfig(ConfigBase):
             ),
         ).model_dump(),
     )
-    AFFIRMATIVE_KEYWORDS: str = Field(
-        default="要,嗯,好,是,对,叫醒,醒醒,起床,快,醒来,yes,ok,wake",
-        title="肯定回答关键词",
-        json_schema_extra=ExtraField(
-            is_textarea=True,
-            i18n_title=i18n.i18n_text(zh_CN="肯定回答关键词", en_US="Affirmative Keywords"),
-            i18n_description=i18n.i18n_text(
-                zh_CN="回答这些词表示同意叫醒，逗号或换行分隔",
-                en_US="Answering with any of these means yes, wake up; comma or newline separated",
-            ),
-        ).model_dump(),
-    )
-    NEGATIVE_KEYWORDS: str = Field(
-        default="不用,不要,算了,没事,别吵,别叫,睡吧,晚安,继续睡,no",
-        title="否定回答关键词",
-        json_schema_extra=ExtraField(
-            is_textarea=True,
-            i18n_title=i18n.i18n_text(zh_CN="否定回答关键词", en_US="Negative Keywords"),
-            i18n_description=i18n.i18n_text(
-                zh_CN="回答这些词表示不用叫醒，之后进入静默期。与肯定词冲突时以否定为准",
-                en_US="Answering with any of these means do not wake up, then a snooze starts. Negatives win ties",
-            ),
-        ).model_dump(),
-    )
     URGENT_KEYWORDS: str = Field(
-        default="紧急,急事,救命,出事了",
+        default="",
         title="紧急唤醒关键词",
         json_schema_extra=ExtraField(
             is_textarea=True,
             i18n_title=i18n.i18n_text(zh_CN="紧急唤醒关键词", en_US="Urgent Keywords"),
             i18n_description=i18n.i18n_text(
-                zh_CN="包含这些词时一步直接叫醒，跳过两段式确认；留空则关闭该通道",
-                en_US="Messages containing these wake the bot immediately, skipping the two-step handshake; empty disables it",
+                zh_CN="可选的关键词直通：消息里出现这些词且是冲着 Bot 来的，就跳过「要叫醒吗」直接叫醒。"
+                "默认留空关闭——是否需要叫醒本来是交给 LLM 判断的，关键词只会带来误判",
+                en_US="Optional keyword shortcut: a message aimed at the bot containing one of these skips the question. "
+                "Empty (default) disables it — the wake decision belongs to the LLM",
             ),
         ).model_dump(),
     )
@@ -268,18 +247,6 @@ class SleepConfig(ConfigBase):
             i18n_description=i18n.i18n_text(
                 zh_CN="offeree: 只有被问的那个人的回答算数；anyone: 群里任何人都能回答",
                 en_US="offeree: only the person who was asked can answer; anyone: anybody in the chat can",
-            ),
-        ).model_dump(),
-    )
-    UNCLEAR_ANSWER: str = Field(
-        default="ignore",
-        title="答非所问时的处理",
-        json_schema_extra=ExtraField(
-            placeholder="ignore",
-            i18n_title=i18n.i18n_text(zh_CN="答非所问时的处理", en_US="Unclear Answer Handling"),
-            i18n_description=i18n.i18n_text(
-                zh_CN="ignore: 既不叫醒也不重复提示，问题继续等；wake: 当作同意叫醒（旧版行为）",
-                en_US="ignore: stay asleep and keep the question open; wake: treat it as consent (old behaviour)",
             ),
         ).model_dump(),
     )
@@ -640,11 +607,8 @@ def _make_config_snapshot() -> Any:
         quality_jitter_points=config.QUALITY_JITTER_POINTS,
         near_wake_minutes=config.NEAR_WAKE_MINUTES,
         sleep_target_hours=config.SLEEP_TARGET_HOURS,
-        affirmative_keywords=config.AFFIRMATIVE_KEYWORDS,
-        negative_keywords=config.NEGATIVE_KEYWORDS,
         urgent_keywords=config.URGENT_KEYWORDS,
         answer_scope=config.ANSWER_SCOPE,
-        unclear_answer=config.UNCLEAR_ANSWER,
         max_offers_per_night=config.MAX_OFFERS_PER_NIGHT,
         offer_cooldown_minutes=config.OFFER_COOLDOWN_MINUTES,
         snooze_minutes=config.SNOOZE_MINUTES,
@@ -678,6 +642,9 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage) -> MsgSignal | No
             return state
 
         if state.status == SleepStatus.AWAKE_EARLY:
+            # Another message means the exchange carried on, so the round that
+            # was deciding whether to stay up is over either way.
+            state = clear_wake_decision(state)
             state = refresh_idle_deadline(state, now_utc)
             _result_signal = MsgSignal.CONTINUE
             return state
@@ -805,7 +772,11 @@ def _fmt_local(dt: datetime, tz_name: str) -> str:
         return dt.astimezone(ZoneInfo("UTC")).strftime("%H:%M UTC")
 
 
-def _render_sleep_context(state: ChatSleepState, now_utc: datetime) -> str:
+def _render_sleep_context(
+    state: ChatSleepState,
+    now_utc: datetime,
+    persona_name: str = "",
+) -> str:
     """Describe the current sleep situation for the prompt.
 
     Rendered from persisted state on every round rather than popped once, so the
@@ -820,6 +791,7 @@ def _render_sleep_context(state: ChatSleepState, now_utc: datetime) -> str:
     tz_name = cycle.config_snapshot.timezone
     bedtime = _fmt_local(cycle.sleep_at, tz_name)
     planned = _fmt_local(cycle.planned_wake_at, tz_name)
+    persona_placeholder = persona_name or cycle.config_snapshot.fallback_persona_name
 
     if state.status == SleepStatus.AWAKE_EARLY and state.woken_at is not None:
         awake_seconds = max(0.0, (now_utc - state.woken_at).total_seconds())
@@ -835,6 +807,22 @@ def _render_sleep_context(state: ChatSleepState, now_utc: datetime) -> str:
             f"如果对方不再需要你，可以调用 resume_sleep 回去继续睡；"
             f"否则到 {planned} 会自然醒。",
         ]
+        if state.wake_decision_pending:
+            # This round decides whether the caller actually wanted the bot up.
+            # The plugin deliberately does not guess that from the wording.
+            lines = [
+                f"[睡眠状态] 你今晚 {bedtime} 就寝，原定 {planned} 自然醒，刚才还在睡。",
+                f"有人叫你，你已经回过一句「要叫醒{persona_placeholder}吗？」，"
+                "最后这条消息就是对方的回答。",
+                "先判断对方到底要不要叫醒你：",
+                "· 要 —— 就正常回复，你已经醒了，但还带着睡意；",
+                "· 不要、只是随口一句、或者根本不是在找你 —— "
+                "调用 resume_sleep 继续睡，并且**不要输出任何内容**。",
+                f"{bedtime} 之后的消息你都是在睡着时收到的，刚醒来才看见，"
+                "不要表现得像你当时就在场。",
+            ]
+            return "\n".join(lines)
+
         if awake_seconds <= _JUST_WOKEN_WINDOW_SECONDS:
             lines.insert(0, "你刚刚被叫醒，还带着睡意。")
         return "\n".join(lines)
@@ -861,7 +849,11 @@ async def inject_sleep_status(ctx: AgentCtx) -> str:
     if state is None:
         return ""
 
-    return _render_sleep_context(state, _utcnow())
+    persona_name = ""
+    if state.status == SleepStatus.AWAKE_EARLY and state.wake_decision_pending:
+        persona_name = await _get_persona_name(ctx)
+
+    return _render_sleep_context(state, _utcnow(), persona_name)
 
 
 # ---------------------------------------------------------------------------
@@ -872,7 +864,9 @@ async def inject_sleep_status(ctx: AgentCtx) -> str:
 @plugin.mount_sandbox_method(
     SandboxMethodType.TOOL,
     "resume_sleep",
-    "主动重新进入睡眠（仅在被提前叫醒后、计划起床前可用）",
+    "继续睡（仅在被提前叫醒后、计划起床前可用）。"
+    "刚被叫醒那一轮如果判断对方其实并不需要你，调用它并且不要输出任何内容，"
+    "会静默睡回去；聊完之后再调用则会说一句「已睡下」",
 )
 async def resume_sleep_tool(_ctx: AgentCtx) -> str:
     chat_key = _ctx.chat_key
@@ -884,6 +878,7 @@ async def resume_sleep_tool(_ctx: AgentCtx) -> str:
 
     async def _process(state: ChatSleepState) -> ChatSleepState:
         nonlocal result_text
+        declined = state.wake_decision_pending
         state, action = handle_resume_sleep(state, now_utc, persona_name)
         if isinstance(action, ActionSendResumeSleep):
             try:
@@ -894,7 +889,11 @@ async def resume_sleep_tool(_ctx: AgentCtx) -> str:
                 )
             except Exception as exc:
                 logger.error("Failed to send resume sleep message: %s", exc)
-        result_text = "ok"
+        result_text = (
+            "已确认对方并不需要你，继续睡；本轮不要再输出任何内容。"
+            if declined
+            else "ok"
+        )
         return state
 
     try:

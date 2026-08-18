@@ -10,13 +10,14 @@ from zoneinfo import ZoneInfo
 from nekro_auto_sleep.engine import (
     ActionForceWake,
     ActionNone,
+    ActionSendResumeSleep,
     ActionSendFixed,
     ActionSendWakeNotice,
     close_sleep_segment,
     compute_actual_sleep_seconds,
     handle_idle_sleep_back,
     handle_resume_sleep,
-    classify_answer,
+    clear_wake_decision,
     handle_message_while_asleep,
     is_urgent,
     offer_is_live,
@@ -64,79 +65,35 @@ def _call(state, now, user="user1", text="醒醒", valid=True):
     return handle_message_while_asleep(state, now, user, text, "Bot", valid)
 
 
-class TestAnswerClassification:
-    """The truth table for reading a reply to "shall I wake X up?".
+class TestUrgentShortcut:
+    """The one keyword path left, and it ships disabled."""
 
-    Substring matching on single characters is the trap here: 要 / 好 / 对 are
-    everywhere in ordinary Chinese, so a naive `kw in text` reads 「我要睡了」 and
-    「对不起吵到你了」 as consent. Short replies are matched as a whole; longer
-    ones only match keywords of two characters or more, ASCII on word
-    boundaries.
-    """
-
-    @pytest.mark.parametrize(
-        "text",
-        [
-            "要",
-            "嗯",
-            "嗯嗯",  # repeated single-character answer
-            "好的",  # trailing particle
-            "要啊！",  # particle + full-width punctuation
-            "是的",
-            "叫醒他",
-            "快醒醒",
-            "起床啦",
-            "OK",  # case folded
-            "wake up",  # ASCII, whole word inside a phrase
-            "yes please",
-        ],
-    )
-    def test_affirmative(self, default_snapshot, text):
-        assert classify_answer(text, default_snapshot) == "yes"
-
-    @pytest.mark.parametrize(
-        "text",
-        [
-            "不用",
-            "算了",  # keyword that itself ends in a particle
-            "没事",
-            "晚安~",
-            "算了你睡吧",
-            "我不要你醒",
-        ],
-    )
-    def test_negative(self, default_snapshot, text):
-        assert classify_answer(text, default_snapshot) == "no"
-
-    @pytest.mark.parametrize(
-        "text",
-        [
-            "我要睡了",  # contains 要, but the user is going to bed
-            "对不起吵到你了",  # contains 对
-            "好困啊",  # contains 好
-            "这题我不会",  # contains 不
-            "你在哪",
-            "今天天气不错",
-            "looks broken to me",  # contains "ok" as a substring
-            "token 过期了",  # contains "ok" again
-            "",
-            "?",
-        ],
-    )
-    def test_unclear(self, default_snapshot, text):
-        assert classify_answer(text, default_snapshot) == "unclear"
-
-    def test_negative_beats_affirmative_in_one_sentence(self, default_snapshot):
-        # 「不用叫醒了」 holds both a negative and an affirmative keyword. Reading
-        # it as consent is exactly how a refusal used to wake the bot up.
-        assert classify_answer("不用叫醒了", default_snapshot) == "no"
-
-    def test_urgent_needs_the_whole_keyword(self, default_snapshot):
+    def test_matches_the_whole_keyword_only(self, default_snapshot):
         assert is_urgent("出事了 快醒醒", default_snapshot) is True
         assert is_urgent("救命", default_snapshot) is True
         # 「没出事」 embeds 出事 but not the keyword 出事了.
         assert is_urgent("没出事", default_snapshot) is False
         assert is_urgent("这事不急", default_snapshot) is False
+
+    def test_disabled_when_no_keywords_are_configured(self, default_snapshot):
+        snap = default_snapshot.model_copy(update={"urgent_keywords": []})
+        assert is_urgent("救命", snap) is False
+
+    def test_a_single_character_keyword_only_counts_as_the_whole_message(
+        self, default_snapshot
+    ):
+        """Otherwise one common character turns every sentence into an emergency."""
+        snap = default_snapshot.model_copy(update={"urgent_keywords": ["急"]})
+        assert is_urgent("急", snap) is True
+        assert is_urgent("急！", snap) is True
+        assert is_urgent("这事不急", snap) is False
+        assert is_urgent("我等下有急事要出门", snap) is False
+
+    def test_ascii_keywords_need_word_boundaries(self, default_snapshot):
+        snap = default_snapshot.model_copy(update={"urgent_keywords": ["sos"]})
+        assert is_urgent("sos", snap) is True
+        assert is_urgent("SOS 快来", snap) is True
+        assert is_urgent("sostenuto", snap) is False
 
 
 class TestWakeProtocol:
@@ -167,52 +124,25 @@ class TestWakeProtocol:
         _state, action = _call(state, NIGHT)
         assert "Bot" in action.text
 
-    def test_plain_yes_wakes_the_bot(self, default_snapshot):
-        """The whole point: the bot asks a yes/no question, so "要" must work."""
+    @pytest.mark.parametrize("reply", ["要", "算了你睡吧", "我要睡了", "你在哪", "嗯"])
+    def test_any_reply_reaches_the_llm(self, default_snapshot, reply):
+        """The plugin no longer decides what the reply meant.
+
+        Hand-matching 要 / 算了 could only ever approximate it, and 「我要睡了」
+        came out as consent. The second message force-triggers a round and the
+        model reads the sentence.
+        """
         state = _sleeping(default_snapshot)
         state, _ = _call(state, NIGHT)
-        state, action = _call(state, NIGHT + timedelta(seconds=20), text="要")
+        state, action = _call(state, NIGHT + timedelta(seconds=20), text=reply)
 
         assert isinstance(action, ActionForceWake)
+        assert action.reason == "deciding"
         assert state.status == SleepStatus.AWAKE_EARLY
+        assert state.wake_decision_pending is True
         assert state.woken_by == "user1"
 
-    def test_plain_no_keeps_it_asleep_and_snoozes(self, default_snapshot):
-        state = _sleeping(default_snapshot)
-        state, _ = _call(state, NIGHT)
-        state, action = _call(state, NIGHT + timedelta(seconds=20), text="算了")
-
-        assert isinstance(action, ActionNone)
-        assert state.status == SleepStatus.ASLEEP
-        assert state.pending_offer is None
-        assert state.snooze_until == NIGHT + timedelta(seconds=20, minutes=30)
-
-    def test_snooze_silences_later_calls(self, default_snapshot):
-        state = _sleeping(default_snapshot)
-        state, _ = _call(state, NIGHT)
-        state, _ = _call(state, NIGHT + timedelta(seconds=20), text="算了")
-
-        state, action = _call(state, NIGHT + timedelta(minutes=10))
-        assert isinstance(action, ActionNone)
-        assert state.offers_sent_tonight == 1
-
-    def test_unclear_answer_neither_wakes_nor_reprompts(self, default_snapshot):
-        state = _sleeping(default_snapshot)
-        state, _ = _call(state, NIGHT)
-        state, action = _call(state, NIGHT + timedelta(seconds=20), text="你在哪")
-
-        assert isinstance(action, ActionNone)
-        assert state.status == SleepStatus.ASLEEP
-        assert offer_is_live(state, NIGHT + timedelta(seconds=20))
-
-    def test_unclear_can_be_configured_to_wake(self, default_snapshot):
-        snap = default_snapshot.model_copy(update={"unclear_answer": "wake"})
-        state = transition_to_sleep(ChatSleepState(chat_key=CHAT_KEY), BED, snap)
-        state, _ = _call(state, NIGHT)
-        state, action = _call(state, NIGHT + timedelta(seconds=20), text="你在哪")
-        assert isinstance(action, ActionForceWake)
-
-    def test_bystander_cannot_answer_by_default(self, default_snapshot):
+    def test_bystander_cannot_trigger_the_decision_round(self, default_snapshot):
         state = _sleeping(default_snapshot)
         state, _ = _call(state, NIGHT, user="user1")
         state, action = _call(state, NIGHT + timedelta(seconds=20), user="user2", text="要")
@@ -227,6 +157,15 @@ class TestWakeProtocol:
         state, action = _call(state, NIGHT + timedelta(seconds=20), user="user2", text="要")
         assert isinstance(action, ActionForceWake)
 
+    def test_an_expired_question_is_a_fresh_call_again(self, default_snapshot):
+        state = _sleeping(default_snapshot)
+        state, _ = _call(state, NIGHT)
+        late = NIGHT + timedelta(seconds=200)  # past the 180s window
+        state, action = _call(state, late, text="随便说点什么", valid=False)
+
+        assert isinstance(action, ActionNone)
+        assert state.status == SleepStatus.ASLEEP
+
     def test_ordinary_message_never_creates_an_offer(self, default_snapshot):
         state, action = _call(_sleeping(default_snapshot), NIGHT, text="随便聊聊", valid=False)
         assert isinstance(action, ActionNone)
@@ -239,6 +178,58 @@ class TestWakeProtocol:
         assert action.reason == "urgent"
         assert state.status == SleepStatus.AWAKE_EARLY
         assert state.woken_reason == "urgent"
+        assert state.wake_decision_pending is False
+
+
+class TestWakeDecision:
+    """What the model does with the round it was handed."""
+
+    def _decide(self, default_snapshot):
+        state = _sleeping(default_snapshot)
+        state, _ = _call(state, NIGHT)
+        state, _ = _call(state, NIGHT + timedelta(seconds=20), text="嗯？")
+        return state
+
+    def test_declining_goes_back_to_sleep_without_saying_anything(self, default_snapshot):
+        state = self._decide(default_snapshot)
+        moment = NIGHT + timedelta(seconds=40)
+
+        state, action = handle_resume_sleep(state, moment, "Bot")
+
+        assert isinstance(action, ActionNone), "declining must not announce itself"
+        assert state.status == SleepStatus.ASLEEP
+        assert state.wake_decision_pending is False
+        assert state.snooze_until == moment + timedelta(minutes=30)
+
+    def test_declining_is_charged_as_a_call_not_a_wake_up(self, default_snapshot):
+        state = self._decide(default_snapshot)
+        state, _ = handle_resume_sleep(state, NIGHT + timedelta(seconds=40), "Bot")
+
+        attempts = state.cycle.wake_attempts
+        assert len(attempts) == 1
+        assert attempts[0].is_confirmed is False
+
+    def test_declining_does_not_fragment_the_night(self, default_snapshot):
+        state = self._decide(default_snapshot)
+        state, _ = handle_resume_sleep(state, NIGHT + timedelta(seconds=40), "Bot")
+
+        assert len(state.cycle.sleep_segments) == 1
+        assert state.cycle.sleep_segments[0].close_at is None
+
+    def test_staying_up_then_turning_in_announces_normally(self, default_snapshot):
+        state = self._decide(default_snapshot)
+        # The model replied and the conversation carried on.
+        state = clear_wake_decision(state)
+
+        state, action = handle_resume_sleep(state, NIGHT + timedelta(minutes=5), "Bot")
+
+        assert isinstance(action, ActionSendResumeSleep)
+        assert "Bot已睡下" in action.text
+        assert len(state.cycle.sleep_segments) == 2
+
+    def test_a_reply_from_the_user_ends_the_decision_round(self, default_snapshot):
+        state = self._decide(default_snapshot)
+        assert clear_wake_decision(state).wake_decision_pending is False
 
 
 class TestOfferRateLimit:
@@ -280,10 +271,10 @@ class TestOfferRateLimit:
 
         attempts = state.cycle.wake_attempts
         assert len(attempts) == 2
-        # Answering confirms only the call that was actually answered; the one
-        # the bot slept through stays on the record as unanswered, which is what
-        # the quality model charges for. The old protocol flipped every earlier
-        # attempt by that user to confirmed and erased the evidence.
+        # Reaching the LLM confirms only the call that was actually answered;
+        # the one the bot slept through stays on the record as unanswered, which
+        # is what the quality model charges for. The first protocol flipped
+        # every earlier attempt by that user and erased the evidence.
         assert [a.is_confirmed for a in attempts] == [False, True]
 
 
