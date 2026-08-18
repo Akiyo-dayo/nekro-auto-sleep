@@ -1,19 +1,23 @@
-"""Source ledger, leases, and reversible runtime wrapping.
+"""Reversible wrapping of host callables, and the source contextvar.
 
-Wraps host callables (schedule_agent_task, _run_chat_agent_task, timer entry points)
-to enforce the sleep gate at dispatch and execution layers.
+Only what is actually load-bearing lives here. The first version also carried a
+TTL lease ledger and a per-chat lock table, built so that a monkey-patched timer
+service could hand a night-time agent round a permission ticket. None of it ever
+ran: the install step registered the timer methods for later restoration without
+ever wrapping them, so `lease_ledger.create` had no call sites anywhere in the
+tree and every night-time scheduled task was silently dropped instead of being
+allowed through. `NIGHT_TIMER_POLICY` replaced that whole mechanism with a
+decision made in `on_system_message`, which needs no patching at all.
 
-Uses contextvars for synchronous call chains and TTL-based message/task lease
-ledger for cross-task permission propagation (spec §7.3).
+What remains: `wrap_callable` / `unwrap_callable`, used for the single optional
+gate on `message_service.schedule_agent_task` (a public method), and the source
+contextvar used to mark the plugin's own outbound wake-up notice.
 """
 
 from __future__ import annotations
 
-import asyncio
 import contextvars
 import logging
-import time
-from dataclasses import dataclass, field
 from typing import Any
 from collections.abc import Callable
 
@@ -36,106 +40,6 @@ current_source: contextvars.ContextVar[SourceType | None] = contextvars.ContextV
     "nekro_auto_sleep_source", default=None
 )
 
-
-# ---------------------------------------------------------------------------
-# TTL-based lease ledger for cross-task permission
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class Lease:
-    source_type: SourceType
-    chat_key: str
-    task_id: str
-    created_at: float
-    ttl: float
-    future: asyncio.Future[Any] | None = None
-    claimed: bool = False
-
-
-class LeaseLedger:
-    """Cross-task permission ledger with TTL expiry."""
-
-    def __init__(self) -> None:
-        self._leases: dict[str, Lease] = {}
-        self._by_chat_key: dict[str, set[str]] = {}
-
-    def create(
-        self,
-        lease_id: str,
-        source_type: SourceType,
-        chat_key: str,
-        task_id: str,
-        ttl: float,
-        future: asyncio.Future[Any] | None = None,
-    ) -> Lease:
-        lease = Lease(
-            source_type=source_type,
-            chat_key=chat_key,
-            task_id=task_id,
-            created_at=time.monotonic(),
-            ttl=ttl,
-            future=future,
-        )
-        self._leases[lease_id] = lease
-        self._by_chat_key.setdefault(chat_key, set()).add(lease_id)
-        return lease
-
-    def get(self, lease_id: str) -> Lease | None:
-        lease = self._leases.get(lease_id)
-        if lease is None:
-            return None
-        if time.monotonic() - lease.created_at > lease.ttl:
-            self.remove(lease_id)
-            return None
-        return lease
-
-    def get_active_for_chat(self, chat_key: str) -> list[Lease]:
-        ids = self._by_chat_key.get(chat_key, set())
-        active = []
-        expired = []
-        for lid in ids:
-            lease = self._leases.get(lid)
-            if lease is None:
-                expired.append(lid)
-                continue
-            if time.monotonic() - lease.created_at > lease.ttl:
-                expired.append(lid)
-                continue
-            active.append(lease)
-        for lid in expired:
-            self.remove(lid)
-        return active
-
-    def has_active_for_chat(self, chat_key: str) -> bool:
-        return len(self.get_active_for_chat(chat_key)) > 0
-
-    def claim(self, lease_id: str) -> Lease | None:
-        lease = self.get(lease_id)
-        if lease is not None:
-            lease.claimed = True
-        return lease
-
-    def remove(self, lease_id: str) -> Lease | None:
-        lease = self._leases.pop(lease_id, None)
-        if lease is not None:
-            chat_ids = self._by_chat_key.get(lease.chat_key)
-            if chat_ids is not None:
-                chat_ids.discard(lease_id)
-                if not chat_ids:
-                    del self._by_chat_key[lease.chat_key]
-        return lease
-
-    def clear(self) -> None:
-        for lease in self._leases.values():
-            if lease.future and not lease.future.done():
-                lease.future.cancel()
-        self._leases.clear()
-        self._by_chat_key.clear()
-
-
-# Global ledger instance
-lease_ledger = LeaseLedger()
 
 # ---------------------------------------------------------------------------
 # Reversible wrapping utilities
@@ -206,85 +110,37 @@ def unwrap_callable(target_obj: Any, attr_name: str) -> bool:
     return True
 
 
+def is_wrapped(target_obj: Any, attr_name: str) -> bool:
+    """Whether attr_name currently holds our wrapper (used by tests)."""
+    return bool(getattr(getattr(target_obj, attr_name, None), _WRAP_MARKER, False))
+
+
 # ---------------------------------------------------------------------------
-# Wrapper factories (to be connected in __init__.py)
+# The one remaining gate
 # ---------------------------------------------------------------------------
 
 
 def make_schedule_agent_task_wrapper(
-    is_sleeping_fn: Callable[[str], bool],
-    has_permission_fn: Callable[[str], bool],
+    should_block_fn: Callable[[str], bool],
 ) -> Callable[..., Any]:
-    """Create a wrapper for message_service.schedule_agent_task.
+    """Wrap `message_service.schedule_agent_task`.
 
-    When sleeping and no trusted permission exists, silently blocks the call.
+    Inbound user messages never reach this while the chat is asleep — the
+    `on_user_message` hook has already returned a blocking signal by then — so
+    in practice this only sees callers that schedule a round directly, which
+    means the timer service. It therefore does nothing unless the operator asked
+    for night-time scheduled tasks to be blocked.
     """
 
-    async def wrapper(original: Callable[..., Any], chat_key: str, *args: Any, **kwargs: Any) -> Any:
-        src = current_source.get()
+    async def wrapper(original: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        chat_key = kwargs.get("chat_key")
+        if chat_key is None and args:
+            chat_key = args[0]
 
-        if src in (SourceType.USER_WAKE_CONFIRM, SourceType.USER_DIRECT,
-                   SourceType.TIMER_ONESHOT, SourceType.TIMER_RECURRING,
-                   SourceType.INTERNAL_WAKE_NOTICE):
-            return await original(chat_key, *args, **kwargs)
-
-        if is_sleeping_fn(chat_key) and not has_permission_fn(chat_key):
-            logger.debug("Blocked schedule_agent_task for sleeping chat_key=%s", chat_key)
+        if isinstance(chat_key, str) and should_block_fn(chat_key):
+            logger.info("Night timer policy blocked an agent round for %s", chat_key)
             return None
 
-        return await original(chat_key, *args, **kwargs)
+        return await original(*args, **kwargs)
 
     return wrapper
-
-
-def make_run_agent_task_wrapper(
-    is_sleeping_fn: Callable[[str], bool],
-    on_agent_start_fn: Callable[[str], Any],
-    on_agent_end_fn: Callable[[str], Any],
-) -> Callable[..., Any]:
-    """Create a wrapper for message_service._run_chat_agent_task.
-
-    Re-checks sleep state before execution (spec §7.2 layer 3).
-    """
-
-    async def wrapper(original: Callable[..., Any], chat_key: str, *args: Any, **kwargs: Any) -> Any:
-        src = current_source.get()
-
-        if src not in (SourceType.USER_WAKE_CONFIRM, SourceType.USER_DIRECT,
-                       SourceType.TIMER_ONESHOT, SourceType.TIMER_RECURRING,
-                       SourceType.INTERNAL_WAKE_NOTICE):
-            if is_sleeping_fn(chat_key):
-                logger.debug("Blocked _run_chat_agent_task for sleeping chat_key=%s", chat_key)
-                return None
-
-        await on_agent_start_fn(chat_key)
-        try:
-            result = await original(chat_key, *args, **kwargs)
-            return result
-        finally:
-            await on_agent_end_fn(chat_key)
-
-    return wrapper
-
-
-# ---------------------------------------------------------------------------
-# Chat-key serial locks for timer tasks
-# ---------------------------------------------------------------------------
-
-
-class ChatKeyLocks:
-    """Per-chat_key asyncio locks for serializing timer task execution."""
-
-    def __init__(self) -> None:
-        self._locks: dict[str, asyncio.Lock] = {}
-
-    def get(self, chat_key: str) -> asyncio.Lock:
-        if chat_key not in self._locks:
-            self._locks[chat_key] = asyncio.Lock()
-        return self._locks[chat_key]
-
-    def clear(self) -> None:
-        self._locks.clear()
-
-
-chat_key_locks = ChatKeyLocks()

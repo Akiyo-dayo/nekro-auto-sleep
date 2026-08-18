@@ -18,6 +18,7 @@ from nekro_auto_sleep.engine import (
     handle_resume_sleep,
     classify_answer,
     handle_message_while_asleep,
+    is_urgent,
     offer_is_live,
     is_idle_expired,
     open_sleep_segment,
@@ -64,22 +65,78 @@ def _call(state, now, user="user1", text="醒醒", valid=True):
 
 
 class TestAnswerClassification:
-    @pytest.mark.parametrize("text", ["要", "嗯", "叫醒他", "好啊", "wake up", "OK"])
+    """The truth table for reading a reply to "shall I wake X up?".
+
+    Substring matching on single characters is the trap here: 要 / 好 / 对 are
+    everywhere in ordinary Chinese, so a naive `kw in text` reads 「我要睡了」 and
+    「对不起吵到你了」 as consent. Short replies are matched as a whole; longer
+    ones only match keywords of two characters or more, ASCII on word
+    boundaries.
+    """
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "要",
+            "嗯",
+            "嗯嗯",  # repeated single-character answer
+            "好的",  # trailing particle
+            "要啊！",  # particle + full-width punctuation
+            "是的",
+            "叫醒他",
+            "快醒醒",
+            "起床啦",
+            "OK",  # case folded
+            "wake up",  # ASCII, whole word inside a phrase
+            "yes please",
+        ],
+    )
     def test_affirmative(self, default_snapshot, text):
         assert classify_answer(text, default_snapshot) == "yes"
 
-    @pytest.mark.parametrize("text", ["不用", "算了", "让他睡吧", "晚安", "no"])
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "不用",
+            "算了",  # keyword that itself ends in a particle
+            "没事",
+            "晚安~",
+            "算了你睡吧",
+            "我不要你醒",
+        ],
+    )
     def test_negative(self, default_snapshot, text):
         assert classify_answer(text, default_snapshot) == "no"
 
-    @pytest.mark.parametrize("text", ["今天天气不错", "", "?"])
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "我要睡了",  # contains 要, but the user is going to bed
+            "对不起吵到你了",  # contains 对
+            "好困啊",  # contains 好
+            "这题我不会",  # contains 不
+            "你在哪",
+            "今天天气不错",
+            "looks broken to me",  # contains "ok" as a substring
+            "token 过期了",  # contains "ok" again
+            "",
+            "?",
+        ],
+    )
     def test_unclear(self, default_snapshot, text):
         assert classify_answer(text, default_snapshot) == "unclear"
 
     def test_negative_beats_affirmative_in_one_sentence(self, default_snapshot):
-        # "不用叫醒了" holds both a negative and an affirmative keyword. Reading
+        # 「不用叫醒了」 holds both a negative and an affirmative keyword. Reading
         # it as consent is exactly how a refusal used to wake the bot up.
         assert classify_answer("不用叫醒了", default_snapshot) == "no"
+
+    def test_urgent_needs_the_whole_keyword(self, default_snapshot):
+        assert is_urgent("出事了 快醒醒", default_snapshot) is True
+        assert is_urgent("救命", default_snapshot) is True
+        # 「没出事」 embeds 出事 but not the keyword 出事了.
+        assert is_urgent("没出事", default_snapshot) is False
+        assert is_urgent("这事不急", default_snapshot) is False
 
 
 class TestWakeProtocol:
@@ -95,6 +152,20 @@ class TestWakeProtocol:
         near = state.cycle.planned_wake_at - timedelta(minutes=30)
         _state, action = _call(state, near)
         assert "还没起床" in action.text
+
+    def test_prompt_wording_is_configurable(self, default_snapshot):
+        snap = default_snapshot.model_copy(
+            update={"asleep_prompt": "[{persona} zzz - wake up? yes/no]"}
+        )
+        state = transition_to_sleep(ChatSleepState(chat_key=CHAT_KEY), BED, snap)
+        _state, action = _call(state, NIGHT)
+        assert action.text == "[Bot zzz - wake up? yes/no]"
+
+    def test_a_broken_template_falls_back_instead_of_crashing(self, default_snapshot):
+        snap = default_snapshot.model_copy(update={"asleep_prompt": "{nope}"})
+        state = transition_to_sleep(ChatSleepState(chat_key=CHAT_KEY), BED, snap)
+        _state, action = _call(state, NIGHT)
+        assert "Bot" in action.text
 
     def test_plain_yes_wakes_the_bot(self, default_snapshot):
         """The whole point: the bot asks a yes/no question, so "要" must work."""

@@ -13,7 +13,9 @@ import pytest
 from zoneinfo import ZoneInfo
 
 from nekro_auto_sleep.engine import (
+    close_timer_interval,
     compute_actual_sleep_seconds,
+    open_timer_interval,
     handle_message_while_asleep,
     transition_resume_sleep,
     transition_to_awake,
@@ -131,7 +133,7 @@ class TestNightDuty:
         expected = (state.cycle.planned_wake_at - start).total_seconds()
         assert night_duty_seconds(state.cycle) == pytest.approx(expected)
 
-    def test_duty_counts_as_half_sleep(self, default_snapshot):
+    def test_half_of_a_duty_stretch_is_charged_as_lost_rest(self, default_snapshot):
         state = _sleep(default_snapshot)
         start = BED + timedelta(hours=2)
         state.cycle = state.cycle.model_copy(
@@ -144,15 +146,64 @@ class TestNightDuty:
         state = transition_to_awake(state, state.cycle.planned_wake_at)
         slept = compute_actual_sleep_seconds(state.cycle)
 
-        with_duty = compute_quality_detail(state.cycle, slept)
-        assert with_duty.effective_hours == pytest.approx(slept / 3600 + 0.5, abs=0.01)
+        detail = compute_quality_detail(state.cycle, slept)
+        assert detail.effective_hours == pytest.approx(slept / 3600 - 0.5, abs=0.01)
+
+    def test_duty_does_not_break_the_sleep_segment(self, default_snapshot):
+        """A timer is not the bot getting out of bed."""
+        state = _sleep(default_snapshot)
+        state = open_timer_interval(state, "t1", BED + timedelta(hours=2))
+        assert state.cycle.sleep_segments[-1].close_at is None
+
+        state = close_timer_interval(state, "t1", BED + timedelta(hours=2, minutes=5))
+        state = transition_to_awake(state, state.cycle.planned_wake_at)
+        assert len(state.cycle.sleep_segments) == 1
 
 
 class TestTargetSelection:
-    def test_auto_target_is_the_midpoint_of_the_wake_range(self, default_snapshot):
+    def test_default_target_is_this_nights_own_plan(self, default_snapshot):
+        detail = _night(default_snapshot)
         state = _sleep(default_snapshot)
-        # 23:00 bedtime, wake range 06:45-08:30 -> midpoint 8h37m30s
-        assert state.cycle.target_sleep_seconds == pytest.approx(8.625 * 3600)
+        planned = (state.cycle.planned_wake_at - state.cycle.sleep_at).total_seconds()
+        assert detail.target_hours == pytest.approx(planned / 3600, abs=0.001)
+        assert detail.coverage_ratio == pytest.approx(1.0)
+
+    def test_the_random_wake_point_does_not_move_the_score(self, default_snapshot):
+        """An early draw is not a bad night.
+
+        The wake-up time is drawn from a range on purpose. Scoring an
+        undisturbed night against anything fixed made that draw worth some
+        fifteen points, so the number moved for a reason that has nothing to do
+        with how the night actually went.
+        """
+        scores = set()
+        for wake_after_hours in (7.75, 8.5, 9.5):
+            state = _sleep(default_snapshot)
+            state.cycle = state.cycle.model_copy(
+                update={
+                    "planned_wake_at": state.cycle.sleep_at
+                    + timedelta(hours=wake_after_hours)
+                }
+            )
+            state = transition_to_awake(state, state.cycle.planned_wake_at)
+            scores.add(
+                compute_quality_detail(
+                    state.cycle, compute_actual_sleep_seconds(state.cycle)
+                ).score
+            )
+
+        assert len(scores) == 1, f"score moved with the wake draw: {sorted(scores)}"
+        assert scores.pop() > 100
+
+    def test_a_clean_night_scores_above_100(self, default_snapshot):
+        detail = _night(default_snapshot)
+        assert detail.bonus_clean_night > 0
+        assert detail.score > 100
+
+    def test_a_single_call_removes_the_clean_night_bonus(self, default_snapshot):
+        detail = _night(default_snapshot, pings=1)
+        assert detail.bonus_clean_night == 0
+        assert detail.score < 100
 
     def test_explicit_target_overrides(self, default_snapshot):
         snap = default_snapshot.model_copy(update={"sleep_target_hours": 6.0})
@@ -167,7 +218,7 @@ class TestTargetSelection:
         )
         assert _night(snap).score > 100
 
-    def test_under_target_night_scores_below_100(self, default_snapshot):
+    def test_under_explicit_target_scores_below_100(self, default_snapshot):
         snap = default_snapshot.model_copy(
             update={"sleep_target_hours": 12.0, "quality_jitter_points": 0.0}
         )
@@ -182,6 +233,7 @@ class TestBreakdown:
             - d.penalty_fragmentation
             - d.penalty_calls
             - d.penalty_wakes
+            + d.bonus_clean_night
             + d.jitter
         )
         assert d.raw == pytest.approx(expected, abs=0.02)
@@ -217,15 +269,15 @@ class TestGoldenCurve:
     @pytest.mark.parametrize(
         ("label", "kwargs", "low", "high"),
         [
-            ("undisturbed", {}, 90, 106),
-            ("one ignored call", {"pings": 1}, 86, 99),
-            ("three ignored calls", {"pings": 3}, 78, 91),
-            ("six ignored calls", {"pings": 6}, 66, 80),
-            ("woken for 30 min", {"early_wake_minutes": 30}, 67, 82),
-            ("woken for two hours", {"early_wake_minutes": 120}, 50, 64),
-            ("woken for four hours", {"early_wake_minutes": 240}, 31, 45),
-            ("only slept three hours", {"cut_short_hours": 3}, 30, 45),
-            ("barely slept", {"cut_short_hours": 1}, 20, 28),
+            ("undisturbed", {}, 101, 108),
+            ("one ignored call", {"pings": 1}, 94, 101),
+            ("three ignored calls", {"pings": 3}, 86, 94),
+            ("six ignored calls", {"pings": 6}, 75, 84),
+            ("woken for 30 min", {"early_wake_minutes": 30}, 76, 85),
+            ("woken for two hours", {"early_wake_minutes": 120}, 58, 67),
+            ("woken for four hours", {"early_wake_minutes": 240}, 38, 47),
+            ("only slept three hours", {"cut_short_hours": 3}, 35, 44),
+            ("barely slept", {"cut_short_hours": 1}, 20, 26),
         ],
     )
     def test_bands(self, default_snapshot, label, kwargs, low, high):

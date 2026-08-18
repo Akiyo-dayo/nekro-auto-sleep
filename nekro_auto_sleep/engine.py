@@ -6,6 +6,7 @@ Domain layer — no host imports. All time parameters are aware UTC datetimes.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Callable, Literal
 
@@ -108,10 +109,6 @@ def create_sleep_cycle(
         config_snapshot.wake_random_step_minutes,
     )
 
-    target_seconds = (
-        (wake_start - sleep_at).total_seconds() + (wake_end - sleep_at).total_seconds()
-    ) / 2
-
     return SleepCycle(
         cycle_id=generate_cycle_id(chat_key, sd),
         sleep_date=sleep_date_local,
@@ -120,7 +117,6 @@ def create_sleep_cycle(
         planned_wake_at=planned_wake,
         config_snapshot=config_snapshot,
         quality_seed=generate_quality_seed(chat_key, sd),
-        target_sleep_seconds=max(0.0, target_seconds),
         sleep_segments=[],
         wake_attempts=[],
         timer_intervals=[],
@@ -269,29 +265,113 @@ def transition_resume_sleep(
 
 AnswerIntent = Literal["yes", "no", "unclear"]
 
+# Trailing particles and punctuation that carry no meaning for a yes/no answer.
+# Stripping them is what turns 好的 / 要啊 / 嗯~ into the bare keyword.
+_TRAILING_NOISE = "的啊呀吧了哦喔噢呢嘛呗嘞哒~～!！?？。.,，、;；:：… "
+_PUNCTUATION = "!！?？。.,，、;；:：…()（）\"“”'‘’"
+
+
+def _fold(text: str) -> str:
+    """Case/width folding and punctuation removal, whitespace collapsed.
+
+    Whitespace is collapsed rather than deleted: ASCII keywords are matched on
+    word boundaries, and squashing "wake up" into "wakeup" would break that.
+    """
+    if not text:
+        return ""
+    folded = []
+    for ch in text.strip():
+        code = ord(ch)
+        if code == 0x3000:  # ideographic space
+            ch = " "
+        elif 0xFF01 <= code <= 0xFF5E:  # full-width ASCII
+            ch = chr(code - 0xFEE0)
+        folded.append(ch)
+    cleaned = "".join(c for c in folded if c not in _PUNCTUATION).lower()
+    return " ".join(cleaned.split())
+
+
+def _normalize(text: str) -> str:
+    """Fold a reply and trim the trailing particles a bare answer picks up."""
+    return _fold(text).rstrip(_TRAILING_NOISE)
+
+
+def _is_ascii(word: str) -> bool:
+    return all(ord(c) < 128 for c in word)
+
+
+def _matches_whole_answer(candidate: str, keyword: str) -> bool:
+    """Whether the whole reply *is* this keyword (allowing 嗯嗯 / 好好)."""
+    if not candidate or not keyword:
+        return False
+    if candidate == keyword:
+        return True
+    return len(keyword) == 1 and set(candidate) == {keyword}
+
+
+def _matches_inside(folded: str, keyword: str) -> bool:
+    """Whether the keyword appears inside a longer reply, safely.
+
+    Single characters are deliberately excluded here. 要 / 好 / 对 are far too
+    common to read as consent mid-sentence — with a plain substring match
+    「我要睡了」 and 「对不起吵到你了」 both came out as "yes". They still count
+    when they *are* the whole answer, which is how people actually reply to a
+    yes/no question.
+    """
+    if len(keyword) < 2:
+        return False
+    if _is_ascii(keyword):
+        return re.search(rf"\b{re.escape(keyword)}\b", folded) is not None
+    return keyword in folded
+
+
+def _matches(folded: str, keywords: list[str]) -> bool:
+    """Match a folded reply against a keyword list.
+
+    Whole-answer matching is tried against both the folded reply and its
+    particle-trimmed form, because the trimming that turns 「好的」 into 「好」
+    would otherwise turn 「算了」 into 「算」 and lose the keyword entirely.
+    Keywords themselves are only folded, never trimmed.
+    """
+    trimmed = folded.rstrip(_TRAILING_NOISE)
+    folded_keywords = [_fold(kw) for kw in keywords]
+    folded_keywords = [kw for kw in folded_keywords if kw]
+
+    for kw in folded_keywords:
+        if _matches_whole_answer(folded, kw) or _matches_whole_answer(trimmed, kw):
+            return True
+    return any(_matches_inside(folded, kw) for kw in folded_keywords)
+
 
 def classify_answer(text: str, snap: ConfigSnapshot) -> AnswerIntent:
     """Read a reply to "shall I wake X up?" as yes / no / neither.
 
-    Negatives win ties on purpose. "不用叫了" contains both a negative and an
-    affirmative keyword, and the old protocol — which counted *any* second
-    message in a private chat as confirmation — turned every such refusal into
-    a wake-up.
+    Two passes. A short reply is matched as a whole, so bare 要 / 嗯 / 好的 work
+    without those characters being able to fire from the middle of an unrelated
+    sentence. Longer replies only match keywords of two characters or more (and
+    whole words for ASCII), which is what keeps 「我要睡了」 from reading as
+    consent.
+
+    Negatives win ties on purpose: 「不用叫醒了」 holds both a negative and an
+    affirmative keyword, and reading it as consent is how a refusal used to wake
+    the bot up.
     """
-    stripped = (text or "").strip().lower()
-    if not stripped:
+    folded = _fold(text)
+    if not folded:
         return "unclear"
-    if any(kw and kw.lower() in stripped for kw in snap.negative_keywords):
+    if _matches(folded, snap.negative_keywords):
         return "no"
-    if any(kw and kw.lower() in stripped for kw in snap.affirmative_keywords):
+    if _matches(folded, snap.affirmative_keywords):
         return "yes"
     return "unclear"
 
 
 def is_urgent(text: str, snap: ConfigSnapshot) -> bool:
     """An emergency skips the two-step handshake."""
-    stripped = (text or "").strip().lower()
-    return any(kw and kw.lower() in stripped for kw in snap.urgent_keywords)
+    folded = _fold(text)
+    if not folded:
+        return False
+    return _matches(folded, snap.urgent_keywords)
 
 
 def _record_attempt(
@@ -450,9 +530,11 @@ def handle_message_while_asleep(
         state.cycle.planned_wake_at,
         snap.near_wake_minutes,
     )
-    if near:
-        prompt = f"【{persona_name}还没起床 要叫醒{persona_name}吗？】"
-    else:
+    template = snap.near_wake_prompt if near else snap.asleep_prompt
+    try:
+        prompt = template.format(persona=persona_name)
+    except (KeyError, IndexError, ValueError):
+        logger.warning("Bad wake prompt template %r, falling back", template)
         prompt = f"【{persona_name}已经睡了 要叫醒{persona_name}吗？】"
 
     return state, ActionSendFixed(text=prompt, block_mode=snap.history_mode)
@@ -671,7 +753,14 @@ def open_timer_interval(
     now_utc: datetime,
     source_type: str = "TIMER_ONESHOT",
 ) -> ChatSleepState:
-    """Record start of a timer task execution during sleep."""
+    """Record the start of a scheduled task running during the night.
+
+    Deliberately does **not** close the sleep segment. The bot did not get out
+    of bed for a timer, so night duty overlays the stretch of sleep instead of
+    splitting it — closing the segment here (as the first version did) also
+    meant nothing reopened it, and the rest of the night stopped being counted
+    as sleep at all.
+    """
     if state.cycle is None:
         return state
     from .models import SourceType
@@ -685,7 +774,6 @@ def open_timer_interval(
         )
     )
     state.cycle = state.cycle.model_copy(update={"timer_intervals": intervals})
-    state = close_sleep_segment(state, now_utc)
     return state
 
 

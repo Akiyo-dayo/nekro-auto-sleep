@@ -507,3 +507,150 @@ class TestQualityBreakdownPersisted:
             "target_hours",
             "effective_hours",
         }
+
+
+# ---------------------------------------------------------------------------
+# Night-time scheduled tasks
+# ---------------------------------------------------------------------------
+
+
+class TestNightTimerPolicy:
+    async def test_run_lets_the_reminder_through(self, wired):
+        plugin_mod, store, ctx = wired
+        m.config.NIGHT_TIMER_POLICY = "run"
+        await _put_asleep(store)
+
+        signal = await plugin_mod.plugin.on_system_message(ctx, "定时提醒：吃药")
+
+        # The host only starts a round for callers passing trigger_agent=True,
+        # so letting this through wakes the timer service and nothing else.
+        assert signal == MsgSignal.CONTINUE
+
+    async def test_run_charges_the_round_to_sleep_quality(self, wired):
+        plugin_mod, store, ctx = wired
+        m.config.NIGHT_TIMER_POLICY = "run"
+        m.config.NIGHT_DUTY_ASSUMED_MINUTES = 6
+        await _put_asleep(store)
+
+        await plugin_mod.plugin.on_system_message(ctx, "定时提醒：吃药")
+
+        cycle = store.get_cached(CHAT_KEY).cycle
+        assert len(cycle.timer_intervals) == 1
+        interval = cycle.timer_intervals[0]
+        assert (interval.end_at - interval.start_at) == timedelta(minutes=6)
+        # Night duty overlays the night; it does not break the sleep segment.
+        assert cycle.sleep_segments[-1].close_at is None
+
+    async def test_block_keeps_the_reminder_out_of_the_llm(self, wired):
+        plugin_mod, store, ctx = wired
+        m.config.NIGHT_TIMER_POLICY = "block"
+        await _put_asleep(store)
+
+        signal = await plugin_mod.plugin.on_system_message(ctx, "定时提醒：吃药")
+
+        assert signal == MsgSignal.BLOCK_TRIGGER
+        assert store.get_cached(CHAT_KEY).cycle.timer_intervals == []
+
+    async def test_awake_channels_are_untouched(self, wired):
+        plugin_mod, store, ctx = wired
+        m.config.NIGHT_TIMER_POLICY = "block"
+        await store.save(ChatSleepState(chat_key=CHAT_KEY))
+
+        assert await plugin_mod.plugin.on_system_message(ctx, "x") == MsgSignal.CONTINUE
+
+    async def test_the_gate_only_blocks_under_the_block_policy(self, wired):
+        plugin_mod, store, _ctx = wired
+        await _put_asleep(store)
+
+        m.config.NIGHT_TIMER_POLICY = "run"
+        assert plugin_mod._night_timer_blocked(CHAT_KEY) is False
+
+        m.config.NIGHT_TIMER_POLICY = "block"
+        assert plugin_mod._night_timer_blocked(CHAT_KEY) is True
+
+    async def test_night_duty_prompt_tells_the_bot_it_is_on_duty(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+
+        text = await plugin_mod.plugin.prompt_injects["sleep_status"](ctx)
+        assert "夜里值班" in text
+        assert "继续睡" in text
+
+
+class TestScheduleGate:
+    async def test_wrapper_is_actually_installed_and_reversible(self):
+        """The first version registered the timer methods for restoration
+        without ever wrapping them, so the gate never existed."""
+        from nekro_auto_sleep.runtime import (
+            is_wrapped,
+            make_schedule_agent_task_wrapper,
+            unwrap_callable,
+            wrap_callable,
+        )
+
+        class FakeService:
+            def __init__(self):
+                self.calls = []
+
+            async def schedule_agent_task(self, chat_key):
+                self.calls.append(chat_key)
+                return "ran"
+
+        service = FakeService()
+        blocked = {"value": False}
+        wrapper = make_schedule_agent_task_wrapper(lambda ck: blocked["value"])
+
+        assert wrap_callable(service, "schedule_agent_task", wrapper) is True
+        assert is_wrapped(service, "schedule_agent_task")
+
+        assert await service.schedule_agent_task(CHAT_KEY) == "ran"
+        blocked["value"] = True
+        assert await service.schedule_agent_task(CHAT_KEY) is None
+        assert service.calls == [CHAT_KEY]
+
+        assert unwrap_callable(service, "schedule_agent_task") is True
+        assert not is_wrapped(service, "schedule_agent_task")
+        assert await service.schedule_agent_task(CHAT_KEY) == "ran"
+
+
+class TestInstallWraps:
+    """`_install_wraps` must actually wrap, not just remember to unwrap.
+
+    The first version appended `(timer_service, "_execute_task")` to the
+    restore list without ever calling `wrap_callable`, so the gate it was
+    supposed to install never existed while the bookkeeping said it did. A test
+    that only exercises `wrap_callable` on a fake object cannot see that.
+    """
+
+    async def test_the_gate_is_installed_and_removed_for_real(self, wired):
+        from nekro_agent.services.message_service import message_service as ms
+        from nekro_auto_sleep.runtime import is_wrapped
+
+        plugin_mod, _store, _ctx = wired
+        plugin_mod._installed_wraps.clear()
+        try:
+            assert plugin_mod._install_wraps() is True
+            assert is_wrapped(ms, "schedule_agent_task"), "gate reported but not installed"
+            assert (ms, "schedule_agent_task") in plugin_mod._installed_wraps
+        finally:
+            plugin_mod._uninstall_wraps()
+
+        assert not is_wrapped(ms, "schedule_agent_task")
+        assert plugin_mod._installed_wraps == []
+
+    async def test_the_installed_gate_honours_the_policy(self, wired):
+        from nekro_agent.services.message_service import message_service as ms
+
+        plugin_mod, store, _ctx = wired
+        await _put_asleep(store)
+        plugin_mod._installed_wraps.clear()
+        try:
+            plugin_mod._install_wraps()
+
+            m.config.NIGHT_TIMER_POLICY = "run"
+            assert await ms.schedule_agent_task(CHAT_KEY) == "scheduled"
+
+            m.config.NIGHT_TIMER_POLICY = "block"
+            assert await ms.schedule_agent_task(CHAT_KEY) is None
+        finally:
+            plugin_mod._uninstall_wraps()

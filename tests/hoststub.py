@@ -237,6 +237,20 @@ class NekroPlugin:
         return decorator
 
 
+# --- nekro_agent.services.message_service --------------------------------------
+
+
+class FakeMessageService:
+    """Enough of the singleton for `_install_wraps` to find and wrap."""
+
+    def __init__(self) -> None:
+        self.scheduled: list[str] = []
+
+    async def schedule_agent_task(self, chat_key: str = "", **kwargs: Any) -> str:
+        self.scheduled.append(chat_key)
+        return "scheduled"
+
+
 # --- installation --------------------------------------------------------------
 
 
@@ -276,5 +290,14 @@ def install_host_stub() -> None:
     _module("nekro_agent.schemas.signal", MsgSignal=MsgSignal)
     _module("nekro_agent.schemas.agent_ctx", AgentCtx=AgentCtx)
 
+    services = _module("nekro_agent.services")
+    services.__path__ = []  # type: ignore[attr-defined]
+    _module(
+        "nekro_agent.services.message_service",
+        message_service=FakeMessageService(),
+        MessageService=FakeMessageService,
+    )
+
     pkg.api = api  # type: ignore[attr-defined]
     pkg.schemas = schemas  # type: ignore[attr-defined]
+    pkg.services = services  # type: ignore[attr-defined]

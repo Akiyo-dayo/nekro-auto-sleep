@@ -213,6 +213,8 @@ def create_config_snapshot(
     max_offers_per_night: int = 3,
     offer_cooldown_minutes: int = 20,
     snooze_minutes: int = 30,
+    asleep_prompt: str = "【{persona}已经睡了 要叫醒{persona}吗？】",
+    near_wake_prompt: str = "【{persona}还没起床 要叫醒{persona}吗？】",
 ) -> ConfigSnapshot:
     """Create a ConfigSnapshot from current config values."""
     return ConfigSnapshot(
@@ -240,4 +242,6 @@ def create_config_snapshot(
         max_offers_per_night=max_offers_per_night,
         offer_cooldown_minutes=offer_cooldown_minutes,
         snooze_minutes=snooze_minutes,
+        asleep_prompt=asleep_prompt,
+        near_wake_prompt=near_wake_prompt,
     )

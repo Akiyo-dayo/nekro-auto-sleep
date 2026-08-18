@@ -116,6 +116,8 @@ class ConfigSnapshot(BaseModel):
     max_offers_per_night: int = 3
     offer_cooldown_minutes: int = 20
     snooze_minutes: int = 30
+    asleep_prompt: str = "【{persona}已经睡了 要叫醒{persona}吗？】"
+    near_wake_prompt: str = "【{persona}还没起床 要叫醒{persona}吗？】"
 
     # Deprecated in v2, kept so v1 payloads keep validating; the near-wake test
     # now uses `near_wake_minutes`.
@@ -132,11 +134,6 @@ class SleepCycle(BaseModel):
     planned_wake_at: datetime
     config_snapshot: ConfigSnapshot
     quality_seed: str
-    # Midpoint of the configured wake range, in seconds after bedtime. Used as
-    # the 100% reference when SLEEP_TARGET_HOURS is left on auto, so a night
-    # that runs long scores above 100 and a short one below, instead of every
-    # undisturbed night landing on the same number.
-    target_sleep_seconds: float = 0.0
     sleep_segments: list[SleepSegment] = Field(default_factory=list)
     wake_attempts: list[WakeAttempt] = Field(default_factory=list)
     timer_intervals: list[TimerInterval] = Field(default_factory=list)

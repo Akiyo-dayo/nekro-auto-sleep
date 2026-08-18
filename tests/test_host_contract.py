@@ -141,6 +141,21 @@ def test_block_all_discards_the_message_before_it_is_recorded():
     assert min(block_lines) < min(record_lines)
 
 
+def test_schedule_agent_task_is_public_and_async():
+    """The only host callable this plugin wraps.
+
+    Deliberately a public method: the previous version also wrapped the private
+    `_run_chat_agent_task`, which upstream is free to rename, and whose absence
+    would have removed a gate while the plugin still looked healthy.
+    """
+    cls = _class(_parse("nekro_agent/services/message_service.py"), "MessageService")
+    node = _func(cls, "schedule_agent_task")
+
+    assert isinstance(node, ast.AsyncFunctionDef)
+    assert not node.name.startswith("_")
+    assert "chat_key" in {a.arg for a in node.args.args}
+
+
 def test_plugin_exposes_every_mount_point_we_use():
     cls = _class(_parse("nekro_agent/services/plugin/base.py"), "NekroPlugin")
     defined = {

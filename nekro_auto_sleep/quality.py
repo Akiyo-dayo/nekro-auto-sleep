@@ -3,11 +3,14 @@
 A role-play metric, not a medical one, with three properties the first model
 did not have:
 
-- **The percentage means something.** 100% is "slept the configured target with
-  nothing bothering me". Above 100% means the night was longer than the target,
-  which is why a number like 103% can show up at all — in the previous model
-  anything over 100 came purely from the random jitter, and the configured
-  ceiling of 120 was unreachable because the raw score topped out at 100.
+- **The percentage means something.** 100% is "slept the night I had planned".
+  The reference is *this night's own plan*, not a fixed number of hours, because
+  the wake-up point is drawn at random from a range: scoring against a fixed
+  target would swing the number by fifteen points for no reason other than the
+  plugin's own dice. Anything above 100% comes from a clean night — nobody
+  called, nothing interrupted — which is a fact about the night rather than
+  about the random draw. (The original model could only exceed 100 through
+  random jitter, and its configured ceiling of 120 was unreachable.)
 - **The scale is used.** Penalties are additive and capped per category instead
   of exponentially saturating, so a rough night lands in the 60s and a wrecked
   one in the 20s rather than everything piling up near the floor.
@@ -36,8 +39,10 @@ FRAGMENT_COST = 6.0  # per extra sleep segment
 FRAGMENT_CAP = 24.0
 CALL_COST = 4.0  # an unanswered wake-up call
 WAKE_COST = 10.0  # a call that actually got the bot out of bed
-MAX_COVERAGE_RATIO = 1.25  # a night cannot count as more than 125% of target
-NIGHT_DUTY_CREDIT = 0.5  # a timer round counts as half sleep, not as being awake
+MAX_COVERAGE_RATIO = 1.25  # only reachable when an explicit target is configured
+CLEAN_NIGHT_BONUS = 3.0  # nobody called, nothing interrupted, one unbroken stretch
+NIGHT_DUTY_DEBIT = 0.5  # half of a night-duty stretch does not count as rest
+MAX_DUTY_RATIO = 0.25  # night duty can never eat more than a quarter of the night
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -56,6 +61,7 @@ class QualityBreakdown:
     penalty_fragmentation: float
     penalty_calls: float
     penalty_wakes: float
+    bonus_clean_night: float
     jitter: float
     raw: float
     segments: int
@@ -127,18 +133,24 @@ def compute_quality_detail(
     snap = cycle.config_snapshot
 
     if snap.sleep_target_hours > 0:
+        # Explicit operator override: measure against a fixed number of hours.
         target_seconds = snap.sleep_target_hours * 3600
-    elif cycle.target_sleep_seconds > 0:
-        # Auto: the midpoint of the configured wake range. A wake-up later than
-        # the midpoint scores above 100%, earlier below.
-        target_seconds = cycle.target_sleep_seconds
     else:
-        # Cycles written before the target was recorded.
-        target_seconds = max(1800.0, (cycle.planned_wake_at - cycle.sleep_at).total_seconds())
+        # Default: this night's own plan. The wake-up point is drawn at random
+        # from a range, so measuring against anything fixed would make an early
+        # draw look like a bad night when nothing bad happened.
+        target_seconds = max(
+            1800.0, (cycle.planned_wake_at - cycle.sleep_at).total_seconds()
+        )
     target_hours = target_seconds / 3600
 
-    duty = night_duty_seconds(cycle)
-    effective = max(0.0, actual_sleep_seconds) + NIGHT_DUTY_CREDIT * duty
+    # Night duty overlaps the sleep segment rather than breaking it: the bot did
+    # not get out of bed, so half the stretch is charged as lost rest instead of
+    # the whole thing being counted either way. The total is capped because the
+    # plugin books an estimate per system message rather than a measured
+    # duration, and a chatty night should not be able to run away with the score.
+    duty = min(night_duty_seconds(cycle), MAX_DUTY_RATIO * target_seconds)
+    effective = max(0.0, max(0.0, actual_sleep_seconds) - NIGHT_DUTY_DEBIT * duty)
 
     coverage_ratio = _clamp(effective / target_seconds, 0.0, MAX_COVERAGE_RATIO)
     base = 100.0 * coverage_ratio
@@ -159,6 +171,11 @@ def compute_quality_detail(
             calls += 1
             penalty_calls += CALL_COST * weight
 
+    undisturbed = (
+        calls == 0 and wakes == 0 and segments <= 1 and duty <= 0 and coverage_ratio >= 0.995
+    )
+    bonus_clean_night = CLEAN_NIGHT_BONUS if undisturbed else 0.0
+
     jitter = compute_stable_jitter(
         cycle.cycle_id,
         cycle.sleep_date,
@@ -166,7 +183,14 @@ def compute_quality_detail(
         snap.quality_jitter_points,
     )
 
-    raw = base - penalty_fragmentation - penalty_calls - penalty_wakes + jitter
+    raw = (
+        base
+        - penalty_fragmentation
+        - penalty_calls
+        - penalty_wakes
+        + bonus_clean_night
+        + jitter
+    )
     score = round(_clamp(raw, snap.quality_min, snap.quality_max))
 
     return QualityBreakdown(
@@ -178,6 +202,7 @@ def compute_quality_detail(
         penalty_fragmentation=round(penalty_fragmentation, 2),
         penalty_calls=round(penalty_calls, 2),
         penalty_wakes=round(penalty_wakes, 2),
+        bonus_clean_night=round(bonus_clean_night, 2),
         jitter=round(jitter, 3),
         raw=round(raw, 2),
         segments=segments,

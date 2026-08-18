@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from zoneinfo import ZoneInfo
@@ -31,6 +31,8 @@ from pydantic import Field
 
 from .engine import (
     ActionForceWake,
+    close_timer_interval,
+    open_timer_interval,
     ActionNone,
     ActionSendFixed,
     ActionSendResumeSleep,
@@ -59,10 +61,7 @@ from .models import (
 from .persistence import SleepStateStore
 from .quality import compute_quality, compute_quality_detail
 from .runtime import (
-    chat_key_locks,
     current_source,
-    lease_ledger,
-    make_run_agent_task_wrapper,
     make_schedule_agent_task_wrapper,
     unwrap_callable,
     wrap_callable,
@@ -234,6 +233,32 @@ class SleepConfig(ConfigBase):
             ),
         ).model_dump(),
     )
+    WAKE_PROMPT_ASLEEP: str = Field(
+        default="【{persona}已经睡了 要叫醒{persona}吗？】",
+        title="叫醒提示语",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(zh_CN="叫醒提示语", en_US="Wake Prompt"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="睡眠中被呼叫时发出的固定提示（不经 LLM），{persona} 会替换为人设名。"
+                "想让用户知道怎么回可以写成「…要叫醒吗？（回「叫醒」或「不用」）」",
+                en_US="Fixed prompt sent when called during sleep (never goes through the LLM); "
+                "{persona} is replaced with the preset name",
+            ),
+        ).model_dump(),
+    )
+    WAKE_PROMPT_NEAR_WAKE: str = Field(
+        default="【{persona}还没起床 要叫醒{persona}吗？】",
+        title="接近起床时的提示语",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(
+                zh_CN="接近起床时的提示语", en_US="Near-Wake Prompt"
+            ),
+            i18n_description=i18n.i18n_text(
+                zh_CN="在「接近起床提前量」内被呼叫时改用这条，{persona} 会替换为人设名",
+                en_US="Used instead when called within the near-wake window; {persona} is replaced with the preset name",
+            ),
+        ).model_dump(),
+    )
     ANSWER_SCOPE: str = Field(
         default="offeree",
         title="谁的回答算数",
@@ -383,14 +408,34 @@ class SleepConfig(ConfigBase):
             ),
         ).model_dump(),
     )
-    TIMER_AGENT_WAIT_TIMEOUT_SECONDS: int = Field(
-        default=900,
-        title="定时任务等待超时（秒）",
+    NIGHT_TIMER_POLICY: str = Field(
+        default="run",
+        title="夜间定时任务策略",
         json_schema_extra=ExtraField(
-            i18n_title=i18n.i18n_text(zh_CN="定时任务等待超时（秒）", en_US="Timer Agent Wait Timeout (s)"),
+            placeholder="run",
+            i18n_title=i18n.i18n_text(
+                zh_CN="夜间定时任务策略", en_US="Night Timer Policy"
+            ),
             i18n_description=i18n.i18n_text(
-                zh_CN="插件等待定时任务完成的最大时间，超时后清理租约但不取消核心任务，30-7200",
-                en_US="Maximum time the plugin waits for a timer task to complete; lease is cleaned on timeout but core task is not cancelled, 30-7200",
+                zh_CN="run（默认）：定时提醒照常执行，Bot 知道自己是在夜里值班，"
+                "值班时长按半睡计入睡眠质量；block：夜间定时提醒只入历史、不执行",
+                en_US="run (default): scheduled reminders still fire at night and the bot is told it is on night duty; "
+                "block: night-time reminders are recorded but never executed",
+            ),
+        ).model_dump(),
+    )
+    NIGHT_DUTY_ASSUMED_MINUTES: int = Field(
+        default=3,
+        title="夜间值班计入时长（分钟）",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(
+                zh_CN="夜间值班计入时长（分钟）", en_US="Assumed Night Duty (min)"
+            ),
+            i18n_description=i18n.i18n_text(
+                zh_CN="每次夜间定时任务按这么久计入睡眠质量（其中一半算作损失的休息），0-120。"
+                "插件拿不到轮次的真实耗时，取一个保守估计而不是去猴补丁宿主内部方法",
+                en_US="Each night-time scheduled task is accounted for as this long (half of it charged as lost rest), 0-120. "
+                "The plugin cannot see the real round duration without patching host internals, so it estimates",
             ),
         ).model_dump(),
     )
@@ -400,8 +445,8 @@ class SleepConfig(ConfigBase):
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="目标睡眠时长（小时）", en_US="Sleep Target (hours)"),
             i18n_description=i18n.i18n_text(
-                zh_CN="质量百分比以此为 100% 的基准，睡得比它久就会超过 100%；填 0 表示自动取起床窗口中点，0-16",
-                en_US="Duration that counts as 100%; sleeping longer scores above 100%. 0 means auto (midpoint of the wake range), 0-16",
+                zh_CN="固定的 100% 基准时长。填 0（默认）表示以当晚自己的计划睡眠时长为准——起床时间本来就是范围内随机的，拿固定值当基准会让「今天起得早」被当成睡得差，0-16",
+                en_US="Fixed duration that counts as 100%. 0 (default) scores against this night's own planned window, so an early random wake-up is not mistaken for a bad night, 0-16",
             ),
         ).model_dump(),
     )
@@ -562,14 +607,19 @@ def _is_sleeping(chat_key: str) -> bool:
     return state.status == SleepStatus.ASLEEP
 
 
-def _has_permission(chat_key: str) -> bool:
-    """Check if there's an active lease or contextvar permission."""
-    src = current_source.get()
-    if src in (SourceType.USER_WAKE_CONFIRM, SourceType.USER_DIRECT,
-               SourceType.TIMER_ONESHOT, SourceType.TIMER_RECURRING,
-               SourceType.INTERNAL_WAKE_NOTICE):
-        return True
-    return lease_ledger.has_active_for_chat(chat_key)
+def _night_timer_blocked(chat_key: str) -> bool:
+    """Whether a directly scheduled agent round should be dropped right now.
+
+    Only true while the chat is asleep *and* the operator asked for night-time
+    scheduled tasks to be blocked. With the default `run` policy this is always
+    false, which is the whole point: a reminder the user scheduled for 03:00 is
+    something they asked for.
+    """
+    if not config.ENABLED:
+        return False
+    if config.NIGHT_TIMER_POLICY != "block":
+        return False
+    return _is_sleeping(chat_key)
 
 
 def _make_config_snapshot() -> Any:
@@ -598,6 +648,8 @@ def _make_config_snapshot() -> Any:
         max_offers_per_night=config.MAX_OFFERS_PER_NIGHT,
         offer_cooldown_minutes=config.OFFER_COOLDOWN_MINUTES,
         snooze_minutes=config.SNOOZE_MINUTES,
+        asleep_prompt=config.WAKE_PROMPT_ASLEEP,
+        near_wake_prompt=config.WAKE_PROMPT_NEAR_WAKE,
     )
 
 
@@ -697,17 +749,47 @@ async def on_system_message(ctx: AgentCtx, message: str) -> MsgSignal | None:
     if state.status != SleepStatus.ASLEEP:
         return MsgSignal.CONTINUE
 
-    src = current_source.get()
-    if src in (SourceType.TIMER_ONESHOT, SourceType.TIMER_RECURRING,
-               SourceType.INTERNAL_WAKE_NOTICE):
+    if current_source.get() == SourceType.INTERNAL_WAKE_NOTICE:
         return MsgSignal.CONTINUE
 
-    if lease_ledger.has_active_for_chat(chat_key):
-        return MsgSignal.CONTINUE
+    if config.NIGHT_TIMER_POLICY == "block":
+        # Recorded so the morning context is continuous, but no agent round.
+        return MsgSignal.BLOCK_TRIGGER
 
-    # Keep the notice in history so the morning context is continuous; just do
-    # not spin up an agent round for it.
-    return MsgSignal.BLOCK_TRIGGER
+    # `run`: let it through. The host only starts a round for callers that pass
+    # trigger_agent=True — which is the timer service — so ordinary system
+    # notices still stay silent, and a reminder the user scheduled for 03:00
+    # actually fires. The bot is told it is on night duty by the prompt
+    # injection, and the stretch is charged to sleep quality.
+    await _record_night_duty(chat_key)
+    return MsgSignal.CONTINUE
+
+
+async def _record_night_duty(chat_key: str) -> None:
+    """Charge a night-time scheduled round to the sleep record.
+
+    The plugin cannot see how long the round actually takes without wrapping a
+    private host method, so it books a configured estimate instead. Half of the
+    stretch is charged as lost rest; the sleep segment itself is left open,
+    because a timer is not the bot getting out of bed.
+    """
+    minutes = max(0, min(120, config.NIGHT_DUTY_ASSUMED_MINUTES))
+    if minutes == 0:
+        return
+
+    now_utc = _utcnow()
+    task_id = f"night-duty-{now_utc.isoformat()}"
+
+    async def _mark(state: ChatSleepState) -> ChatSleepState:
+        if state.status != SleepStatus.ASLEEP or state.cycle is None:
+            return state
+        state = open_timer_interval(state, task_id, now_utc)
+        return close_timer_interval(state, task_id, now_utc + timedelta(minutes=minutes))
+
+    try:
+        await _get_store().with_state(chat_key, _mark)
+    except Exception as exc:
+        logger.warning("Cannot record night duty for %s: %s", chat_key, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -759,8 +841,9 @@ def _render_sleep_context(state: ChatSleepState, now_utc: datetime) -> str:
 
     if state.status == SleepStatus.ASLEEP:
         return (
-            f"[睡眠状态] 你从 {bedtime} 起一直在睡觉，计划 {planned} 自然醒，"
-            "此刻仍在睡梦中。"
+            f"[睡眠状态] 你从 {bedtime} 起一直在睡觉，计划 {planned} 自然醒。"
+            "现在是夜里值班——有个定时任务把你临时叫起来处理，"
+            "处理完就继续睡，不用寒暄，也不要表现得像已经起床了。"
         )
 
     return ""
@@ -1125,7 +1208,14 @@ async def _boot_reconcile(store: SleepStateStore, now_utc: datetime) -> None:
 
 
 def _install_wraps() -> bool:
-    """Install runtime wraps via capability probing (spec §2.3)."""
+    """Install the one optional host gate, via capability probing.
+
+    Only `schedule_agent_task` is wrapped, and only so that
+    NIGHT_TIMER_POLICY=block can stop a directly scheduled round. It is a public
+    method; nothing private is patched any more. Inbound user messages never get
+    this far while asleep — `on_user_message` has already blocked them — so with
+    the default `run` policy this wrapper is a pass-through.
+    """
     success = True
 
     try:
@@ -1135,50 +1225,18 @@ def _install_wraps() -> bool:
             return False
 
         if hasattr(ms, "schedule_agent_task") and callable(ms.schedule_agent_task):
-            wrapper = make_schedule_agent_task_wrapper(_is_sleeping, _has_permission)
+            wrapper = make_schedule_agent_task_wrapper(_night_timer_blocked)
             if wrap_callable(ms, "schedule_agent_task", wrapper):
                 _installed_wraps.append((ms, "schedule_agent_task"))
         else:
             logger.error("schedule_agent_task not found on message_service")
             success = False
 
-        if hasattr(ms, "_run_chat_agent_task") and callable(ms._run_chat_agent_task):
-            async def _on_agent_start(chat_key: str) -> None:
-                pass
-
-            async def _on_agent_end(chat_key: str) -> None:
-                store = _get_store()
-                state = store.get_cached(chat_key)
-                if state and state.status == SleepStatus.AWAKE_EARLY:
-                    src = current_source.get()
-                    if src == SourceType.USER_DIRECT or src == SourceType.USER_WAKE_CONFIRM:
-                        async def _refresh(s: ChatSleepState) -> ChatSleepState:
-                            return refresh_idle_deadline(s, _utcnow())
-                        await store.with_state(chat_key, _refresh)
-
-            wrapper = make_run_agent_task_wrapper(
-                _is_sleeping, _on_agent_start, _on_agent_end
-            )
-            if wrap_callable(ms, "_run_chat_agent_task", wrapper):
-                _installed_wraps.append((ms, "_run_chat_agent_task"))
-        else:
-            logger.warning("_run_chat_agent_task not found, layer-3 gate unavailable")
-
     except ImportError as exc:
         logger.error("Cannot import message_service: %s", exc)
         return False
 
-    # The timer gate is deliberately NOT installed. The previous build appended
-    # (timer_service, "_execute_task") to _installed_wraps without ever calling
-    # wrap_callable, so the lease ledger was never populated and night-time timer
-    # tasks were silently blocked by on_system_message instead of temporarily
-    # waking the bot. Registering an entry that was never wrapped only made the
-    # gap look filled. NIGHT_TIMER_POLICY replaces this whole path.
-    logger.info(
-        "Night timer gate not installed; scheduled tasks run normally at night "
-        "(NIGHT_TIMER_POLICY will take this over)"
-    )
-
+    logger.info("Night timer policy: %s", config.NIGHT_TIMER_POLICY)
     return success
 
 
@@ -1226,8 +1284,6 @@ async def cleanup() -> None:
         _maintenance_task = None
 
     _uninstall_wraps()
-    lease_ledger.clear()
-    chat_key_locks.clear()
 
     if _store:
         _store.clear_all()
