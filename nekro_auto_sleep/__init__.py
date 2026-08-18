@@ -163,12 +163,20 @@ plugin = NekroPlugin(
     version="1.0.0",
     author="Akiyo_dayo",
     url="https://github.com/Akiyo-dayo/nekro-auto-sleep",
-    allow_sleep=True,
-    # Without a brief the host treats the plugin as not dormant-capable under the
-    # `auto` strategy, so `allow_sleep=True` alone kept its prompt resident all
-    # day. (Host-side "sleep" here means plugin dormancy in the prompt — nothing
-    # to do with the bot going to bed.)
-    sleep_brief="让 Bot 按作息入睡与起床；仅在被提前叫醒、需要决定继续睡还是起来时才用得上。",
+    # Deliberately NOT dormant-capable. Host-side "sleep" here means plugin
+    # dormancy in the prompt — nothing to do with the bot going to bed — and a
+    # dormant plugin renders its brief **without any of its methods**, so the
+    # model has to call extend_plugin_activation before it can do anything. That
+    # is fatal here: the one moment `resume_sleep` matters is the moment someone
+    # tells the bot to go back to sleep, and the model would answer "好的我去睡了"
+    # with no tool to actually do it. Observed live.
+    #
+    # Paying for it in tokens is unnecessary anyway: `mount_collect_methods`
+    # already withholds the method except while the bot is awake before its
+    # alarm, and the host drops the whole block when a resident plugin discloses
+    # no methods. Same saving, without hiding the tool when it is needed.
+    allow_sleep=False,
+    sleep_brief="让 Bot 按作息入睡与起床；仅在被提前叫醒、需要决定继续睡还是起来时才交出方法。",
     i18n_name=i18n.i18n_text(
         zh_CN="自动睡眠",
         en_US="Auto Sleep",

@@ -344,7 +344,12 @@ python tools/gen_config_table.py --write
 - 每个 `chat_key` 独立状态、独立异步锁
 - 领域层（`models` / `schedule` / `engine` / `quality`）不导入宿主单例，可独立测试
 - `resume_sleep` 通过 `mount_collect_methods` 按状态收集：只有被提前叫醒、且还没到
-  计划起床点时才出现在提示词里，白天一个 token 都不占
+  计划起床点时才出现在提示词里，白天一个 token 都不占（常驻插件本轮不交方法时，
+  宿主会把整块声明一起收掉）
+- **不使用宿主的插件休眠**（`allow_sleep=False`）：休眠态只渲染简介、不渲染方法，
+  模型得先调 `extend_plugin_activation` 才拿得到 `resume_sleep`——而这个工具恰恰
+  只在「有人让它去睡」那一刻才有用，模型会答应下来却没有工具可用。省 token 这件事
+  `collect_methods` 已经做了，不需要再叠一层休眠
 - 命令系统缺失时（老版本宿主）自动跳过 `/sleep` 注册，插件仍可加载
 - 每频道解析出的作息与实例配置带 300 秒 TTL 缓存，写入覆盖时显式失效
 - 插件日志经 `_HostLogBridge` 转发进宿主 logger：领域层保持只依赖 stdlib `logging`

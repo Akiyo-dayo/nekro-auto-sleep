@@ -257,3 +257,44 @@ def test_boot_discovery_queries_have_the_columns_they_filter_on(relpath, cls_nam
         if isinstance(stmt, ast.Assign) and isinstance(stmt.targets[0], ast.Name)
     }
     assert fields <= defined, fields - defined
+
+
+def test_a_dormant_plugin_is_rendered_without_its_methods():
+    """Why this plugin sets `allow_sleep=False`.
+
+    Host-side plugin dormancy renders only the brief, withholding every method
+    until the model calls `extend_plugin_activation`. That is fatal for
+    `resume_sleep`: the one moment it matters is when somebody tells the bot to
+    go back to sleep, and a dormant plugin leaves the model answering
+    "好的我去睡了" with no tool to actually do it. Observed live.
+    """
+    tree = _parse("nekro_agent/services/plugin/prompt_activation.py")
+    node = _func(tree, "build_prompt_disclosure_view")
+
+    sleeping_units = [
+        call
+        for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+        and getattr(call.func, "id", getattr(call.func, "attr", "")) == "PluginPromptRenderUnit"
+        and any(
+            kw.arg == "state"
+            and isinstance(kw.value, ast.Constant)
+            and kw.value.value == "sleeping"
+            for kw in call.keywords
+        )
+    ]
+    assert sleeping_units, "no sleeping render unit found; dormancy may have changed"
+    for call in sleeping_units:
+        assert "plugin_method_prompt" not in {kw.arg for kw in call.keywords}, (
+            "a dormant plugin now discloses its methods; `allow_sleep=False` "
+            "may no longer be necessary"
+        )
+
+
+def test_allow_sleep_false_is_honoured_over_any_strategy():
+    """`allow_sleep=False` must win regardless of the operator's strategy."""
+    tree = _parse("nekro_agent/services/plugin/prompt_activation.py")
+    node = _func(tree, "is_sleep_effective")
+
+    source = ast.dump(node)
+    assert "plugin_strategy_is_protected" in source

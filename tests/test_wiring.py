@@ -1728,3 +1728,16 @@ class TestResumeSleepInstruction:
 class TestPluginMetadata:
     async def test_the_url_points_at_this_repository(self):
         assert "nekro-auto-sleep" in m.plugin.init_kwargs["url"]
+
+
+class TestPromptDormancy:
+    async def test_the_plugin_never_goes_dormant_in_the_prompt(self):
+        """A dormant plugin shows a brief and no methods.
+
+        `resume_sleep` matters exactly when somebody tells the bot to go back to
+        sleep; hiding it behind `extend_plugin_activation` meant the model
+        agreed to sleep and then could not. Token cost is already handled by
+        `mount_collect_methods`, which withholds the method except while the bot
+        is awake before its alarm.
+        """
+        assert m.plugin.init_kwargs["allow_sleep"] is False
