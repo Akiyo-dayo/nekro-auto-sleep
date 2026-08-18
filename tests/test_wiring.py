@@ -1630,3 +1630,101 @@ class TestSpacedCommandForm:
         )
         assert response.status == "error"
         assert "参数" in response.message
+
+
+class TestIdleSleepBack:
+    """Woken at 23:01, still up at 02:17 with the deadline nine minutes out.
+
+    The idle timer refreshed on every message in the channel, so a group that
+    keeps chatting among itself all night pushed the deadline forward forever
+    and the bot never went back to bed. Reported from the live instance.
+    """
+
+    WAKER = "u1"
+    BYSTANDER = "u2"
+
+    def _msg(self, sender: str, text: str, is_tome: bool = False):
+        return ChatMessage(
+            content=text, chat_key=CHAT_KEY, platform_userid=sender, is_tome=is_tome
+        )
+
+    async def _woken(self, plugin_mod, store, ctx):
+        await _put_asleep(store)
+        await plugin_mod.plugin.on_user_message(ctx, self._msg(self.WAKER, "醒醒"))
+        await plugin_mod.plugin.on_user_message(ctx, self._msg(self.WAKER, "要"))
+        return store.get_cached(CHAT_KEY).idle_sleep_deadline
+
+    async def test_bystander_chatter_does_not_keep_it_up(self, wired, clock):
+        plugin_mod, store, ctx = wired
+        deadline = await self._woken(plugin_mod, store, ctx)
+
+        clock.advance(minutes=5)
+        for _ in range(5):
+            await plugin_mod.plugin.on_user_message(
+                ctx, self._msg(self.BYSTANDER, "他们在聊别的")
+            )
+
+        assert store.get_cached(CHAT_KEY).idle_sleep_deadline == deadline
+
+    async def test_the_waker_carrying_on_does_keep_it_up(self, wired, clock):
+        plugin_mod, store, ctx = wired
+        deadline = await self._woken(plugin_mod, store, ctx)
+
+        clock.advance(minutes=5)
+        await plugin_mod.plugin.on_user_message(
+            ctx, self._msg(self.WAKER, "帮我看个东西")
+        )
+
+        assert store.get_cached(CHAT_KEY).idle_sleep_deadline > deadline
+
+    async def test_someone_else_addressing_it_also_counts(self, wired, clock):
+        plugin_mod, store, ctx = wired
+        deadline = await self._woken(plugin_mod, store, ctx)
+
+        clock.advance(minutes=5)
+        await plugin_mod.plugin.on_user_message(
+            ctx, self._msg(self.BYSTANDER, "在吗", is_tome=True)
+        )
+
+        assert store.get_cached(CHAT_KEY).idle_sleep_deadline > deadline
+
+    async def test_it_goes_back_to_sleep_once_the_deadline_passes(self, wired, clock):
+        plugin_mod, store, ctx = wired
+        await self._woken(plugin_mod, store, ctx)
+
+        # A noisy room, but nobody is talking to the bot.
+        for minute in range(1, 13):
+            clock.advance(minutes=1)
+            await plugin_mod.plugin.on_user_message(
+                ctx, self._msg(self.BYSTANDER, f"闲聊 {minute}")
+            )
+            await plugin_mod._maintain_chat(store, CHAT_KEY, clock.now)
+
+        assert store.get_cached(CHAT_KEY).status == SleepStatus.ASLEEP
+
+
+class TestResumeSleepInstruction:
+    async def test_the_prompt_tells_it_that_saying_so_is_not_enough(self, wired):
+        """The model kept replying "好的我去睡了" without calling the tool."""
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="醒醒", chat_key=CHAT_KEY)
+        )
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="要", chat_key=CHAT_KEY)
+        )
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="继续聊", chat_key=CHAT_KEY)
+        )
+
+        text = await plugin_mod.plugin.prompt_injects["sleep_status"](ctx)
+
+        assert "resume_sleep" in text
+        assert "让你去睡" in text
+        assert "并不会真的睡下" in text
+
+
+class TestPluginMetadata:
+    async def test_the_url_points_at_this_repository(self):
+        assert "nekro-auto-sleep" in m.plugin.init_kwargs["url"]

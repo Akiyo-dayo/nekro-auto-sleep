@@ -162,7 +162,7 @@ plugin = NekroPlugin(
     description="为每个会话提供独立的拟人化睡眠周期，支持叫醒协议和睡眠质量统计",
     version="1.0.0",
     author="Akiyo_dayo",
-    url="https://github.com/Akiyo-dayo/NekroAgent_ByAkiyo",
+    url="https://github.com/Akiyo-dayo/nekro-auto-sleep",
     allow_sleep=True,
     # Without a brief the host treats the plugin as not dormant-capable under the
     # `auto` strategy, so `allow_sleep=True` alone kept its prompt resident all
@@ -1105,10 +1105,19 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage) -> MsgSignal | No
             return state
 
         if state.status == SleepStatus.AWAKE_EARLY:
-            # Another message means the exchange carried on, so the round that
-            # was deciding whether to stay up is over either way.
-            state = clear_wake_decision(state)
-            state = refresh_idle_deadline(state, now_utc)
+            # "Still needed" means somebody is talking *to it*: a message aimed
+            # at the bot, or anything from the person who woke it — they are by
+            # definition mid-conversation and should not have to @ it every
+            # line. Refreshing on every message in the room instead meant a
+            # group chatting among itself at 2am pushed the deadline forward
+            # forever: observed live, woken at 23:01 and still up three hours
+            # later with the deadline nine minutes out.
+            engaged = _is_valid_call(message, persona_name) or (
+                state.woken_by is not None and user_id == state.woken_by
+            )
+            if engaged:
+                state = clear_wake_decision(state)
+                state = refresh_idle_deadline(state, now_utc)
             _result_signal = MsgSignal.CONTINUE
             return state
 
@@ -1270,8 +1279,9 @@ def _render_sleep_context(
             f"（当前 {_fmt_local(now_utc, tz_name)}）。",
             f"{bedtime} 之后的消息你都是在睡着时收到的，刚醒来才看见，"
             "不要表现得像你当时就在场。",
-            f"如果对方不再需要你，可以调用 resume_sleep 回去继续睡；"
-            f"否则到 {planned} 会自然醒。",
+            f"对方让你去睡、或者不再需要你了，就调用 resume_sleep 睡回去——"
+            "这是唯一能让你重新睡下的方式，光在话里说「我去睡了」并不会真的睡下。"
+            f"没人再找你的话到 {planned} 也会自然醒。",
         ]
         if state.wake_decision_pending:
             # This round decides whether the caller actually wanted the bot up.
@@ -1457,9 +1467,13 @@ async def _maintain_chat(
             await store.with_state(chat_key, _settle)
         elif is_idle_expired(state, now_utc):
             if not has_active_timer_lease(state):
+
                 async def _idle_back(s: ChatSleepState) -> ChatSleepState:
                     return handle_idle_sleep_back(s, now_utc)
-                await store.with_state(chat_key, _idle_back)
+
+                new_state = await store.with_state(chat_key, _idle_back)
+                if new_state.status == SleepStatus.ASLEEP:
+                    logger.info("%s 没人再找，静默睡回去", chat_key)
 
 
 async def _last_message_at(chat_key: str) -> datetime | None:
