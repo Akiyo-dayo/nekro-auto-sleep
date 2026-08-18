@@ -86,8 +86,14 @@ def create_sleep_cycle(
     chat_key: str,
     sleep_date_local: str,
     config_snapshot: ConfigSnapshot,
+    sleep_at_override: datetime | None = None,
 ) -> SleepCycle:
-    """Create a new SleepCycle with pre-computed random wake time."""
+    """Create a new SleepCycle with a pre-computed random wake time.
+
+    `sleep_at_override` is for a forced early bedtime: the wake-up point still
+    comes from the configured range, but the night is measured from when the bot
+    actually turned in.
+    """
     from datetime import date as date_type
 
     sd = date_type.fromisoformat(sleep_date_local)
@@ -113,7 +119,7 @@ def create_sleep_cycle(
         cycle_id=generate_cycle_id(chat_key, sd),
         sleep_date=sleep_date_local,
         timezone=config_snapshot.timezone,
-        sleep_at=sleep_at,
+        sleep_at=min(sleep_at, sleep_at_override) if sleep_at_override else sleep_at,
         planned_wake_at=planned_wake,
         config_snapshot=config_snapshot,
         quality_seed=generate_quality_seed(chat_key, sd),
@@ -164,6 +170,7 @@ def transition_to_sleep(
     config_snapshot: ConfigSnapshot,
     sleep_date_local: str | None = None,
     segment_open_at: datetime | None = None,
+    sleep_at_override: datetime | None = None,
 ) -> ChatSleepState:
     """AWAKE -> ASLEEP: create cycle and open segment.
 
@@ -178,7 +185,9 @@ def transition_to_sleep(
     if sleep_date_local is None:
         sleep_date_local = now_utc.astimezone(tz).date().isoformat()
 
-    cycle = create_sleep_cycle(state.chat_key, sleep_date_local, config_snapshot)
+    cycle = create_sleep_cycle(
+        state.chat_key, sleep_date_local, config_snapshot, sleep_at_override
+    )
     state = state.model_copy(
         update={
             "status": SleepStatus.ASLEEP,

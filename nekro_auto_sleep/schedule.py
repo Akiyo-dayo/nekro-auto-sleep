@@ -11,7 +11,7 @@ from datetime import date, datetime, time, timedelta
 
 from zoneinfo import ZoneInfo
 
-from .models import ConfigSnapshot
+from .models import ConfigSnapshot, ResolvedSchedule, ScheduleOverride
 
 
 def parse_hhmm(s: str) -> time:
@@ -178,6 +178,40 @@ def next_sleep_at(
     if candidate <= local_now:
         candidate += timedelta(days=1)
     return candidate.astimezone(ZoneInfo("UTC"))
+
+
+def resolve_schedule(
+    *,
+    timezone: str,
+    sleep_time: str,
+    wake_time_start: str,
+    wake_time_end: str,
+    preset_override: ScheduleOverride | None = None,
+    channel_override: ScheduleOverride | None = None,
+) -> ResolvedSchedule:
+    """Layer the schedule: channel beats persona, persona beats global config.
+
+    A persona keeps its own hours the way it keeps its own memories, and a
+    single channel can still be moved without touching either.
+    """
+    values = {
+        "timezone": timezone,
+        "sleep_time": sleep_time,
+        "wake_time_start": wake_time_start,
+        "wake_time_end": wake_time_end,
+    }
+    sources = dict.fromkeys(values, "global")
+
+    for label, override in (("preset", preset_override), ("channel", channel_override)):
+        if override is None:
+            continue
+        for field in values:
+            value = getattr(override, field, None)
+            if value:
+                values[field] = value
+                sources[field] = label
+
+    return ResolvedSchedule(**values, sources=sources)
 
 
 def parse_keyword_list(raw: str | list[str]) -> list[str]:

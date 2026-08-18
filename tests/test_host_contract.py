@@ -173,8 +173,43 @@ def test_plugin_exposes_every_mount_point_we_use():
         "mount_prompt_inject_method",
         "mount_sandbox_method",
         "mount_collect_methods",
+        "mount_command_group",
     }
     assert required <= defined, required - defined
+
+
+def test_command_system_surface():
+    """`/sleep ...` is registered against these; missing them disables the group."""
+    perms = _class(_parse("nekro_agent/services/command/base.py"), "CommandPermission")
+    members = {
+        stmt.targets[0].id
+        for stmt in perms.body
+        if isinstance(stmt, ast.Assign) and isinstance(stmt.targets[0], ast.Name)
+    }
+    assert {"PUBLIC", "ADVANCED", "SUPER_USER"} <= members
+
+    schemas = _parse("nekro_agent/services/command/schemas.py")
+    ctx = _class(schemas, "CommandExecutionContext")
+    ctx_fields = {
+        stmt.target.id
+        for stmt in ctx.body
+        if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
+    }
+    assert "chat_key" in ctx_fields
+
+    arg_init = _func(_class(schemas, "Arg"), "__init__")
+    arg_kwargs = {a.arg for a in arg_init.args.kwonlyargs} | {
+        a.arg for a in arg_init.args.args
+    }
+    assert {"description", "default", "positional", "choices"} <= arg_kwargs
+
+    ctl = _class(_parse("nekro_agent/services/command/ctl.py"), "CmdCtl")
+    ctl_methods = {
+        node.name
+        for node in ctl.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert {"success", "failed"} <= ctl_methods
 
 
 @pytest.mark.parametrize(

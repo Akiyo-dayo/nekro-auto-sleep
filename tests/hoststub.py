@@ -94,13 +94,42 @@ class FakePreset:
 
 
 class FakeChatChannel:
-    def __init__(self, chat_key: str, preset_name: str = "小助手", is_active: bool = True) -> None:
+    def __init__(
+        self,
+        chat_key: str,
+        preset_name: str = "小助手",
+        is_active: bool = True,
+        preset_id: Optional[int] = 1,
+    ) -> None:
         self.chat_key = chat_key
         self.is_active = is_active
+        self.preset_id = preset_id
         self._preset = FakePreset(preset_name)
 
     async def get_preset(self) -> FakePreset:
         return self._preset
+
+    @classmethod
+    async def get_channel(cls, chat_key: str = "") -> "FakeChatChannel":
+        return _channel_factory(chat_key)
+
+
+def _default_channel_factory(chat_key: str) -> FakeChatChannel:
+    return FakeChatChannel(chat_key)
+
+
+_channel_factory: Callable[[str], FakeChatChannel] = _default_channel_factory
+
+
+def set_channel_factory(factory: Callable[[str], FakeChatChannel]) -> None:
+    """Control what `DBChatChannel.get_channel` hands back."""
+    global _channel_factory
+    _channel_factory = factory
+
+
+def reset_channel_factory() -> None:
+    global _channel_factory
+    _channel_factory = _default_channel_factory
 
 
 class AgentCtx:
@@ -172,6 +201,7 @@ class NekroPlugin:
         self.prompt_injects: dict[str, Callable] = {}
         self.sandbox_methods: dict[str, Callable] = {}
         self.collect_methods: Any = None
+        self.commands: dict[str, Callable] = {}
         self.init_method: Any = None
         self.cleanup_method: Any = None
 
@@ -222,6 +252,16 @@ class NekroPlugin:
 
         return decorator
 
+    def mount_command_group(self, name: str, description: str = "", **kwargs: Any):
+        return CommandGroup(self, name)
+
+    def mount_command(self, name: str, description: str = "", **kwargs: Any) -> Callable:
+        def decorator(func):
+            self.commands[name] = func
+            return func
+
+        return decorator
+
     def mount_init_method(self) -> Callable:
         def decorator(func):
             self.init_method = func
@@ -232,6 +272,70 @@ class NekroPlugin:
     def mount_cleanup_method(self) -> Callable:
         def decorator(func):
             self.cleanup_method = func
+            return func
+
+        return decorator
+
+
+# --- nekro_agent.services.command.* --------------------------------------------
+
+
+class CommandPermission(str, enum.Enum):
+    PUBLIC = "public"
+    USER = "user"
+    ADVANCED = "advanced"
+    SUPER_USER = "super_user"
+
+
+class CommandExecutionContext(BaseModel):
+    user_id: str = "u1"
+    chat_key: str = ""
+    username: str = "tester"
+    adapter_key: str = "onebot_v11"
+    is_super_user: bool = True
+    is_advanced_user: bool = True
+
+
+class CommandResponse(BaseModel):
+    status: str
+    message: str = ""
+
+
+class CmdCtl:
+    @staticmethod
+    def success(content: str = "", **kw: Any) -> CommandResponse:
+        return CommandResponse(status="success", message=content)
+
+    @staticmethod
+    def failed(content: str = "", **kw: Any) -> CommandResponse:
+        return CommandResponse(status="error", message=content)
+
+
+class _Missing:
+    """Stands in for a positional argument the real parser would have filled."""
+
+
+_UNSET = object()
+
+
+def Arg(description: str = "", *, default: Any = _UNSET, **kwargs: Any) -> Any:
+    """Collapse to the plain default, the way the real parser resolves it.
+
+    The real `Arg` is a descriptor the command framework replaces before the
+    handler runs; returning the default here lets tests call the handler as an
+    ordinary function and still exercise the declared defaults.
+    """
+    return _Missing() if default is _UNSET else default
+
+
+class CommandGroup:
+    def __init__(self, plugin: "NekroPlugin", name: str) -> None:
+        self._plugin = plugin
+        self._name = name
+
+    def command(self, name: str, description: str = "", **kwargs: Any) -> Callable:
+        def decorator(func):
+            self._plugin.commands[f"{self._name}.{name}"] = func
             return func
 
         return decorator
@@ -290,8 +394,22 @@ def install_host_stub() -> None:
     _module("nekro_agent.schemas.signal", MsgSignal=MsgSignal)
     _module("nekro_agent.schemas.agent_ctx", AgentCtx=AgentCtx)
 
+    models = _module("nekro_agent.models")
+    models.__path__ = []  # type: ignore[attr-defined]
+    _module("nekro_agent.models.db_chat_channel", DBChatChannel=FakeChatChannel)
+
     services = _module("nekro_agent.services")
     services.__path__ = []  # type: ignore[attr-defined]
+    command_pkg = _module("nekro_agent.services.command")
+    command_pkg.__path__ = []  # type: ignore[attr-defined]
+    _module("nekro_agent.services.command.base", CommandPermission=CommandPermission)
+    _module("nekro_agent.services.command.ctl", CmdCtl=CmdCtl)
+    _module(
+        "nekro_agent.services.command.schemas",
+        Arg=Arg,
+        CommandExecutionContext=CommandExecutionContext,
+        CommandResponse=CommandResponse,
+    )
     _module(
         "nekro_agent.services.message_service",
         message_service=FakeMessageService(),
@@ -301,3 +419,4 @@ def install_host_stub() -> None:
     pkg.api = api  # type: ignore[attr-defined]
     pkg.schemas = schemas  # type: ignore[attr-defined]
     pkg.services = services  # type: ignore[attr-defined]
+    pkg.models = models  # type: ignore[attr-defined]

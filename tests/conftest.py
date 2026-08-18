@@ -24,6 +24,7 @@ class FakeStoreBackend:
 
     def __init__(self) -> None:
         self._data: dict[str, str] = {}
+        self.set_calls = 0
 
     def _key(self, chat_key: str, user_key: str, store_key: str) -> str:
         return f"{chat_key}|{user_key}|{store_key}"
@@ -39,6 +40,7 @@ class FakeStoreBackend:
         k = self._key(chat_key, user_key, store_key)
         existed = k in self._data
         self._data[k] = value
+        self.set_calls += 1
         return 1 if existed else 0
 
     async def delete(

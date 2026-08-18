@@ -168,6 +168,34 @@ class PendingWakeOffer(BaseModel):
         return v
 
 
+class ScheduleOverride(BaseModel):
+    """A partial schedule that shadows the global config.
+
+    Every field is optional: an override says only what it wants to change, so
+    a channel can move its bedtime without also pinning its timezone.
+    """
+
+    timezone: str | None = None
+    sleep_time: str | None = None
+    wake_time_start: str | None = None
+    wake_time_end: str | None = None
+
+    def is_empty(self) -> bool:
+        return not any(
+            (self.timezone, self.sleep_time, self.wake_time_start, self.wake_time_end)
+        )
+
+
+class ResolvedSchedule(BaseModel):
+    """The schedule actually in force for one chat, plus where it came from."""
+
+    timezone: str
+    sleep_time: str
+    wake_time_start: str
+    wake_time_end: str
+    sources: dict[str, str] = Field(default_factory=dict)
+
+
 class ChatSleepState(BaseModel):
     """Top-level persisted state for one chat_key."""
 
@@ -181,6 +209,8 @@ class ChatSleepState(BaseModel):
     offers_sent_tonight: int = 0
     last_offer_at: datetime | None = None
     snooze_until: datetime | None = None
+    # Local sleep_date the operator asked the bot to stay up through.
+    skip_sleep_date: str | None = None
     idle_sleep_deadline: datetime | None = None
     cycle: SleepCycle | None = None
     # Wake provenance, used to render the sleep-status prompt injection for the

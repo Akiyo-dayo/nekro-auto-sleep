@@ -22,8 +22,8 @@ from nekro_auto_sleep.engine import (
     compute_actual_sleep_seconds,
     transition_to_sleep,
 )
-from nekro_auto_sleep.models import ChatSleepState, SleepStatus
-from nekro_auto_sleep.persistence import SleepStateStore
+from nekro_auto_sleep.models import ChatSleepState, ScheduleOverride, SleepStatus
+from nekro_auto_sleep.persistence import ScheduleOverrideStore, SleepStateStore
 from nekro_auto_sleep.quality import compute_quality
 from tests.hoststub import (
     AgentCtx,
@@ -70,6 +70,9 @@ def wired(monkeypatch, clock):
     backend = FakeStoreBackend()
     store = SleepStateStore(backend)
     monkeypatch.setattr(m, "_store", store)
+    monkeypatch.setattr(m, "_overrides", ScheduleOverrideStore(backend))
+    store.test_backend = backend  # write counter, for the quiet-tick assertions
+    m.invalidate_schedule_cache()
 
     saved = m.config.model_dump()
     m.config.TIMEZONE = "Asia/Shanghai"
@@ -91,6 +94,7 @@ def wired(monkeypatch, clock):
     yield m, store, ctx
 
     reset_ctx_factory()
+    m.invalidate_schedule_cache()
     for k, v in saved.items():
         setattr(m.config, k, v)
 
@@ -250,8 +254,21 @@ class TestPersonaName:
         # a bare except turned every persona into the configured fallback.
         assert await plugin_mod._get_persona_name(ctx) == PERSONA
 
-    async def test_falls_back_only_when_there_is_no_channel(self, wired):
+    async def test_looks_the_channel_up_when_the_ctx_has_none(self, wired):
+        """Upstream can hand back a ctx with no channel prefilled."""
         plugin_mod, _store, _ctx = wired
+        bare = AgentCtx(CHAT_KEY, None)
+        assert await plugin_mod._get_persona_name(bare) == "小助手"
+
+    async def test_falls_back_when_the_lookup_fails(self, wired, monkeypatch):
+        from nekro_agent.models import db_chat_channel
+
+        plugin_mod, _store, _ctx = wired
+
+        async def _boom(chat_key: str = ""):
+            raise RuntimeError("no database here")
+
+        monkeypatch.setattr(db_chat_channel.DBChatChannel, "get_channel", _boom)
         bare = AgentCtx(CHAT_KEY, None)
         assert await plugin_mod._get_persona_name(bare) == m.config.FALLBACK_PERSONA_NAME
 
@@ -383,7 +400,7 @@ class TestBedtimeDetection:
         # A tick 40 minutes after bedtime: the old 30-second look-back window
         # skipped the night entirely whenever the interval was raised.
         late_tick = BEDTIME + timedelta(minutes=40)
-        await plugin_mod._check_sleep_transition(store, CHAT_KEY, late_tick, TZ)
+        await plugin_mod._check_sleep_transition(store, CHAT_KEY, late_tick)
 
         state = store.get_cached(CHAT_KEY)
         assert state.status == SleepStatus.ASLEEP
@@ -394,11 +411,11 @@ class TestBedtimeDetection:
         await store.hydrate(CHAT_KEY)
 
         first_tick = BEDTIME + timedelta(minutes=5)
-        await plugin_mod._check_sleep_transition(store, CHAT_KEY, first_tick, TZ)
+        await plugin_mod._check_sleep_transition(store, CHAT_KEY, first_tick)
         opened_at = store.get_cached(CHAT_KEY).cycle.sleep_segments[0].open_at
 
         await plugin_mod._check_sleep_transition(
-            store, CHAT_KEY, BEDTIME + timedelta(hours=2), TZ
+            store, CHAT_KEY, BEDTIME + timedelta(hours=2)
         )
 
         state = store.get_cached(CHAT_KEY)
@@ -411,7 +428,7 @@ class TestBedtimeDetection:
 
         # 08:15 local, inside the wake range but past most wake points.
         morning = datetime(2026, 8, 18, 0, 15, tzinfo=UTC)
-        await plugin_mod._check_sleep_transition(store, CHAT_KEY, morning, TZ)
+        await plugin_mod._check_sleep_transition(store, CHAT_KEY, morning)
 
         state = store.get_cached(CHAT_KEY)
         if state.cycle is not None and morning >= state.cycle.planned_wake_at:
@@ -707,3 +724,242 @@ class TestInstallWraps:
             assert await ms.schedule_agent_task(CHAT_KEY) is None
         finally:
             plugin_mod._uninstall_wraps()
+
+
+# ---------------------------------------------------------------------------
+# Schedule overrides and operator commands
+# ---------------------------------------------------------------------------
+
+
+def _cmd_context(chat_key: str = CHAT_KEY):
+    from tests.hoststub import CommandExecutionContext
+
+    return CommandExecutionContext(chat_key=chat_key)
+
+
+class TestScheduleLayering:
+    async def test_global_config_is_the_default(self, wired):
+        plugin_mod, _store, _ctx = wired
+        schedule = await plugin_mod._resolve_schedule_for(CHAT_KEY)
+
+        assert schedule.timezone == "Asia/Shanghai"
+        assert schedule.sleep_time == "23:00"
+        assert set(schedule.sources.values()) == {"global"}
+
+    async def test_channel_override_wins(self, wired):
+        plugin_mod, _store, _ctx = wired
+        await plugin_mod._get_overrides().set_channel(
+            CHAT_KEY, ScheduleOverride(timezone="Asia/Tokyo", sleep_time="01:00")
+        )
+        plugin_mod.invalidate_schedule_cache(CHAT_KEY)
+
+        schedule = await plugin_mod._resolve_schedule_for(CHAT_KEY)
+        assert schedule.timezone == "Asia/Tokyo"
+        assert schedule.sleep_time == "01:00"
+        # Untouched fields still come from the global config.
+        assert schedule.wake_time_start == "06:45"
+        assert schedule.sources["timezone"] == "channel"
+        assert schedule.sources["wake_time_start"] == "global"
+
+    async def test_channel_beats_persona_beats_global(self, wired):
+        plugin_mod, _store, _ctx = wired
+        overrides = plugin_mod._get_overrides()
+        await overrides.set_preset(1, ScheduleOverride(sleep_time="22:00", timezone="Asia/Tokyo"))
+        await overrides.set_channel(CHAT_KEY, ScheduleOverride(sleep_time="00:30"))
+        plugin_mod.invalidate_schedule_cache()
+
+        schedule = await plugin_mod._resolve_schedule_for(CHAT_KEY)
+        assert schedule.sleep_time == "00:30"  # channel
+        assert schedule.timezone == "Asia/Tokyo"  # persona
+        assert schedule.wake_time_end == "08:30"  # global
+        assert schedule.sources == {
+            "timezone": "preset",
+            "sleep_time": "channel",
+            "wake_time_start": "global",
+            "wake_time_end": "global",
+        }
+
+    async def test_bedtime_follows_the_channel_override(self, wired, clock):
+        plugin_mod, store, _ctx = wired
+        await store.hydrate(CHAT_KEY)
+        await plugin_mod._get_overrides().set_channel(
+            CHAT_KEY, ScheduleOverride(sleep_time="01:00")
+        )
+        plugin_mod.invalidate_schedule_cache(CHAT_KEY)
+
+        # 23:30 local: past the global bedtime, before the one this channel set.
+        await plugin_mod._check_sleep_transition(
+            store, CHAT_KEY, BEDTIME + timedelta(minutes=30)
+        )
+        assert store.get_cached(CHAT_KEY).status == SleepStatus.AWAKE
+
+        # 01:30 local.
+        await plugin_mod._check_sleep_transition(
+            store, CHAT_KEY, BEDTIME + timedelta(hours=2, minutes=30)
+        )
+        assert store.get_cached(CHAT_KEY).status == SleepStatus.ASLEEP
+
+    async def test_the_cycle_records_the_schedule_it_actually_slept_on(self, wired):
+        """The snapshot drives the cycle boundaries, not just the decision to sleep.
+
+        Deciding with the channel schedule but building the cycle from the global
+        one would put bedtime and the wake range in the wrong timezone for the
+        whole night.
+        """
+        plugin_mod, store, _ctx = wired
+        await store.hydrate(CHAT_KEY)
+        await plugin_mod._get_overrides().set_channel(
+            CHAT_KEY, ScheduleOverride(timezone="Asia/Tokyo", sleep_time="01:00")
+        )
+        plugin_mod.invalidate_schedule_cache(CHAT_KEY)
+
+        await plugin_mod._check_sleep_transition(
+            store, CHAT_KEY, BEDTIME + timedelta(hours=2, minutes=30)
+        )
+
+        cycle = store.get_cached(CHAT_KEY).cycle
+        assert cycle.config_snapshot.timezone == "Asia/Tokyo"
+        assert cycle.config_snapshot.sleep_time == "01:00"
+        assert cycle.sleep_at.astimezone(ZoneInfo("Asia/Tokyo")).strftime("%H:%M") == "01:00"
+
+
+class TestOperatorCommands:
+    async def test_status_reports_the_schedule_and_its_origin(self, wired):
+        plugin_mod, _store, _ctx = wired
+        await plugin_mod._get_overrides().set_channel(
+            CHAT_KEY, ScheduleOverride(timezone="Asia/Tokyo")
+        )
+        plugin_mod.invalidate_schedule_cache(CHAT_KEY)
+
+        response = await plugin_mod.plugin.commands["sleep.status"](_cmd_context())
+
+        assert response.status == "success"
+        assert "Asia/Tokyo" in response.message
+        assert "本频道" in response.message
+        assert PERSONA in response.message
+
+    async def test_status_shows_last_nights_scoring_terms(self, wired):
+        plugin_mod, store, _ctx = wired
+        state = await _put_asleep(store)
+        await plugin_mod._settle_wake(store, CHAT_KEY, state.cycle.planned_wake_at)
+
+        response = await plugin_mod.plugin.commands["sleep.status"](_cmd_context())
+
+        assert "上一夜" in response.message
+        assert "整夜无扰" in response.message
+
+    async def test_now_puts_it_to_bed_immediately(self, wired, clock):
+        plugin_mod, store, _ctx = wired
+        clock.now = BEDTIME - timedelta(hours=1)  # 22:00, an hour early
+        await store.hydrate(CHAT_KEY)
+
+        response = await plugin_mod.plugin.commands["sleep.now"](_cmd_context())
+
+        assert response.status == "success"
+        state = store.get_cached(CHAT_KEY)
+        assert state.status == SleepStatus.ASLEEP
+        # The night is measured from when it actually turned in, not from 23:00.
+        assert state.cycle.sleep_at == clock.now
+
+    async def test_wake_settles_and_reports(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+        ctx.sent.clear()
+
+        response = await plugin_mod.plugin.commands["sleep.wake"](_cmd_context())
+
+        assert response.status == "success"
+        assert store.get_cached(CHAT_KEY).status == SleepStatus.AWAKE
+        assert any("已起床" in text for text, _ in ctx.sent)
+
+    async def test_wake_refuses_when_already_awake(self, wired):
+        plugin_mod, store, _ctx = wired
+        await store.hydrate(CHAT_KEY)
+        response = await plugin_mod.plugin.commands["sleep.wake"](_cmd_context())
+        assert response.status == "error"
+
+    async def test_skip_keeps_it_up_for_one_night(self, wired, clock):
+        plugin_mod, store, _ctx = wired
+        await store.hydrate(CHAT_KEY)
+
+        await plugin_mod.plugin.commands["sleep.skip"](_cmd_context())
+        await plugin_mod._check_sleep_transition(
+            store, CHAT_KEY, BEDTIME + timedelta(minutes=30)
+        )
+
+        state = store.get_cached(CHAT_KEY)
+        assert state.status == SleepStatus.AWAKE
+        assert state.skip_sleep_date == "2026-08-17"
+
+    async def test_a_skipped_night_does_not_rewrite_state_every_tick(self, wired):
+        """The maintenance loop runs every 15 seconds all night long."""
+        plugin_mod, store, _ctx = wired
+        await store.hydrate(CHAT_KEY)
+        await plugin_mod.plugin.commands["sleep.skip"](_cmd_context())
+
+        writes_before = store.test_backend.set_calls
+        for minutes in (30, 60, 90):
+            await plugin_mod._check_sleep_transition(
+                store, CHAT_KEY, BEDTIME + timedelta(minutes=minutes)
+            )
+
+        assert store.test_backend.set_calls == writes_before
+
+    async def test_set_and_unset_a_channel_override(self, wired):
+        plugin_mod, _store, _ctx = wired
+        commands = plugin_mod.plugin.commands
+
+        ok = await commands["sleep.set"](_cmd_context(), "tz", "Asia/Tokyo")
+        assert ok.status == "success"
+        assert (await plugin_mod._resolve_schedule_for(CHAT_KEY)).timezone == "Asia/Tokyo"
+
+        await commands["sleep.unset"](_cmd_context())
+        assert (await plugin_mod._resolve_schedule_for(CHAT_KEY)).timezone == "Asia/Shanghai"
+
+    async def test_set_rejects_nonsense(self, wired):
+        plugin_mod, _store, _ctx = wired
+        commands = plugin_mod.plugin.commands
+
+        assert (await commands["sleep.set"](_cmd_context(), "tz", "Mars/Olympus")).status == "error"
+        assert (await commands["sleep.set"](_cmd_context(), "bed", "25 点")).status == "error"
+        assert (await commands["sleep.set"](_cmd_context(), "nope", "x")).status == "error"
+        # Nothing was written.
+        assert (await plugin_mod._resolve_schedule_for(CHAT_KEY)).timezone == "Asia/Shanghai"
+
+    async def test_set_can_target_the_persona(self, wired):
+        plugin_mod, _store, _ctx = wired
+
+        ok = await plugin_mod.plugin.commands["sleep.set"](
+            _cmd_context(), "bed", "22:00", "preset"
+        )
+        assert ok.status == "success"
+
+        schedule = await plugin_mod._resolve_schedule_for(CHAT_KEY)
+        assert schedule.sleep_time == "22:00"
+        assert schedule.sources["sleep_time"] == "preset"
+
+
+class TestToolExposure:
+    async def test_resume_sleep_is_hidden_while_awake(self, wired):
+        plugin_mod, store, ctx = wired
+        await store.save(ChatSleepState(chat_key=CHAT_KEY))
+        assert await plugin_mod.plugin.collect_methods(ctx) == []
+
+    async def test_resume_sleep_is_hidden_while_asleep(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+        assert await plugin_mod.plugin.collect_methods(ctx) == []
+
+    async def test_resume_sleep_appears_once_woken(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="醒醒", chat_key=CHAT_KEY)
+        )
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="要", chat_key=CHAT_KEY)
+        )
+
+        methods = await plugin_mod.plugin.collect_methods(ctx)
+        assert len(methods) == 1
+        assert methods[0] is plugin_mod.resume_sleep_tool
