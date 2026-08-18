@@ -39,6 +39,22 @@ plugins/external/nekro_auto_sleep/
 
 重启 NekroAgent 后在插件管理页面启用「自动睡眠」插件。
 
+## 从 v1 升级
+
+插件配置是**按字段持久化**的，所以升级后新的默认值只对全新安装生效，老装机保留原值。
+有一项必须手动改：
+
+| 配置项 | v1 默认 | v2 默认 | 不改会怎样 |
+|---|---|---|---|
+| 睡眠质量下限 | `60` | `20` | v2 的量程是 20–110，下限 60 会把所有糟糕的夜晚一律夹到 60，**看起来就像分数不动**——正是 v1 那个 bug 的症状 |
+| 质量稳定扰动幅度 | `4.0` | `2.0` | 分数现在本就随实际情况浮动，4.0 的随机量偏大 |
+
+插件启动时会对下限过高发一条 WARNING，`/sleep status` 也会把它显示出来，
+并在分数真的被夹住时标注「原始分 X，被下限 Y 夹住」。
+
+已删除的配置项（`NEAR_WAKE_RATIO`、`AFFIRMATIVE_KEYWORDS`、`NEGATIVE_KEYWORDS`、
+`UNCLEAR_ANSWER`、`TIMER_AGENT_WAIT_TIMEOUT_SECONDS`）会在下次保存配置时自动消失，不用手动清。
+
 ## 配置
 
 所有配置项均支持 WebUI 中文界面。
@@ -230,6 +246,16 @@ python -m pytest tests -q
 
 ```bash
 NEKRO_AGENT_SRC=/path/to/nekro-agent python -m pytest tests/test_host_contract.py -q
+```
+
+`tools/integration_probe.py` 是**上机器用的**：放进 NekroAgent 根目录、用它的 venv 跑，
+会连真实数据库、真实 `message_service`、真实人设跑一遍全链路（启动对账、包装闸门、
+叫醒协议、结算播报、重启恢复、`/sleep` 指令），但**一条消息都不会发出去**——
+所有出站路径在插件被加载之前就被换成了捕获，唯一被驱动的频道是它自己建、跑完自己删的。
+
+```bash
+cp tools/integration_probe.py /opt/NekroAgent_ByAkiyo/
+cd /opt/NekroAgent_ByAkiyo && uv run python integration_probe.py
 ```
 
 ## 已知未完项

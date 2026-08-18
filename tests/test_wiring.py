@@ -939,6 +939,46 @@ class TestOperatorCommands:
         assert schedule.sources["sleep_time"] == "preset"
 
 
+class TestUpgradeWarnings:
+    """Plugin config is persisted per field, so an upgrade keeps v1 values.
+
+    Found on a real install: after deploying v2 the score still read 60% for
+    every rough night, because the saved config still carried the v1 floor.
+    """
+
+    async def test_a_stale_v1_floor_is_called_out(self, wired):
+        plugin_mod, _store, _ctx = wired
+        m.config.QUALITY_MIN = 60
+
+        warnings = plugin_mod.collect_upgrade_warnings()
+        assert len(warnings) == 1
+        assert "20" in warnings[0]
+
+    async def test_a_sane_floor_says_nothing(self, wired):
+        plugin_mod, _store, _ctx = wired
+        m.config.QUALITY_MIN = 20
+        assert plugin_mod.collect_upgrade_warnings() == []
+
+    async def test_status_surfaces_the_warning(self, wired):
+        plugin_mod, _store, _ctx = wired
+        m.config.QUALITY_MIN = 60
+
+        response = await plugin_mod.plugin.commands["sleep.status"](_cmd_context())
+        assert "睡眠质量下限" in response.message
+
+    async def test_status_marks_a_clipped_score(self, wired):
+        plugin_mod, store, _ctx = wired
+        m.config.QUALITY_MIN = 60
+        state = await _put_asleep(store)
+        # A night that barely happened: the raw score lands far below the floor.
+        await plugin_mod._settle_wake(
+            store, CHAT_KEY, state.cycle.sleep_at + timedelta(minutes=1)
+        )
+
+        response = await plugin_mod.plugin.commands["sleep.status"](_cmd_context())
+        assert "被下限" in response.message
+
+
 class TestToolExposure:
     async def test_resume_sleep_is_hidden_while_awake(self, wired):
         plugin_mod, store, ctx = wired

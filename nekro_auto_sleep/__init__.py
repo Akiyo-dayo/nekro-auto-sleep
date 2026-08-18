@@ -485,6 +485,31 @@ _schedule_cache: dict[str, tuple[float, ResolvedSchedule]] = {}
 _JUST_WOKEN_WINDOW_SECONDS = 180
 
 
+# The v1 default floor. It clipped everything the old model produced, and an
+# upgraded install keeps it because plugin config is persisted per field: the
+# new defaults only apply to fresh installs.
+_V1_QUALITY_MIN = 60
+_QUALITY_FLOOR_WARN_ABOVE = 40
+
+
+def collect_upgrade_warnings() -> list[str]:
+    """Config that was fine for v1 and quietly breaks v2.
+
+    Returned rather than logged directly so it can be tested, and so
+    `/sleep status` can show the same thing where operators actually look.
+    """
+    warnings: list[str] = []
+    if config.QUALITY_MIN > _QUALITY_FLOOR_WARN_ABOVE:
+        warnings.append(
+            f"睡眠质量下限当前是 {config.QUALITY_MIN}"
+            + ("，这正是 v1 的默认值。" if config.QUALITY_MIN == _V1_QUALITY_MIN else "。")
+            +
+            "新的评分量程是 20–110，下限设这么高会把所有糟糕的夜晚一律夹到同一个数字上，"
+            "看起来就像分数不动——这正是 v1 那个 bug 的症状。建议改成 20。"
+        )
+    return warnings
+
+
 def _utcnow() -> datetime:
     """Single clock seam for the wiring layer, so tests can pin the time."""
     return datetime.now(ZoneInfo("UTC"))
@@ -1366,6 +1391,9 @@ async def init() -> None:
     if not _install_wraps():
         logger.error("Some runtime wraps failed to install; plugin may not fully function")
 
+    for warning in collect_upgrade_warnings():
+        logger.warning("配置提醒：%s", warning)
+
     if config.ENABLED:
         try:
             await _boot_reconcile(_store, _utcnow())
@@ -1474,6 +1502,9 @@ def _render_status(
     else:
         lines.append(f"当前：{status_text}")
 
+    for warning in collect_upgrade_warnings():
+        lines.append(f"⚠️ {warning}")
+
     if state.skip_sleep_date:
         lines.append(f"今夜：已设置不睡（{state.skip_sleep_date}）")
     elif cycle is not None:
@@ -1490,8 +1521,15 @@ def _render_status(
     if cycle is not None:
         breakdown = cycle.quality_breakdown
         if breakdown:
+            raw = breakdown.get("raw", 0.0)
+            score = int(breakdown.get("score", 0))
+            clipped = (
+                f"（原始分 {raw:.1f}，被下限 {config.QUALITY_MIN} 夹住）"
+                if raw < config.QUALITY_MIN - 0.5
+                else ""
+            )
             lines.append(
-                f"上一夜：{int(breakdown.get('score', 0))}%，"
+                f"上一夜：{score}%{clipped}，"
                 f"睡了 {_fmt_duration(breakdown.get('effective_hours', 0) * 3600)}"
             )
             lines.append(
