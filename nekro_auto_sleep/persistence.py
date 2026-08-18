@@ -124,6 +124,19 @@ class SleepStateStore:
             await self.save(new_state)
             return new_state
 
+    async def hydrate(self, chat_key: str) -> ChatSleepState:
+        """Pull a chat_key into the cache so background maintenance can see it.
+
+        `known_chat_keys()` only reports cached keys, and the cache used to be
+        filled exclusively by inbound messages — so after a restart no channel
+        went to bed until somebody talked in it, and channels that were already
+        asleep never got their wake-up settled. Boot reconciliation calls this
+        for every discovered channel, including ones with no stored state yet.
+        """
+        state = await self.load_or_create(chat_key)
+        self._cache[chat_key] = state
+        return state
+
     def get_cached(self, chat_key: str) -> ChatSleepState | None:
         """Return cached state without DB access. For read-only checks."""
         return self._cache.get(chat_key)

@@ -165,18 +165,35 @@ class TestNaturalWake:
         state, _ = handle_valid_call_while_asleep(state, call_time, "user1", "Bot")
 
         wake_time = state.cycle.planned_wake_at
-        state, action = settle_natural_wake(state, wake_time, "Bot", 103)
+        state, action = settle_natural_wake(
+            state, wake_time, "Bot", lambda cycle, secs: 103
+        )
         assert isinstance(action, ActionSendWakeNotice)
         assert "103%" in action.text
         assert state.status == SleepStatus.AWAKE
 
-    def test_no_notice_without_attempts(self, default_snapshot):
+    def test_quiet_night_still_announces_by_default(self, default_snapshot):
+        """A night nobody interrupted still gets a wake-up report."""
         state = ChatSleepState(chat_key=CHAT_KEY)
         now = datetime(2026, 8, 13, 15, 0, tzinfo=UTC)
         state = transition_to_sleep(state, now, default_snapshot)
 
         wake_time = state.cycle.planned_wake_at
-        state, action = settle_natural_wake(state, wake_time, "Bot", 100)
+        state, action = settle_natural_wake(
+            state, wake_time, "Bot", lambda cycle, secs: 100
+        )
+        assert isinstance(action, ActionSendWakeNotice)
+        assert state.status == SleepStatus.AWAKE
+
+    def test_no_notice_without_attempts_under_if_disturbed(self, default_snapshot):
+        state = ChatSleepState(chat_key=CHAT_KEY)
+        now = datetime(2026, 8, 13, 15, 0, tzinfo=UTC)
+        state = transition_to_sleep(state, now, default_snapshot)
+
+        wake_time = state.cycle.planned_wake_at
+        state, action = settle_natural_wake(
+            state, wake_time, "Bot", lambda cycle, secs: 100, "if_disturbed"
+        )
         assert action is None
         assert state.status == SleepStatus.AWAKE
 
@@ -193,7 +210,9 @@ class TestNaturalWake:
         assert state.status == SleepStatus.AWAKE_EARLY
 
         wake_time = state.cycle.planned_wake_at
-        state, action = settle_natural_wake(state, wake_time, "Bot", 100)
+        state, action = settle_natural_wake(
+            state, wake_time, "Bot", lambda cycle, secs: 100
+        )
         assert action is None
 
 

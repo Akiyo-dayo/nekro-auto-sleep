@@ -156,8 +156,14 @@ class ChatSleepState(BaseModel):
     pending_wake_offers: dict[str, PendingWakeOffer] = Field(default_factory=dict)
     idle_sleep_deadline: datetime | None = None
     cycle: SleepCycle | None = None
+    # Wake provenance, used to render the sleep-status prompt injection for the
+    # whole AWAKE_EARLY stretch instead of a single in-memory one-shot string.
+    # Additive optional fields: v1 payloads still validate, so SCHEMA_VERSION
+    # stays at 1 and a rollback keeps reading state instead of resetting it.
+    woken_at: datetime | None = None
+    woken_by: str | None = None
 
-    @field_validator("last_seen_at", "idle_sleep_deadline", mode="before")
+    @field_validator("last_seen_at", "idle_sleep_deadline", "woken_at", mode="before")
     @classmethod
     def _parse_utc(cls, v: object) -> object:
         if isinstance(v, str) and v.endswith("Z"):

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta
-from typing import Literal
+from typing import Callable, Literal
 
 from zoneinfo import ZoneInfo
 
@@ -161,12 +161,21 @@ def transition_to_sleep(
     state: ChatSleepState,
     now_utc: datetime,
     config_snapshot: ConfigSnapshot,
+    sleep_date_local: str | None = None,
+    segment_open_at: datetime | None = None,
 ) -> ChatSleepState:
-    """AWAKE -> ASLEEP: create cycle and open segment."""
+    """AWAKE -> ASLEEP: create cycle and open segment.
+
+    `sleep_date_local` / `segment_open_at` exist for boot reconciliation: when the
+    process was down across the bedtime boundary, the cycle belongs to the night
+    that already started, and the sleep segment has to be backdated to the real
+    bedtime — otherwise the morning report claims the bot slept five minutes.
+    """
     from datetime import date as date_type
 
     tz = ZoneInfo(config_snapshot.timezone)
-    sleep_date_local = now_utc.astimezone(tz).date().isoformat()
+    if sleep_date_local is None:
+        sleep_date_local = now_utc.astimezone(tz).date().isoformat()
 
     cycle = create_sleep_cycle(state.chat_key, sleep_date_local, config_snapshot)
     state = state.model_copy(
@@ -177,7 +186,7 @@ def transition_to_sleep(
             "idle_sleep_deadline": None,
         }
     )
-    state = open_sleep_segment(state, now_utc)
+    state = open_sleep_segment(state, segment_open_at or now_utc)
     return state
 
 
@@ -195,6 +204,8 @@ def transition_to_awake_early(
             "status": SleepStatus.AWAKE_EARLY,
             "pending_wake_offers": {},
             "idle_sleep_deadline": deadline,
+            "woken_at": now_utc,
+            "woken_by": user_id,
         }
     )
     return state
@@ -215,6 +226,8 @@ def transition_to_awake(
             "status": SleepStatus.AWAKE,
             "idle_sleep_deadline": None,
             "pending_wake_offers": {},
+            "woken_at": None,
+            "woken_by": None,
         }
     )
     return state
@@ -229,6 +242,8 @@ def transition_resume_sleep(
         update={
             "status": SleepStatus.ASLEEP,
             "idle_sleep_deadline": None,
+            "woken_at": None,
+            "woken_by": None,
         }
     )
     state = open_sleep_segment(state, now_utc)
@@ -317,12 +332,23 @@ def handle_valid_call_while_asleep(
 # ---------------------------------------------------------------------------
 
 
-def should_send_wake_notice(cycle: SleepCycle) -> bool:
-    """Check if natural wake notice should be sent (spec §10.2)."""
+def should_send_wake_notice(
+    cycle: SleepCycle,
+    policy: str = "always",
+) -> bool:
+    """Decide whether to announce the natural wake-up.
+
+    `always` matches the original requirement (the bot reports when it wakes up
+    on its own). `if_disturbed` is the pre-fix behaviour, kept for operators who
+    do not want a daily message in quiet channels.
+    """
     if cycle.ended_while_early_awake:
         return False
-    has_real_attempt = any(True for wa in cycle.wake_attempts)
-    return has_real_attempt
+    if policy == "never":
+        return False
+    if policy == "if_disturbed":
+        return bool(cycle.wake_attempts)
+    return True
 
 
 def format_sleep_duration(total_seconds: float) -> str:
@@ -356,9 +382,19 @@ def settle_natural_wake(
     state: ChatSleepState,
     now_utc: datetime,
     persona_name: str,
-    quality_percent: int,
+    quality_fn: Callable[[SleepCycle, float], int],
+    notice_policy: str = "always",
 ) -> tuple[ChatSleepState, SleepAction | None]:
-    """Handle natural wake-up at planned_wake_at (spec §10.1, §10.2)."""
+    """Handle natural wake-up at planned_wake_at.
+
+    Takes a `quality_fn` rather than a pre-computed score on purpose. The final
+    sleep segment is still open when settlement starts, and
+    `compute_actual_sleep_seconds` skips unclosed segments — so any caller that
+    scored the cycle *before* this function ran measured zero seconds of sleep
+    and reported the quality floor, while the duration string (rebuilt after the
+    close) came out correct. Closing first and scoring here makes the two
+    numbers structurally incapable of disagreeing.
+    """
     if state.cycle is None:
         state = transition_to_awake(state, now_utc)
         return state, None
@@ -366,19 +402,23 @@ def settle_natural_wake(
     was_early_awake = state.status == SleepStatus.AWAKE_EARLY
 
     state = transition_to_awake(state, now_utc)
+    cycle = state.cycle
+    if cycle is None:  # pragma: no cover - transition never drops the cycle
+        return state, None
 
     if was_early_awake:
         return state, None
 
-    if not should_send_wake_notice(state.cycle):
+    if not should_send_wake_notice(cycle, notice_policy):
         return state, None
 
-    sleep_secs = compute_actual_sleep_seconds(state.cycle)
+    sleep_secs = compute_actual_sleep_seconds(cycle)
+    quality_percent = quality_fn(cycle, sleep_secs)
     duration_str = format_sleep_duration(sleep_secs)
 
     text = f"【{persona_name}已起床：昨日睡眠质量 {quality_percent}%，睡眠时长 {duration_str}】"
 
-    state.cycle = state.cycle.model_copy(
+    state.cycle = cycle.model_copy(
         update={"notification_status": NotificationStatus.SENDING}
     )
 

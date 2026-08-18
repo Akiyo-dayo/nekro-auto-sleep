@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
-from typing import Any, Literal
+import time
+from datetime import datetime
+from typing import Any
 
 from zoneinfo import ZoneInfo
 
@@ -34,9 +35,6 @@ from .engine import (
     ActionSendFixed,
     ActionSendResumeSleep,
     ActionSendWakeNotice,
-    close_sleep_segment,
-    close_timer_interval,
-    compute_actual_sleep_seconds,
     handle_idle_sleep_back,
     handle_resume_sleep,
     handle_valid_call_while_asleep,
@@ -44,25 +42,23 @@ from .engine import (
     is_idle_expired,
     mark_notice_failed,
     mark_notice_sent,
-    open_sleep_segment,
-    open_timer_interval,
     refresh_idle_deadline,
     settle_natural_wake,
     transition_to_awake,
     transition_to_sleep,
 )
 from .models import (
+    DATA_KEY,
     PLUGIN_KEY,
     ChatSleepState,
     NotificationStatus,
+    SleepCycle,
     SleepStatus,
     SourceType,
 )
 from .persistence import SleepStateStore
 from .quality import compute_quality
 from .runtime import (
-    ChatKeyLocks,
-    LeaseLedger,
     chat_key_locks,
     current_source,
     lease_ledger,
@@ -74,9 +70,7 @@ from .runtime import (
 from .schedule import (
     compute_cycle_boundaries,
     create_config_snapshot,
-    current_local_date,
     find_sleep_date_for_now,
-    next_sleep_at,
 )
 
 logger = logging.getLogger("nekro_auto_sleep")
@@ -262,6 +256,29 @@ class SleepConfig(ConfigBase):
             ),
         ).model_dump(),
     )
+    WAKE_NOTICE_POLICY: str = Field(
+        default="always",
+        title="起床播报策略",
+        json_schema_extra=ExtraField(
+            placeholder="always",
+            i18n_title=i18n.i18n_text(zh_CN="起床播报策略", en_US="Wake Notice Policy"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="always: 自然醒即播报；if_disturbed: 仅当夜里有人叫过时播报；never: 从不播报",
+                en_US="always: announce every natural wake-up; if_disturbed: only when someone called during the night; never: stay silent",
+            ),
+        ).model_dump(),
+    )
+    HYDRATE_ACTIVE_DAYS: int = Field(
+        default=14,
+        title="启动装载活跃天数",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(zh_CN="启动装载活跃天数", en_US="Hydrate Active Days"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="启动时装载最近多少天内有消息的频道，装载后它们才会按时入睡，1-365",
+                en_US="On startup, load channels active within this many days; only loaded channels fall asleep on schedule, 1-365",
+            ),
+        ).model_dump(),
+    )
     MAINTENANCE_INTERVAL_SECONDS: int = Field(
         default=15,
         title="维护循环间隔（秒）",
@@ -327,8 +344,19 @@ config = plugin.get_config(SleepConfig)
 
 _store: SleepStateStore | None = None
 _maintenance_task: asyncio.Task[None] | None = None
-_wake_inject_cache: dict[str, str] = {}
 _installed_wraps: list[tuple[Any, str]] = []
+
+# How long after an early wake the bot is still told it *just* woke up. The wake
+# context itself is rendered from persisted state for the whole AWAKE_EARLY
+# stretch; this only gates the extra "you were just shaken awake" line. It
+# replaces an in-memory pop-once dict that leaked its payload into an unrelated
+# round whenever the triggered round never ran (quota, observe mode, debounce).
+_JUST_WOKEN_WINDOW_SECONDS = 180
+
+
+def _utcnow() -> datetime:
+    """Single clock seam for the wiring layer, so tests can pin the time."""
+    return datetime.now(ZoneInfo("UTC"))
 
 
 def _get_store() -> SleepStateStore:
@@ -342,14 +370,27 @@ def _get_store() -> SleepStateStore:
 
 
 async def _get_persona_name(ctx: AgentCtx) -> str:
-    """Get persona name, falling back to config default."""
+    """Resolve the current persona name, falling back to the configured default.
+
+    `ctx.db_chat_channel` is a plain property on both the fork and upstream, so
+    it must not be awaited: awaiting the ORM object raises TypeError, and with a
+    bare `except` around it every prompt silently rendered the fallback name
+    instead of the persona.
+    """
     try:
-        db_channel = await ctx.db_chat_channel
+        db_channel = ctx.db_chat_channel
+        if db_channel is None:
+            # Upstream builds can hand back a ctx with no channel prefilled.
+            from nekro_agent.models.db_chat_channel import DBChatChannel
+
+            db_channel = await DBChatChannel.get_channel(chat_key=ctx.chat_key)
         preset = await db_channel.get_preset()
-        if preset and hasattr(preset, "name") and preset.name:
-            return preset.name
-    except Exception:
-        pass
+        name = getattr(preset, "name", "")
+        if name:
+            return name
+        logger.warning("Preset for %s has no name; using fallback", ctx.chat_key)
+    except Exception as exc:
+        logger.warning("Cannot resolve persona name for %s: %s", ctx.chat_key, exc)
     return config.FALLBACK_PERSONA_NAME
 
 
@@ -445,7 +486,7 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage) -> MsgSignal | No
 
     chat_key = ctx.chat_key
     store = _get_store()
-    now_utc = datetime.now(ZoneInfo("UTC"))
+    now_utc = _utcnow()
     persona_name = await _get_persona_name(ctx)
     user_id = _get_user_id(message)
 
@@ -464,7 +505,15 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage) -> MsgSignal | No
 
         if state.status == SleepStatus.ASLEEP:
             if not _is_valid_call(message, persona_name):
-                _result_signal = MsgSignal.BLOCK_ALL
+                # BLOCK_TRIGGER, not BLOCK_ALL: the host returns on BLOCK_ALL
+                # *before* writing the message to DBChatMessage, so blocking
+                # everything meant the bot woke up with no memory of the night
+                # at all. Only `strict` history mode still drops the record.
+                _result_signal = (
+                    MsgSignal.BLOCK_ALL
+                    if config.HISTORY_MODE == "strict"
+                    else MsgSignal.BLOCK_TRIGGER
+                )
                 return state
 
             state, action = handle_valid_call_while_asleep(
@@ -473,7 +522,9 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage) -> MsgSignal | No
             _result_action = action
 
             if isinstance(action, ActionForceWake):
-                _wake_inject_cache[chat_key] = action.inject_text
+                # No side-channel cache: `woken_at` / `woken_by` are persisted on
+                # the state, so every round of this early-awake stretch can
+                # rebuild the wake context instead of only the first one.
                 _result_signal = MsgSignal.FORCE_TRIGGER
             elif isinstance(action, ActionSendFixed):
                 if action.block_mode == "strict":
@@ -494,8 +545,14 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage) -> MsgSignal | No
     await store.with_state(chat_key, _process)
 
     if isinstance(_result_action, ActionSendFixed):
+        # Record the question in `preserve` mode. Without it the woken bot sees
+        # the same user calling twice with no turn of its own in between, which
+        # is why the reply after a wake-up read as a non sequitur.
         try:
-            await ctx.send_text(_result_action.text, record=False)
+            await ctx.send_text(
+                _result_action.text,
+                record=_result_action.block_mode != "strict",
+            )
         except Exception as exc:
             logger.error("Failed to send wake offer: %s", exc)
 
@@ -525,7 +582,9 @@ async def on_system_message(ctx: AgentCtx, message: str) -> MsgSignal | None:
     if lease_ledger.has_active_for_chat(chat_key):
         return MsgSignal.CONTINUE
 
-    return MsgSignal.BLOCK_ALL
+    # Keep the notice in history so the morning context is continuous; just do
+    # not spin up an agent round for it.
+    return MsgSignal.BLOCK_TRIGGER
 
 
 # ---------------------------------------------------------------------------
@@ -533,22 +592,69 @@ async def on_system_message(ctx: AgentCtx, message: str) -> MsgSignal | None:
 # ---------------------------------------------------------------------------
 
 
-@plugin.mount_prompt_inject_method(
-    "sleep_status",
-    "注入当前睡眠状态信息（仅在叫醒时瞬时注入）",
-)
-async def inject_sleep_status(ctx: AgentCtx) -> str:
-    chat_key = ctx.chat_key
+def _fmt_local(dt: datetime, tz_name: str) -> str:
+    """Render an aware UTC datetime as HH:MM in the cycle timezone."""
+    try:
+        return dt.astimezone(ZoneInfo(tz_name)).strftime("%H:%M")
+    except Exception:
+        return dt.astimezone(ZoneInfo("UTC")).strftime("%H:%M UTC")
 
-    inject = _wake_inject_cache.pop(chat_key, None)
-    if inject:
-        return inject
 
-    src = current_source.get()
-    if src in (SourceType.TIMER_ONESHOT, SourceType.TIMER_RECURRING):
-        return "当前为夜间定时任务执行，任务完成后将自动恢复睡眠。"
+def _render_sleep_context(state: ChatSleepState, now_utc: datetime) -> str:
+    """Describe the current sleep situation for the prompt.
+
+    Rendered from persisted state on every round rather than popped once, so the
+    second and third replies after a wake-up still know it is the middle of the
+    night, that the visible night messages arrived while the bot was asleep, and
+    that `resume_sleep` is the way back to bed.
+    """
+    cycle = state.cycle
+    if cycle is None:
+        return ""
+
+    tz_name = cycle.config_snapshot.timezone
+    bedtime = _fmt_local(cycle.sleep_at, tz_name)
+    planned = _fmt_local(cycle.planned_wake_at, tz_name)
+
+    if state.status == SleepStatus.AWAKE_EARLY and state.woken_at is not None:
+        awake_seconds = max(0.0, (now_utc - state.woken_at).total_seconds())
+        who = f"用户 {state.woken_by} " if state.woken_by else ""
+        lines = [
+            f"[睡眠状态] 你今晚 {bedtime} 就寝，原定 {planned} 自然醒。",
+            f"{_fmt_local(state.woken_at, tz_name)} {who}把你提前叫醒了，"
+            f"到现在醒了约 {int(awake_seconds // 60)} 分钟"
+            f"（当前 {_fmt_local(now_utc, tz_name)}）。",
+            f"{bedtime} 之后的消息你都是在睡着时收到的，刚醒来才看见，"
+            "不要表现得像你当时就在场。",
+            f"如果对方不再需要你，可以调用 resume_sleep 回去继续睡；"
+            f"否则到 {planned} 会自然醒。",
+        ]
+        if awake_seconds <= _JUST_WOKEN_WINDOW_SECONDS:
+            lines.insert(0, "你刚刚被叫醒，还带着睡意。")
+        return "\n".join(lines)
+
+    if state.status == SleepStatus.ASLEEP:
+        return (
+            f"[睡眠状态] 你从 {bedtime} 起一直在睡觉，计划 {planned} 自然醒，"
+            "此刻仍在睡梦中。"
+        )
 
     return ""
+
+
+@plugin.mount_prompt_inject_method(
+    "sleep_status",
+    "注入当前睡眠状态，让被叫醒后的回复接得上夜里的上下文",
+)
+async def inject_sleep_status(ctx: AgentCtx) -> str:
+    if not config.ENABLED:
+        return ""
+
+    state = _get_store().get_cached(ctx.chat_key)
+    if state is None:
+        return ""
+
+    return _render_sleep_context(state, _utcnow())
 
 
 # ---------------------------------------------------------------------------
@@ -564,7 +670,7 @@ async def inject_sleep_status(ctx: AgentCtx) -> str:
 async def resume_sleep_tool(_ctx: AgentCtx) -> str:
     chat_key = _ctx.chat_key
     store = _get_store()
-    now_utc = datetime.now(ZoneInfo("UTC"))
+    now_utc = _utcnow()
     persona_name = await _get_persona_name(_ctx)
 
     result_text = ""
@@ -574,7 +680,11 @@ async def resume_sleep_tool(_ctx: AgentCtx) -> str:
         state, action = handle_resume_sleep(state, now_utc, persona_name)
         if isinstance(action, ActionSendResumeSleep):
             try:
-                await _ctx.send_text(action.text, record=False)
+                # Recorded like the wake offer: the transcript should show the
+                # bot going back to bed, not jump straight to silence.
+                await _ctx.send_text(
+                    action.text, record=config.HISTORY_MODE != "strict"
+                )
             except Exception as exc:
                 logger.error("Failed to send resume sleep message: %s", exc)
         result_text = "ok"
@@ -604,7 +714,7 @@ async def _maintenance_loop() -> None:
             if not config.ENABLED:
                 continue
 
-            now_utc = datetime.now(ZoneInfo("UTC"))
+            now_utc = _utcnow()
             tz = ZoneInfo(config.TIMEZONE)
 
             for chat_key in list(store.known_chat_keys()):
@@ -656,18 +766,61 @@ async def _check_sleep_transition(
     chat_key: str,
     now_utc: datetime,
     tz: ZoneInfo,
+    backdate_segment: bool = False,
 ) -> None:
-    """Check if it's time to transition AWAKE -> ASLEEP."""
-    sleep_at = next_sleep_at(now_utc - timedelta(seconds=30), tz, config.SLEEP_TIME)
-    if now_utc >= sleep_at:
-        snap = _make_config_snapshot()
+    """AWAKE -> ASLEEP, at most once per local sleep_date.
 
-        async def _sleep(s: ChatSleepState) -> ChatSleepState:
-            if s.status != SleepStatus.AWAKE:
-                return s
-            return transition_to_sleep(s, now_utc, snap)
+    The previous check asked whether `now` fell in a 30-second window just after
+    bedtime, which quietly stopped working as soon as an operator raised
+    MAINTENANCE_INTERVAL_SECONDS above 30 (the field allows up to 300). Keying
+    on the sleep_date instead means any tick during the night is enough, and a
+    second tick cannot start the night over.
 
-        await store.with_state(chat_key, _sleep)
+    `backdate_segment` is for boot reconciliation: when the process was down
+    across bedtime, the sleep segment starts at the real bedtime rather than at
+    startup, so the morning report does not claim a five-minute night.
+    """
+    sleep_date = find_sleep_date_for_now(
+        now_utc, tz, config.SLEEP_TIME, config.WAKE_TIME_START, config.WAKE_TIME_END
+    )
+    if sleep_date is None:
+        return
+
+    sleep_date_iso = sleep_date.isoformat()
+    cached = store.get_cached(chat_key)
+    if cached is not None and cached.cycle is not None and cached.cycle.sleep_date == sleep_date_iso:
+        return
+
+    snap = _make_config_snapshot()
+    segment_open_at = now_utc
+    if backdate_segment:
+        try:
+            bedtime, _ws, _we = compute_cycle_boundaries(
+                sleep_date, tz, config.SLEEP_TIME, config.WAKE_TIME_START, config.WAKE_TIME_END
+            )
+            segment_open_at = min(bedtime, now_utc)
+        except Exception as exc:
+            logger.warning("Cannot backdate bedtime for %s: %s", chat_key, exc)
+
+    async def _sleep(s: ChatSleepState) -> ChatSleepState:
+        if s.status != SleepStatus.AWAKE:
+            return s
+        if s.cycle is not None and s.cycle.sleep_date == sleep_date_iso:
+            return s
+        new_state = transition_to_sleep(
+            s,
+            now_utc,
+            snap,
+            sleep_date_local=sleep_date_iso,
+            segment_open_at=segment_open_at,
+        )
+        if new_state.cycle is not None and now_utc >= new_state.cycle.planned_wake_at:
+            # Enabled (or restarted) after this night's wake-up point: record the
+            # night as done instead of going to sleep for the remaining minutes.
+            return transition_to_awake(new_state, now_utc)
+        return new_state
+
+    await store.with_state(chat_key, _sleep)
 
 
 async def _settle_wake(
@@ -675,51 +828,158 @@ async def _settle_wake(
     chat_key: str,
     now_utc: datetime,
 ) -> None:
-    """Settle natural wake-up."""
-    state = store.get_cached(chat_key)
-    if state is None or state.cycle is None:
-        return
+    """Settle a natural wake-up and announce it.
 
-    persona_name = state.cycle.config_snapshot.fallback_persona_name
-    actual_sleep = compute_actual_sleep_seconds(state.cycle)
-    quality = compute_quality(state.cycle, actual_sleep)
+    The score and the duration are both produced inside `settle_natural_wake`,
+    after the final sleep segment has been closed. Computing either one out here
+    is what made every morning report say "quality 60%, slept 8h55m": the score
+    was measured against a still-open segment worth zero seconds, the duration
+    was rebuilt afterwards from the closed one.
+    """
+    ctx: AgentCtx | None = None
+    persona_name = config.FALLBACK_PERSONA_NAME
+    try:
+        ctx = await AgentCtx.create_by_chat_key(chat_key)
+        persona_name = await _get_persona_name(ctx)
+    except Exception as exc:
+        logger.warning("Cannot build ctx for %s, using fallback name: %s", chat_key, exc)
 
     notice_action: ActionSendWakeNotice | None = None
 
     async def _wake(s: ChatSleepState) -> ChatSleepState:
         nonlocal notice_action
-        new_state, action = settle_natural_wake(s, now_utc, persona_name, quality)
+        policy = config.WAKE_NOTICE_POLICY
+        if s.cycle is not None:
+            late_seconds = (now_utc - s.cycle.planned_wake_at).total_seconds()
+            grace_seconds = max(0, config.WAKE_NOTICE_GRACE_MINUTES) * 60
+            if late_seconds > grace_seconds:
+                logger.info(
+                    "Wake-up for %s is %.0f min late (grace %d min); settling silently",
+                    chat_key,
+                    late_seconds / 60,
+                    config.WAKE_NOTICE_GRACE_MINUTES,
+                )
+                policy = "never"
+        new_state, action = settle_natural_wake(
+            s, now_utc, persona_name, compute_quality, policy
+        )
         if isinstance(action, ActionSendWakeNotice):
             notice_action = action
         return new_state
 
     await store.with_state(chat_key, _wake)
 
-    if notice_action is not None:
+    if notice_action is None:
+        return
+
+    if ctx is None:
+        logger.error("No ctx for %s; cannot deliver wake notice", chat_key)
+        await store.with_state(chat_key, lambda s: _identity(mark_notice_failed(s)))
+        return
+
+    try:
+        token = current_source.set(SourceType.INTERNAL_WAKE_NOTICE)
         try:
-            ctx = await AgentCtx.create_by_chat_key(chat_key)
-            persona_name = await _get_persona_name(ctx)
+            await ctx.send_text(notice_action.text, record=False)
+        finally:
+            current_source.reset(token)
 
-            actual_sleep = compute_actual_sleep_seconds(state.cycle)
-            from .engine import format_sleep_duration
-            duration_str = format_sleep_duration(actual_sleep)
-            text = f"【{persona_name}已起床：昨日睡眠质量 {quality}%，睡眠时长 {duration_str}】"
+        async def _mark_sent(s: ChatSleepState) -> ChatSleepState:
+            return mark_notice_sent(s)
 
-            token = current_source.set(SourceType.INTERNAL_WAKE_NOTICE)
-            try:
-                await ctx.send_text(text, record=False)
-            finally:
-                current_source.reset(token)
+        await store.with_state(chat_key, _mark_sent)
+    except Exception as exc:
+        logger.error("Failed to send wake notice for %s: %s", chat_key, exc)
 
-            async def _mark_sent(s: ChatSleepState) -> ChatSleepState:
-                return mark_notice_sent(s)
-            await store.with_state(chat_key, _mark_sent)
+        async def _mark_failed(s: ChatSleepState) -> ChatSleepState:
+            return mark_notice_failed(s)
 
+        await store.with_state(chat_key, _mark_failed)
+
+
+async def _identity(state: ChatSleepState) -> ChatSleepState:
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Boot reconciliation
+# ---------------------------------------------------------------------------
+
+
+async def _discover_chat_keys() -> set[str]:
+    """Every chat_key the plugin should be watching after a (re)start.
+
+    Two sources, both best-effort: channels that already have persisted sleep
+    state (they may be mid-night and need settling), and channels with recent
+    traffic (they need to go to bed tonight even if nobody talks first).
+    """
+    keys: set[str] = set()
+
+    try:
+        from nekro_agent.models.db_plugin_data import DBPluginData
+
+        plugin_key = getattr(plugin, "key", PLUGIN_KEY)
+        rows = await DBPluginData.filter(plugin_key=plugin_key, data_key=DATA_KEY).values(
+            "target_chat_key"
+        )
+        keys.update(str(r["target_chat_key"]) for r in rows if r.get("target_chat_key"))
+    except Exception as exc:
+        logger.error("Cannot enumerate persisted sleep state: %s", exc)
+
+    try:
+        from nekro_agent.models.db_chat_message import DBChatMessage
+
+        days = max(1, min(365, config.HYDRATE_ACTIVE_DAYS))
+        cutoff = int(time.time()) - days * 86400
+        rows = (
+            await DBChatMessage.filter(send_timestamp__gte=cutoff)
+            .distinct()
+            .values("chat_key")
+        )
+        keys.update(str(r["chat_key"]) for r in rows if r.get("chat_key"))
+    except Exception as exc:
+        logger.warning("Cannot enumerate recently active channels: %s", exc)
+
+    return keys
+
+
+async def _reconcile_chat(
+    store: SleepStateStore,
+    chat_key: str,
+    now_utc: datetime,
+    tz: ZoneInfo,
+) -> None:
+    """Align one chat_key with the wall clock after a restart."""
+    state = store.get_cached(chat_key)
+    if state is None:
+        return
+
+    if state.status in (SleepStatus.ASLEEP, SleepStatus.AWAKE_EARLY):
+        if state.cycle is not None and now_utc >= state.cycle.planned_wake_at:
+            await _settle_wake(store, chat_key, now_utc)
+        return
+
+    if state.status == SleepStatus.AWAKE:
+        await _check_sleep_transition(store, chat_key, now_utc, tz, backdate_segment=True)
+
+
+async def _boot_reconcile(store: SleepStateStore, now_utc: datetime) -> None:
+    """Hydrate every known channel and settle whatever the downtime skipped."""
+    try:
+        tz = ZoneInfo(config.TIMEZONE)
+    except Exception as exc:
+        logger.error("Invalid timezone %r: %s", config.TIMEZONE, exc)
+        return
+
+    chat_keys = await _discover_chat_keys()
+    logger.info("Boot reconciliation over %d chat_key(s)", len(chat_keys))
+
+    for chat_key in sorted(chat_keys):
+        try:
+            await store.hydrate(chat_key)
+            await _reconcile_chat(store, chat_key, now_utc, tz)
         except Exception as exc:
-            logger.error("Failed to send wake notice for %s: %s", chat_key, exc)
-            async def _mark_failed(s: ChatSleepState) -> ChatSleepState:
-                return mark_notice_failed(s)
-            await store.with_state(chat_key, _mark_failed)
+            logger.error("Boot reconciliation failed for %s: %s", chat_key, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -756,7 +1016,7 @@ def _install_wraps() -> bool:
                     src = current_source.get()
                     if src == SourceType.USER_DIRECT or src == SourceType.USER_WAKE_CONFIRM:
                         async def _refresh(s: ChatSleepState) -> ChatSleepState:
-                            return refresh_idle_deadline(s, datetime.now(ZoneInfo("UTC")))
+                            return refresh_idle_deadline(s, _utcnow())
                         await store.with_state(chat_key, _refresh)
 
             wrapper = make_run_agent_task_wrapper(
@@ -771,19 +1031,16 @@ def _install_wraps() -> bool:
         logger.error("Cannot import message_service: %s", exc)
         return False
 
-    try:
-        from nekro_agent.services.timer.timer_service import timer_service as ts
-        if ts and hasattr(ts, "_execute_task") and callable(ts._execute_task):
-            _installed_wraps.append((ts, "_execute_task"))
-    except ImportError:
-        logger.info("TimerService not available, timer wrapping skipped")
-
-    try:
-        from nekro_agent.services.timer.recurring_timer_service import recurring_timer_service as rts
-        if rts and hasattr(rts, "_fire_job") and callable(rts._fire_job):
-            _installed_wraps.append((rts, "_fire_job"))
-    except ImportError:
-        logger.info("RecurringTimerService not available, recurring timer wrapping skipped")
+    # The timer gate is deliberately NOT installed. The previous build appended
+    # (timer_service, "_execute_task") to _installed_wraps without ever calling
+    # wrap_callable, so the lease ledger was never populated and night-time timer
+    # tasks were silently blocked by on_system_message instead of temporarily
+    # waking the bot. Registering an entry that was never wrapped only made the
+    # gap look filled. NIGHT_TIMER_POLICY replaces this whole path.
+    logger.info(
+        "Night timer gate not installed; scheduled tasks run normally at night "
+        "(NIGHT_TIMER_POLICY will take this over)"
+    )
 
     return success
 
@@ -809,6 +1066,12 @@ async def init() -> None:
     if not _install_wraps():
         logger.error("Some runtime wraps failed to install; plugin may not fully function")
 
+    if config.ENABLED:
+        try:
+            await _boot_reconcile(_store, _utcnow())
+        except Exception as exc:
+            logger.error("Boot reconciliation aborted: %s", exc)
+
     _maintenance_task = asyncio.create_task(_maintenance_loop())
     logger.info("Auto-sleep plugin initialized")
 
@@ -828,7 +1091,6 @@ async def cleanup() -> None:
     _uninstall_wraps()
     lease_ledger.clear()
     chat_key_locks.clear()
-    _wake_inject_cache.clear()
 
     if _store:
         _store.clear_all()
