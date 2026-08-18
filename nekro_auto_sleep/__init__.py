@@ -1287,7 +1287,7 @@ def _render_sleep_context(
             f"（当前 {_fmt_local(now_utc, tz_name)}）。",
             f"{bedtime} 之后的消息你都是在睡着时收到的，刚醒来才看见，"
             "不要表现得像你当时就在场。",
-            f"对方让你去睡、或者不再需要你了，就调用 resume_sleep 睡回去——"
+            f"对方让你去睡、或者不再需要你了，就调用 {resume_sleep.__name__}() 睡回去——"
             "这是唯一能让你重新睡下的方式，光在话里说「我去睡了」并不会真的睡下。"
             f"没人再找你的话到 {planned} 也会自然醒。",
         ]
@@ -1301,7 +1301,7 @@ def _render_sleep_context(
                 "先判断对方到底要不要叫醒你：",
                 "· 要 —— 就正常回复，你已经醒了，但还带着睡意；",
                 "· 不要、只是随口一句、或者根本不是在找你 —— "
-                "调用 resume_sleep 继续睡，并且**不要输出任何内容**。",
+                f"调用 {resume_sleep.__name__}() 继续睡，并且**不要输出任何内容**。",
                 f"{bedtime} 之后的消息你都是在睡着时收到的，刚醒来才看见，"
                 "不要表现得像你当时就在场。",
             ]
@@ -1359,12 +1359,27 @@ async def inject_sleep_status(ctx: AgentCtx) -> str:
 
 @plugin.mount_sandbox_method(
     SandboxMethodType.TOOL,
-    "resume_sleep",
-    "继续睡（仅在被提前叫醒后、计划起床前可用）。"
-    "刚被叫醒那一轮如果判断对方其实并不需要你，调用它并且不要输出任何内容，"
-    "会静默睡回去；聊完之后再调用则会说一句「已睡下」",
+    "继续睡",
+    "被提前叫醒后重新睡下",
 )
-async def resume_sleep_tool(_ctx: AgentCtx) -> str:
+async def resume_sleep(_ctx: AgentCtx) -> str:
+    """回去继续睡（仅在被提前叫醒之后、计划起床时间之前可用）
+
+    这是**唯一**能让你重新睡下的方式。只在回复里说「我去睡了」不会改变任何状态，
+    对方下一句话你依然是醒着的。
+
+    刚被叫醒的那一轮，如果判断对方其实并不需要你，调用它并且**不要输出任何内容**，
+    会静默睡回去，对方不会收到任何消息；聊完之后再调用，则会说一句「已睡下」。
+
+    Returns:
+        str: 执行结果说明
+
+    Example:
+        ```python
+        # 对方说「你去睡吧」「不用管我了」「晚安」
+        resume_sleep()
+        ```
+    """
     chat_key = _ctx.chat_key
     store = _get_store()
     now_utc = _utcnow()
@@ -1389,6 +1404,11 @@ async def resume_sleep_tool(_ctx: AgentCtx) -> str:
             "已确认对方并不需要你，继续睡；本轮不要再输出任何内容。"
             if declined
             else "ok"
+        )
+        logger.info(
+            "%s 调用 resume_sleep 睡回去（%s）",
+            chat_key,
+            "静默" if declined else "已播报",
         )
         return state
 
@@ -1415,7 +1435,7 @@ async def collect_available_methods(_ctx: AgentCtx) -> list:
         return []
     if state.cycle is not None and _utcnow() >= state.cycle.planned_wake_at:
         return []
-    return [resume_sleep_tool]
+    return [resume_sleep]
 
 
 # ---------------------------------------------------------------------------

@@ -489,7 +489,7 @@ class TestWakeProtocolWiring:
         await self._ask(plugin_mod, ctx, "算了你睡吧")
         ctx.sent.clear()
 
-        await plugin_mod.plugin.sandbox_methods["resume_sleep"](ctx)
+        await plugin_mod.resume_sleep(ctx)
 
         assert ctx.sent == [], "declining the wake must not send anything"
         state = store.get_cached(CHAT_KEY)
@@ -505,7 +505,7 @@ class TestWakeProtocolWiring:
         await self._ask(plugin_mod, ctx, "帮我查个东西")
         ctx.sent.clear()
 
-        await plugin_mod.plugin.sandbox_methods["resume_sleep"](ctx)
+        await plugin_mod.resume_sleep(ctx)
 
         assert len(ctx.sent) == 1
         assert "已睡下" in ctx.sent[0][0]
@@ -1081,7 +1081,7 @@ class TestToolExposure:
 
         methods = await plugin_mod.plugin.collect_methods(ctx)
         assert len(methods) == 1
-        assert methods[0] is plugin_mod.resume_sleep_tool
+        assert methods[0] is plugin_mod.resume_sleep
 
 
 # ---------------------------------------------------------------------------
@@ -1741,3 +1741,60 @@ class TestPromptDormancy:
         is awake before its alarm.
         """
         assert m.plugin.init_kwargs["allow_sleep"] is False
+
+
+class TestToolNameReachesTheModel:
+    """The prompt has to name the callable exactly as the sandbox exposes it.
+
+    The host renders `* {func.__name__}` and the sandbox binds that same name,
+    while the injection said "call resume_sleep" — and the function was called
+    `resume_sleep_tool`. The model agreed to go to sleep and then called a name
+    that did not exist. Reported from the live instance.
+    """
+
+    async def test_the_injection_names_the_real_callable(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="醒醒", chat_key=CHAT_KEY)
+        )
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="要", chat_key=CHAT_KEY)
+        )
+
+        deciding = await plugin_mod.plugin.prompt_injects["sleep_status"](ctx)
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="继续聊", chat_key=CHAT_KEY)
+        )
+        awake = await plugin_mod.plugin.prompt_injects["sleep_status"](ctx)
+
+        # Substring matching would let `resume_sleep_tool` pass, which is
+        # exactly the name that did not exist in the sandbox. Every mention has
+        # to be the real callable and nothing else.
+        import re
+
+        name = plugin_mod.resume_sleep.__name__
+        for text in (deciding, awake):
+            mentions = set(re.findall(r"resume_sleep\w*", text))
+            assert mentions == {name}, mentions
+            assert f"{name}()" in text
+
+    async def test_the_collected_method_is_that_same_callable(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="醒醒", chat_key=CHAT_KEY)
+        )
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="要", chat_key=CHAT_KEY)
+        )
+
+        methods = await plugin_mod.plugin.collect_methods(ctx)
+        assert [f.__name__ for f in methods] == [plugin_mod.resume_sleep.__name__]
+
+    async def test_the_tool_carries_its_own_documentation(self, wired):
+        """Without a docstring the host falls back to registration metadata and
+        warns, leaving the model a signature line instead of a spec."""
+        doc = (m.resume_sleep.__doc__ or "").strip()
+        assert doc
+        assert "唯一" in doc, "the docstring must say that saying it is not doing it"

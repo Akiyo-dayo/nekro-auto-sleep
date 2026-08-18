@@ -298,3 +298,17 @@ def test_allow_sleep_false_is_honoured_over_any_strategy():
 
     source = ast.dump(node)
     assert "plugin_strategy_is_protected" in source
+
+
+def test_the_prompt_names_sandbox_methods_by_function_name():
+    """Why the tool function is named `resume_sleep` and not `resume_sleep_tool`.
+
+    `render_sandbox_methods_prompt` writes `* {method.func.__name__}`, so the
+    function's own name is what the model sees and calls — the display name
+    passed to `mount_sandbox_method` never reaches it.
+    """
+    cls = _class(_parse("nekro_agent/services/plugin/base.py"), "NekroPlugin")
+    node = _func(cls, "render_sandbox_methods_prompt")
+
+    dumped = ast.dump(node)
+    assert "__name__" in dumped, "sandbox methods are no longer rendered by function name"

@@ -343,6 +343,9 @@ python tools/gen_config_table.py --write
   不再碰任何私有方法
 - 每个 `chat_key` 独立状态、独立异步锁
 - 领域层（`models` / `schedule` / `engine` / `quality`）不导入宿主单例，可独立测试
+- 沙盒方法的**函数名就是模型要调的名字**（宿主渲染的是 `func.__name__`，
+  `mount_sandbox_method` 的 name 参数只是给人看的显示名），所以工具函数直接叫
+  `resume_sleep`；提示注入里的名字也从函数本身取，不写死字符串
 - `resume_sleep` 通过 `mount_collect_methods` 按状态收集：只有被提前叫醒、且还没到
   计划起床点时才出现在提示词里，白天一个 token 都不占（常驻插件本轮不交方法时，
   宿主会把整块声明一起收掉）
