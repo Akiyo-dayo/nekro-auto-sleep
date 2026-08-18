@@ -156,6 +156,27 @@ def test_schedule_agent_task_is_public_and_async():
     assert "chat_key" in {a.arg for a in node.args.args}
 
 
+def test_a_command_line_is_split_at_the_first_space():
+    """Why `/sleep status` needs its own top-level command.
+
+    `detect_command` takes everything before the first space as the command
+    name, so a group registered as `sleep.status` is only reachable dotted —
+    the spaced form resolves the bare name `sleep`. If the host ever learns to
+    walk group names, the extra dispatcher can go.
+    """
+    cls = _class(_parse("nekro_agent/adapters/interface/base.py"), "BaseAdapter")
+    node = _func(cls, "detect_command")
+
+    splits = [
+        call
+        for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "split"
+    ]
+    assert splits, "detect_command no longer splits the command line"
+
+
 def test_plugin_exposes_every_mount_point_we_use():
     cls = _class(_parse("nekro_agent/services/plugin/base.py"), "NekroPlugin")
     defined = {

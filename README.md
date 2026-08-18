@@ -107,6 +107,10 @@ plugins/external/nekro_auto_sleep/
 
 ## 运维指令
 
+两种写法都行：`/sleep status` 与 `/sleep.status`。宿主按第一个空格切命令名，
+命令组注册出来的是展平的 `sleep.status`，所以插件另外注册了一个 `sleep` 顶层命令
+把空格写法转发过去——否则 `/sleep status` 会解析不到命令、静默无响应。
+
 | 指令 | 权限 | 说明 |
 |---|---|---|
 | `/sleep status` | 高级用户 | 当前状态、今夜提示次数、**上一夜评分的每一项** |

@@ -2229,6 +2229,54 @@ if _COMMANDS_AVAILABLE:
         invalidate_schedule_cache(chat_key)
         return CmdCtl.success(f"已为本频道设置 {field} = {value}")
 
+    _SUBCOMMANDS = {
+        "status": "sleep_status_command",
+        "now": "sleep_now_command",
+        "wake": "sleep_wake_command",
+        "skip": "sleep_skip_command",
+        "set": "sleep_set_command",
+        "unset": "sleep_unset_command",
+    }
+    _MUTATING = {"now", "wake", "skip", "set", "unset"}
+
+    @plugin.mount_command(
+        name="sleep",
+        description="自动睡眠（等价于 /sleep.<子命令>）",
+        permission=CommandPermission.ADVANCED,
+        usage="/sleep status | now | wake | skip | set <字段> <值> [scope] | unset [scope]",
+    )
+    async def sleep_dispatch_command(
+        context: CommandExecutionContext,
+        action: str = Arg("子命令", positional=True, default="status"),
+        first: str = Arg("子命令的第一个参数", positional=True, default=""),
+        second: str = Arg("子命令的第二个参数", positional=True, default=""),
+        third: str = Arg("子命令的第三个参数", positional=True, default=""),
+    ):
+        """Accept the spacing people actually type.
+
+        The host splits a command line at the first space, so a group registered
+        as `sleep.status` is only reachable as `/sleep.status` — typing
+        `/sleep status` resolves the name "sleep", finds nothing, and answers
+        with silence. This forwards the spaced form to the same handlers.
+        """
+        name = (action or "status").strip().lstrip(".")
+        handler_name = _SUBCOMMANDS.get(name)
+        if handler_name is None:
+            return CmdCtl.failed(
+                f"未知子命令 {name!r}，可用：{'、'.join(_SUBCOMMANDS)}"
+            )
+
+        if name in _MUTATING and not context.is_super_user:
+            return CmdCtl.failed(f"/sleep {name} 需要超级用户权限")
+
+        handler = globals()[handler_name]
+        args = [a for a in (first, second, third) if a]
+        try:
+            return await handler(context, *args)
+        except TypeError as exc:
+            logger.warning("Bad arguments for /sleep %s: %s", name, exc)
+            return CmdCtl.failed(f"/sleep {name} 的参数不对：{exc}")
+
     @sleep_group.command(
         name="unset",
         description="清除作息覆盖",

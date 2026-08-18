@@ -1567,3 +1567,66 @@ class TestWeekdayParsing:
         assert is_weekend_night(date(2026, 8, 22), {4, 5}) is True  # Saturday
         assert is_weekend_night(date(2026, 8, 23), {4, 5}) is False  # Sunday night
         assert is_weekend_night(date(2026, 8, 17), {4, 5}) is False  # Monday
+
+
+class TestSpacedCommandForm:
+    """`/sleep status` is what people type; the host only resolves `/sleep.status`.
+
+    `detect_command` splits the line at the first space, so a group registered
+    as `sleep.status` leaves the bare name `sleep` unregistered — and an
+    unresolved command answers with silence, which reads as "the update did not
+    install". Reported from the live instance.
+    """
+
+    async def test_the_spaced_form_reaches_the_same_handler(self, wired):
+        plugin_mod, _store, _ctx = wired
+        commands = plugin_mod.plugin.commands
+
+        spaced = await commands["sleep"](_cmd_context(), "status")
+        dotted = await commands["sleep.status"](_cmd_context())
+
+        assert spaced.status == "success"
+        assert spaced.message == dotted.message
+
+    async def test_it_defaults_to_status(self, wired):
+        plugin_mod, _store, _ctx = wired
+        response = await plugin_mod.plugin.commands["sleep"](_cmd_context())
+        assert response.status == "success"
+        assert PERSONA in response.message
+
+    async def test_arguments_are_forwarded(self, wired):
+        plugin_mod, _store, _ctx = wired
+        commands = plugin_mod.plugin.commands
+
+        ok = await commands["sleep"](_cmd_context(), "set", "tz", "Asia/Tokyo")
+        assert ok.status == "success"
+        assert (await plugin_mod._resolve_schedule_for(CHAT_KEY)).timezone == "Asia/Tokyo"
+
+    async def test_an_unknown_subcommand_says_so(self, wired):
+        plugin_mod, _store, _ctx = wired
+        response = await plugin_mod.plugin.commands["sleep"](_cmd_context(), "nope")
+        assert response.status == "error"
+        assert "status" in response.message
+
+    async def test_mutating_subcommands_need_a_super_user(self, wired):
+        from tests.hoststub import CommandExecutionContext
+
+        plugin_mod, store, _ctx = wired
+        await store.hydrate(CHAT_KEY)
+        plain = CommandExecutionContext(chat_key=CHAT_KEY, is_super_user=False)
+
+        refused = await plugin_mod.plugin.commands["sleep"](plain, "now")
+        assert refused.status == "error"
+        assert store.get_cached(CHAT_KEY).status == SleepStatus.AWAKE
+
+        # Reading is still allowed.
+        assert (await plugin_mod.plugin.commands["sleep"](plain, "status")).status == "success"
+
+    async def test_too_many_arguments_answer_instead_of_crashing(self, wired):
+        """The sub-handler raises TypeError; the user should see a message."""
+        plugin_mod, _store, _ctx = wired
+        response = await plugin_mod.plugin.commands["sleep"](
+            _cmd_context(), "unset", "channel", "extra"
+        )
+        assert response.status == "error"
+        assert "参数" in response.message
