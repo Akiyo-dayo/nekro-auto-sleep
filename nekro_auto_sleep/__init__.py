@@ -1462,6 +1462,24 @@ async def _maintain_chat(
                 await store.with_state(chat_key, _idle_back)
 
 
+async def _last_message_at(chat_key: str) -> datetime | None:
+    """When this channel last saw a message, from history. One query per channel."""
+    try:
+        from nekro_agent.models.db_chat_message import DBChatMessage
+
+        row = (
+            await DBChatMessage.filter(chat_key=chat_key)
+            .order_by("-send_timestamp")
+            .first()
+        )
+        if row is None or not getattr(row, "send_timestamp", 0):
+            return None
+        return datetime.fromtimestamp(int(row.send_timestamp), tz=ZoneInfo("UTC"))
+    except Exception as exc:
+        logger.debug("Cannot read last message time for %s: %s", chat_key, exc)
+        return None
+
+
 async def _maybe_bedtime_notice(
     store: SleepStateStore,
     chat_key: str,
@@ -1500,6 +1518,17 @@ async def _maybe_bedtime_notice(
 
     quiet_hours = max(1, min(720, cfg.BEDTIME_NOTICE_QUIET_HOURS))
     last_seen = state.last_seen_at
+    if last_seen is None:
+        # `last_seen_at` only starts filling in once the plugin is running, so
+        # on a fresh install every channel would look "quiet" for a day or two
+        # and the heads-up would appear broken. Backfill it once from history.
+        last_seen = await _last_message_at(chat_key)
+        if last_seen is not None:
+            async def _seed(s: ChatSleepState) -> ChatSleepState:
+                return s.model_copy(update={"last_seen_at": last_seen})
+
+            await store.with_state(chat_key, _seed)
+
     if last_seen is None or (now_utc - last_seen) > timedelta(hours=quiet_hours):
         logger.debug("Skipping bedtime notice for %s (quiet channel)", chat_key)
         return

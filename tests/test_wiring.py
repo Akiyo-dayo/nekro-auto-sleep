@@ -28,6 +28,7 @@ from nekro_auto_sleep.quality import compute_quality
 from tests.hoststub import (
     AgentCtx,
     clear_instance_config_overrides,
+    clear_last_message_times,
     set_own_bot_accounts,
     ChatMessage,
     FakeChatChannel,
@@ -98,6 +99,7 @@ def wired(monkeypatch, clock):
     reset_ctx_factory()
     clear_instance_config_overrides()
     set_own_bot_accounts([])
+    clear_last_message_times()
     m.invalidate_own_accounts_cache()
     m.invalidate_settings_cache()
     for k, v in saved.items():
@@ -1363,6 +1365,40 @@ class TestBedtimeHeadsUp:
     async def test_skips_a_channel_nobody_has_spoken_in(self, wired):
         plugin_mod, store, ctx = wired
         await self._ready(plugin_mod, store, seen_ago_hours=72)
+
+        await plugin_mod._maybe_bedtime_notice(
+            store, CHAT_KEY, BEDTIME - timedelta(minutes=5)
+        )
+        assert ctx.sent == []
+
+    async def test_backfills_last_seen_from_history_on_a_fresh_install(self, wired):
+        """`last_seen_at` only fills in while the plugin runs.
+
+        Without a backfill every channel looks quiet for the first day or two
+        after deploying and the heads-up never fires — which reads as broken.
+        """
+        from tests.hoststub import set_last_message_at
+
+        plugin_mod, store, ctx = wired
+        m.config.BEDTIME_NOTICE_MINUTES = 10
+        await store.hydrate(CHAT_KEY)
+        assert store.get_cached(CHAT_KEY).last_seen_at is None
+        set_last_message_at(CHAT_KEY, int((BEDTIME - timedelta(hours=2)).timestamp()))
+
+        await plugin_mod._maybe_bedtime_notice(
+            store, CHAT_KEY, BEDTIME - timedelta(minutes=5)
+        )
+
+        assert len(ctx.sent) == 1
+        assert store.get_cached(CHAT_KEY).last_seen_at is not None
+
+    async def test_a_channel_with_no_history_at_all_stays_silent(self, wired):
+        from tests.hoststub import set_last_message_at
+
+        plugin_mod, store, ctx = wired
+        m.config.BEDTIME_NOTICE_MINUTES = 10
+        await store.hydrate(CHAT_KEY)
+        set_last_message_at(CHAT_KEY, None)
 
         await plugin_mod._maybe_bedtime_notice(
             store, CHAT_KEY, BEDTIME - timedelta(minutes=5)

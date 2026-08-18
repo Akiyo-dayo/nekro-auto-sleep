@@ -303,6 +303,46 @@ class NekroPlugin:
         return decorator
 
 
+# --- nekro_agent.models.db_chat_message -----------------------------------------
+
+_LAST_MESSAGE_AT: dict[str, int] = {}
+
+
+def set_last_message_at(chat_key: str, timestamp: Optional[int]) -> None:
+    """Test helper: pretend this channel last spoke at `timestamp`."""
+    if timestamp is None:
+        _LAST_MESSAGE_AT.pop(chat_key, None)
+    else:
+        _LAST_MESSAGE_AT[chat_key] = int(timestamp)
+
+
+def clear_last_message_times() -> None:
+    _LAST_MESSAGE_AT.clear()
+
+
+class _ChatMessageRow:
+    def __init__(self, send_timestamp: int) -> None:
+        self.send_timestamp = send_timestamp
+
+
+class _ChatMessageQuery:
+    def __init__(self, chat_key: str) -> None:
+        self._chat_key = chat_key
+
+    def order_by(self, *args: Any) -> "_ChatMessageQuery":
+        return self
+
+    async def first(self):
+        stamp = _LAST_MESSAGE_AT.get(self._chat_key)
+        return _ChatMessageRow(stamp) if stamp else None
+
+
+class DBChatMessage:
+    @classmethod
+    def filter(cls, **kwargs: Any) -> "_ChatMessageQuery":
+        return _ChatMessageQuery(kwargs.get("chat_key", ""))
+
+
 # --- nekro_agent.models.db_adapter_instance -------------------------------------
 
 _OWN_ACCOUNTS: list[str] = []
@@ -471,6 +511,7 @@ def install_host_stub() -> None:
     models.__path__ = []  # type: ignore[attr-defined]
     _module("nekro_agent.models.db_chat_channel", DBChatChannel=FakeChatChannel)
     _module("nekro_agent.models.db_adapter_instance", DBAdapterInstance=DBAdapterInstance)
+    _module("nekro_agent.models.db_chat_message", DBChatMessage=DBChatMessage)
 
     services = _module("nekro_agent.services")
     services.__path__ = []  # type: ignore[attr-defined]
