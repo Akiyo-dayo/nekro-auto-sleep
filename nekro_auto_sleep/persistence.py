@@ -12,7 +12,7 @@ import logging
 from typing import Any, Protocol
 from collections.abc import Callable, Coroutine
 
-from .models import SCHEMA_VERSION, ChatSleepState, SleepStatus
+from .models import SCHEMA_VERSION, ChatSleepState, ScheduleOverride, SleepStatus
 
 logger = logging.getLogger("nekro_auto_sleep.persistence")
 
@@ -33,6 +33,62 @@ class StoreBackend(Protocol):
     async def delete(
         self, chat_key: str = "", user_key: str = "", store_key: str = ""
     ) -> int: ...
+
+
+CHANNEL_OVERRIDE_KEY = "schedule_override.v1"
+PRESET_OVERRIDE_PREFIX = "preset_schedule.v1."
+
+
+class ScheduleOverrideStore:
+    """Per-channel and per-persona schedule overrides.
+
+    Kept apart from the nightly state on purpose: overrides outlive cycles, and
+    losing one because a night's state failed to validate would silently move a
+    channel back to the global bedtime.
+    """
+
+    def __init__(self, backend: StoreBackend) -> None:
+        self._backend = backend
+
+    @staticmethod
+    def _preset_key(preset_id: object) -> str:
+        return f"{PRESET_OVERRIDE_PREFIX}{preset_id}"
+
+    async def _load(self, chat_key: str, store_key: str) -> ScheduleOverride | None:
+        raw = await self._backend.get(chat_key=chat_key, store_key=store_key)
+        if not raw:
+            return None
+        try:
+            return ScheduleOverride.model_validate_json(raw)
+        except Exception as exc:
+            logger.error("Corrupted schedule override at %s/%s: %s", chat_key, store_key, exc)
+            return None
+
+    async def _save(
+        self, chat_key: str, store_key: str, override: ScheduleOverride
+    ) -> None:
+        if override.is_empty():
+            await self._backend.delete(chat_key=chat_key, store_key=store_key)
+            return
+        await self._backend.set(
+            chat_key=chat_key, store_key=store_key, value=override.model_dump_json()
+        )
+
+    async def get_channel(self, chat_key: str) -> ScheduleOverride | None:
+        return await self._load(chat_key, CHANNEL_OVERRIDE_KEY)
+
+    async def set_channel(self, chat_key: str, override: ScheduleOverride) -> None:
+        await self._save(chat_key, CHANNEL_OVERRIDE_KEY, override)
+
+    async def get_preset(self, preset_id: object) -> ScheduleOverride | None:
+        if preset_id is None:
+            return None
+        return await self._load("", self._preset_key(preset_id))
+
+    async def set_preset(self, preset_id: object, override: ScheduleOverride) -> None:
+        if preset_id is None:
+            return
+        await self._save("", self._preset_key(preset_id), override)
 
 
 class SleepStateStore:
@@ -95,8 +151,16 @@ class SleepStateStore:
         return state
 
     async def save(self, state: ChatSleepState) -> None:
-        """Persist state to DB. Must be called within the chat_key's lock."""
+        """Persist state to DB. Must be called within the chat_key's lock.
+
+        Stamps the current schema version on the way out. Pydantic keeps
+        whatever version was in the payload it validated, so a row migrated
+        from v1 kept advertising v1 forever — the guard that refuses to load a
+        *newer* schema was reading a number that no longer described the row.
+        """
         chat_key = state.chat_key
+        if state.schema_version != SCHEMA_VERSION:
+            state = state.model_copy(update={"schema_version": SCHEMA_VERSION})
         raw = state.model_dump_json(by_alias=True)
         await self._backend.set(chat_key=chat_key, store_key=DATA_KEY, value=raw)
         self._cache[chat_key] = state
@@ -123,6 +187,19 @@ class SleepStateStore:
             new_state = await fn(state)
             await self.save(new_state)
             return new_state
+
+    async def hydrate(self, chat_key: str) -> ChatSleepState:
+        """Pull a chat_key into the cache so background maintenance can see it.
+
+        `known_chat_keys()` only reports cached keys, and the cache used to be
+        filled exclusively by inbound messages — so after a restart no channel
+        went to bed until somebody talked in it, and channels that were already
+        asleep never got their wake-up settled. Boot reconciliation calls this
+        for every discovered channel, including ones with no stored state yet.
+        """
+        state = await self.load_or_create(chat_key)
+        self._cache[chat_key] = state
+        return state
 
     def get_cached(self, chat_key: str) -> ChatSleepState | None:
         """Return cached state without DB access. For read-only checks."""

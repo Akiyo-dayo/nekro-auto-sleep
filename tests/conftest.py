@@ -24,6 +24,7 @@ class FakeStoreBackend:
 
     def __init__(self) -> None:
         self._data: dict[str, str] = {}
+        self.set_calls = 0
 
     def _key(self, chat_key: str, user_key: str, store_key: str) -> str:
         return f"{chat_key}|{user_key}|{store_key}"
@@ -39,6 +40,7 @@ class FakeStoreBackend:
         k = self._key(chat_key, user_key, store_key)
         existed = k in self._data
         self._data[k] = value
+        self.set_calls += 1
         return 1 if existed else 0
 
     async def delete(
@@ -75,9 +77,16 @@ def default_snapshot() -> ConfigSnapshot:
         call_keywords="醒醒,起床,在吗",
         fallback_persona_name="Bot",
         early_wake_idle_minutes=10,
-        quality_min=60,
+        quality_min=20,
         quality_max=120,
-        quality_jitter_points=4.0,
+        quality_jitter_points=2.0,
+        near_wake_minutes=60,
+        sleep_target_hours=0.0,
+        urgent_keywords="紧急,急事,救命,出事了",
+        answer_scope="offeree",
+        max_offers_per_night=3,
+        offer_cooldown_minutes=20,
+        snooze_minutes=30,
     )
 
 

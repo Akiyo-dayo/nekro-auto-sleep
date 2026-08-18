@@ -11,7 +11,7 @@ from datetime import date, datetime, time, timedelta
 
 from zoneinfo import ZoneInfo
 
-from .models import ConfigSnapshot
+from .models import ConfigSnapshot, ResolvedSchedule, ScheduleOverride
 
 
 def parse_hhmm(s: str) -> time:
@@ -122,12 +122,17 @@ def is_near_wake(
     now_utc: datetime,
     sleep_at_utc: datetime,
     wake_at_utc: datetime,
-    near_wake_ratio: float,
+    near_wake_minutes: int,
 ) -> bool:
-    """Check if now_utc is in the last near_wake_ratio portion of the sleep window."""
-    total = (wake_at_utc - sleep_at_utc).total_seconds()
-    threshold = wake_at_utc - timedelta(seconds=total * max(0.0, min(0.5, near_wake_ratio)))
-    return now_utc >= threshold
+    """Whether now_utc falls in the final stretch before the planned wake-up.
+
+    An absolute window rather than a fraction of the night: with a fraction the
+    "not up yet" wording drifted every night along with the random wake point,
+    and a longer configured night silently widened it.
+    """
+    minutes = max(0, min(720, near_wake_minutes))
+    threshold = wake_at_utc - timedelta(minutes=minutes)
+    return sleep_at_utc <= now_utc and now_utc >= threshold
 
 
 def current_local_date(tz: ZoneInfo, now_utc: datetime | None = None) -> date:
@@ -175,6 +180,73 @@ def next_sleep_at(
     return candidate.astimezone(ZoneInfo("UTC"))
 
 
+def resolve_schedule(
+    *,
+    timezone: str,
+    sleep_time: str,
+    wake_time_start: str,
+    wake_time_end: str,
+    preset_override: ScheduleOverride | None = None,
+    channel_override: ScheduleOverride | None = None,
+) -> ResolvedSchedule:
+    """Layer the schedule: channel beats persona, persona beats global config.
+
+    A persona keeps its own hours the way it keeps its own memories, and a
+    single channel can still be moved without touching either.
+    """
+    values = {
+        "timezone": timezone,
+        "sleep_time": sleep_time,
+        "wake_time_start": wake_time_start,
+        "wake_time_end": wake_time_end,
+    }
+    sources = dict.fromkeys(values, "global")
+
+    for label, override in (("preset", preset_override), ("channel", channel_override)):
+        if override is None:
+            continue
+        for field in values:
+            value = getattr(override, field, None)
+            if value:
+                values[field] = value
+                sources[field] = label
+
+    return ResolvedSchedule(**values, sources=sources)
+
+
+def parse_weekday_list(raw: str | list[int]) -> set[int]:
+    """Parse "4,5" into {4, 5}. Monday is 0, Sunday is 6."""
+    if isinstance(raw, str):
+        parts = [p.strip() for p in raw.replace("\n", ",").split(",") if p.strip()]
+    else:
+        parts = [str(p) for p in raw]
+    days: set[int] = set()
+    for part in parts:
+        try:
+            value = int(part)
+        except ValueError:
+            continue
+        if 0 <= value <= 6:
+            days.add(value)
+    return days
+
+
+def is_weekend_night(sleep_date: date, weekend_days: set[int]) -> bool:
+    """Whether the night starting on `sleep_date` uses the weekend hours.
+
+    Keyed on the evening, not the morning: Friday night is the one people stay
+    up for, so the default set is {4, 5} — Friday and Saturday.
+    """
+    return sleep_date.weekday() in weekend_days
+
+
+def parse_keyword_list(raw: str | list[str]) -> list[str]:
+    """Split a comma/newline separated keyword field into a clean list."""
+    if isinstance(raw, str):
+        return [k.strip() for k in raw.replace("\n", ",").split(",") if k.strip()]
+    return [str(k).strip() for k in raw if str(k).strip()]
+
+
 def create_config_snapshot(
     timezone: str,
     sleep_time: str,
@@ -190,13 +262,18 @@ def create_config_snapshot(
     quality_min: int,
     quality_max: int,
     quality_jitter_points: float,
+    *,
+    near_wake_minutes: int = 60,
+    sleep_target_hours: float = 8.0,
+    urgent_keywords: str | list[str] = (),
+    answer_scope: str = "offeree",
+    max_offers_per_night: int = 3,
+    offer_cooldown_minutes: int = 20,
+    snooze_minutes: int = 30,
+    asleep_prompt: str = "【{persona}已经睡了 要叫醒{persona}吗？】",
+    near_wake_prompt: str = "【{persona}还没起床 要叫醒{persona}吗？】",
 ) -> ConfigSnapshot:
     """Create a ConfigSnapshot from current config values."""
-    if isinstance(call_keywords, str):
-        kw_list = [k.strip() for k in call_keywords.replace("\n", ",").split(",") if k.strip()]
-    else:
-        kw_list = list(call_keywords)
-
     return ConfigSnapshot(
         timezone=timezone,
         sleep_time=sleep_time,
@@ -206,10 +283,19 @@ def create_config_snapshot(
         near_wake_ratio=near_wake_ratio,
         wake_confirm_window_seconds=wake_confirm_window_seconds,
         history_mode=history_mode,  # type: ignore[arg-type]
-        call_keywords=kw_list,
+        call_keywords=parse_keyword_list(call_keywords),
         fallback_persona_name=fallback_persona_name,
         early_wake_idle_minutes=early_wake_idle_minutes,
         quality_min=quality_min,
         quality_max=quality_max,
         quality_jitter_points=quality_jitter_points,
+        near_wake_minutes=near_wake_minutes,
+        sleep_target_hours=sleep_target_hours,
+        urgent_keywords=parse_keyword_list(urgent_keywords),
+        answer_scope=answer_scope,  # type: ignore[arg-type]
+        max_offers_per_night=max_offers_per_night,
+        offer_cooldown_minutes=offer_cooldown_minutes,
+        snooze_minutes=snooze_minutes,
+        asleep_prompt=asleep_prompt,
+        near_wake_prompt=near_wake_prompt,
     )

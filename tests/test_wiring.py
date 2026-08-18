@@ -1,0 +1,1901 @@
+"""Tests for the host-facing wiring layer (`nekro_auto_sleep/__init__.py`).
+
+Everything the domain-layer suites cannot see lives here: the order in which
+settlement closes and scores a cycle, which MsgSignal each situation returns,
+whether the persona name survives the round trip, what the prompt injection says
+on the second round after a wake-up, and what happens after a restart.
+
+Every v1 defect these cover was invisible to `test_engine.py` / `test_quality.py`
+because those build their inputs by hand and call the domain functions directly.
+"""
+
+from __future__ import annotations
+
+import re
+from datetime import datetime, timedelta
+
+import pytest
+from zoneinfo import ZoneInfo
+
+import nekro_auto_sleep as m
+from nekro_auto_sleep.engine import (
+    compute_actual_sleep_seconds,
+    transition_to_sleep,
+)
+from nekro_auto_sleep.models import ChatSleepState, ScheduleOverride, SleepStatus
+from nekro_auto_sleep.persistence import ScheduleOverrideStore, SleepStateStore
+from nekro_auto_sleep.quality import compute_quality
+from tests.hoststub import (
+    AgentCtx,
+    clear_instance_config_overrides,
+    clear_last_message_times,
+    set_own_bot_accounts,
+    ChatMessage,
+    FakeChatChannel,
+    MsgSignal,
+    reset_ctx_factory,
+    set_ctx_factory,
+)
+from tests.conftest import FakeStoreBackend
+
+CHAT_KEY = "onebot_v11-group_123456789"
+TZ = ZoneInfo("Asia/Shanghai")
+UTC = ZoneInfo("UTC")
+PERSONA = "阿绫"
+
+# 2026-08-17 23:00 +08:00
+BEDTIME = datetime(2026, 8, 17, 15, 0, tzinfo=UTC)
+
+
+class FrozenClock:
+    """Pinned clock for the wiring layer (`m._utcnow` is the only seam)."""
+
+    def __init__(self, now: datetime) -> None:
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, **kwargs) -> None:
+        self.now += timedelta(**kwargs)
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    c = FrozenClock(BEDTIME + timedelta(hours=2))
+    monkeypatch.setattr(m, "_utcnow", c)
+    return c
+
+
+@pytest.fixture
+def wired(monkeypatch, clock):
+    """A plugin wired to an in-memory store, with config restored afterwards."""
+    backend = FakeStoreBackend()
+    store = SleepStateStore(backend)
+    monkeypatch.setattr(m, "_store", store)
+    monkeypatch.setattr(m, "_overrides", ScheduleOverrideStore(backend))
+    store.test_backend = backend  # write counter, for the quiet-tick assertions
+    m.invalidate_settings_cache()
+
+    saved = m.config.model_dump()
+    m.config.TIMEZONE = "Asia/Shanghai"
+    m.config.SLEEP_TIME = "23:00"
+    m.config.WAKE_TIME_START = "06:45"
+    m.config.WAKE_TIME_END = "08:30"
+    m.config.HISTORY_MODE = "preserve"
+    m.config.WAKE_NOTICE_POLICY = "always"
+    m.config.FALLBACK_PERSONA_NAME = "Bot"
+    m.config.ANSWER_SCOPE = "offeree"
+    m.config.URGENT_KEYWORDS = ""
+    m.config.MAX_OFFERS_PER_NIGHT = 3
+    m.config.OFFER_COOLDOWN_MINUTES = 20
+    m.config.SNOOZE_MINUTES = 30
+
+    ctx = AgentCtx(CHAT_KEY, FakeChatChannel(CHAT_KEY, preset_name=PERSONA))
+    set_ctx_factory(lambda chat_key: ctx)
+
+    yield m, store, ctx
+
+    reset_ctx_factory()
+    clear_instance_config_overrides()
+    set_own_bot_accounts([])
+    clear_last_message_times()
+    m.invalidate_own_accounts_cache()
+    m.invalidate_settings_cache()
+    for k, v in saved.items():
+        setattr(m.config, k, v)
+
+
+async def _put_asleep(store: SleepStateStore, now=BEDTIME) -> ChatSleepState:
+    snap = m._make_config_snapshot()
+    state = transition_to_sleep(ChatSleepState(chat_key=CHAT_KEY), now, snap)
+    await store.save(state)
+    return state
+
+
+async def _drain_deferred(plugin_mod) -> None:
+    """Wait for the plugin's deferred sends (the 【已睡下】 that follows a round)."""
+    import asyncio
+
+    pending = list(plugin_mod._deferred_sends)
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+def _parse_notice(text: str) -> tuple[int, float]:
+    """Pull (quality percent, duration in hours) out of a wake-up report."""
+    quality = int(re.search(r"睡眠质量 (\d+)%", text).group(1))
+    hours = 0.0
+    h = re.search(r"(\d+) 小时", text)
+    if h:
+        hours += int(h.group(1))
+    mins = re.search(r"(\d+) 分钟", text)
+    if mins:
+        hours += int(mins.group(1)) / 60
+    return quality, hours
+
+
+# ---------------------------------------------------------------------------
+# Settlement: the score and the duration must describe the same night
+# ---------------------------------------------------------------------------
+
+
+class TestSettlement:
+    async def test_quality_and_duration_come_from_the_same_snapshot(self, wired):
+        plugin_mod, store, ctx = wired
+        state = await _put_asleep(store)
+        wake_at = state.cycle.planned_wake_at
+
+        await plugin_mod._settle_wake(store, CHAT_KEY, wake_at)
+
+        assert len(ctx.sent) == 1, ctx.sent
+        reported_quality, reported_hours = _parse_notice(ctx.sent[0][0])
+
+        settled = store.get_cached(CHAT_KEY)
+        assert settled.status == SleepStatus.AWAKE
+        actual_seconds = compute_actual_sleep_seconds(settled.cycle)
+
+        # The number in the message must be the score of the cycle as settled.
+        assert reported_quality == compute_quality(settled.cycle, actual_seconds)
+        assert reported_hours == pytest.approx(actual_seconds / 3600, abs=0.02)
+
+    async def test_undisturbed_night_does_not_report_the_floor(self, wired):
+        """Scoring before the final segment closes measured 0s of sleep and
+        pinned every quiet night to QUALITY_MIN while the duration stayed right."""
+        plugin_mod, store, ctx = wired
+        state = await _put_asleep(store)
+
+        await plugin_mod._settle_wake(store, CHAT_KEY, state.cycle.planned_wake_at)
+
+        quality, hours = _parse_notice(ctx.sent[0][0])
+        assert hours > 8
+        assert quality > m.config.QUALITY_MIN
+        assert quality >= 95
+
+    async def test_notice_suppressed_past_the_grace_period(self, wired):
+        plugin_mod, store, ctx = wired
+        state = await _put_asleep(store)
+        m.config.WAKE_NOTICE_GRACE_MINUTES = 120
+
+        very_late = state.cycle.planned_wake_at + timedelta(hours=5)
+        await plugin_mod._settle_wake(store, CHAT_KEY, very_late)
+
+        assert ctx.sent == []
+        assert store.get_cached(CHAT_KEY).status == SleepStatus.AWAKE
+
+    async def test_notice_sent_within_the_grace_period(self, wired):
+        plugin_mod, store, ctx = wired
+        state = await _put_asleep(store)
+        m.config.WAKE_NOTICE_GRACE_MINUTES = 120
+
+        slightly_late = state.cycle.planned_wake_at + timedelta(minutes=30)
+        await plugin_mod._settle_wake(store, CHAT_KEY, slightly_late)
+
+        assert len(ctx.sent) == 1
+        assert PERSONA in ctx.sent[0][0]
+
+
+# ---------------------------------------------------------------------------
+# Message signals: the night must stay in the history
+# ---------------------------------------------------------------------------
+
+
+class TestMessageSignals:
+    async def test_ordinary_night_message_is_still_recorded(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+
+        signal = await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="今天真累啊", chat_key=CHAT_KEY)
+        )
+
+        # BLOCK_ALL would make the host return before DBChatMessage.create,
+        # leaving the bot with no memory of the night at all.
+        assert signal == MsgSignal.BLOCK_TRIGGER
+        assert ctx.sent == []
+
+    async def test_strict_mode_still_drops_the_record(self, wired):
+        plugin_mod, store, ctx = wired
+        m.config.HISTORY_MODE = "strict"
+        await _put_asleep(store)
+
+        signal = await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="今天真累啊", chat_key=CHAT_KEY)
+        )
+        assert signal == MsgSignal.BLOCK_ALL
+
+    async def test_wake_offer_is_recorded_in_preserve_mode(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+
+        signal = await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="醒醒", chat_key=CHAT_KEY)
+        )
+
+        assert signal == MsgSignal.BLOCK_TRIGGER
+        assert len(ctx.sent) == 1
+        text, record = ctx.sent[0]
+        assert f"【{PERSONA}已经睡了 要叫醒{PERSONA}吗？】" == text
+        # Recorded, otherwise the woken bot sees the same user calling twice
+        # with no turn of its own in between.
+        assert record is True
+
+    async def test_second_call_forces_the_agent_round(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="醒醒", chat_key=CHAT_KEY)
+        )
+        signal = await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="要", chat_key=CHAT_KEY)
+        )
+
+        assert signal == MsgSignal.FORCE_TRIGGER
+        state = store.get_cached(CHAT_KEY)
+        assert state.status == SleepStatus.AWAKE_EARLY
+        assert state.woken_by == "u1"
+        assert state.woken_at is not None
+
+
+# ---------------------------------------------------------------------------
+# Persona name
+# ---------------------------------------------------------------------------
+
+
+class TestPersonaName:
+    async def test_resolves_the_preset_name(self, wired):
+        plugin_mod, _store, ctx = wired
+        # `db_chat_channel` is a plain property; awaiting it raised TypeError and
+        # a bare except turned every persona into the configured fallback.
+        assert await plugin_mod._get_persona_name(ctx) == PERSONA
+
+    async def test_looks_the_channel_up_when_the_ctx_has_none(self, wired):
+        """Upstream can hand back a ctx with no channel prefilled."""
+        plugin_mod, _store, _ctx = wired
+        bare = AgentCtx(CHAT_KEY, None)
+        assert await plugin_mod._get_persona_name(bare) == "小助手"
+
+    async def test_falls_back_when_the_lookup_fails(self, wired, monkeypatch):
+        from nekro_agent.models import db_chat_channel
+
+        plugin_mod, _store, _ctx = wired
+
+        async def _boom(chat_key: str = ""):
+            raise RuntimeError("no database here")
+
+        monkeypatch.setattr(db_chat_channel.DBChatChannel, "get_channel", _boom)
+        bare = AgentCtx(CHAT_KEY, None)
+        assert await plugin_mod._get_persona_name(bare) == m.config.FALLBACK_PERSONA_NAME
+
+
+# ---------------------------------------------------------------------------
+# Wake context: the reply after a wake-up has to make sense
+# ---------------------------------------------------------------------------
+
+
+class TestWakeContext:
+    async def _wake_up(self, plugin_mod, store, ctx):
+        """Call, answer, and then carry on — so the bot is properly awake.
+
+        The third message is what ends the decision round: the model replied,
+        the user said something else, and from here the injection describes an
+        awake bot in the middle of the night rather than one still deciding.
+        """
+        await _put_asleep(store)
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="醒醒", chat_key=CHAT_KEY)
+        )
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="要", chat_key=CHAT_KEY)
+        )
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="帮我看个东西", chat_key=CHAT_KEY)
+        )
+
+    async def test_context_survives_more_than_one_round(self, wired):
+        plugin_mod, store, ctx = wired
+        await self._wake_up(plugin_mod, store, ctx)
+        inject = plugin_mod.plugin.prompt_injects["sleep_status"]
+
+        first = await inject(ctx)
+        second = await inject(ctx)
+
+        # The old one-shot cache was popped by the first round, so every later
+        # reply had no idea it was the middle of the night.
+        assert first.strip()
+        assert second.strip()
+        assert "resume_sleep" in second
+
+    async def test_context_names_the_bedtime_and_the_waker(self, wired):
+        plugin_mod, store, ctx = wired
+        await self._wake_up(plugin_mod, store, ctx)
+
+        text = await plugin_mod.plugin.prompt_injects["sleep_status"](ctx)
+
+        assert "23:00" in text  # bedtime, rendered in the cycle timezone
+        assert "u1" in text  # who did the waking
+        assert "睡着时收到" in text  # night messages must not be treated as live
+
+    async def test_just_woken_line_expires(self, wired):
+        plugin_mod, store, ctx = wired
+        await self._wake_up(plugin_mod, store, ctx)
+        state = store.get_cached(CHAT_KEY)
+
+        fresh = plugin_mod._render_sleep_context(state, state.woken_at + timedelta(seconds=5))
+        later = plugin_mod._render_sleep_context(state, state.woken_at + timedelta(minutes=30))
+
+        assert "刚刚被叫醒" in fresh
+        assert "刚刚被叫醒" not in later
+        assert later.strip()  # the rest of the context stays
+
+    async def test_no_injection_when_awake(self, wired):
+        plugin_mod, store, ctx = wired
+        await store.save(ChatSleepState(chat_key=CHAT_KEY))
+        assert await plugin_mod.plugin.prompt_injects["sleep_status"](ctx) == ""
+
+
+# ---------------------------------------------------------------------------
+# Restart behaviour
+# ---------------------------------------------------------------------------
+
+
+class TestBootReconcile:
+    async def test_settles_a_wake_up_that_happened_while_down(self, wired, monkeypatch):
+        plugin_mod, store, ctx = wired
+        state = await _put_asleep(store)
+        wake_at = state.cycle.planned_wake_at
+
+        store.clear_all()  # a restart: nothing in the cache
+        monkeypatch.setattr(
+            plugin_mod, "_discover_chat_keys", lambda: _async_set({CHAT_KEY})
+        )
+
+        await plugin_mod._boot_reconcile(store, wake_at + timedelta(minutes=20))
+
+        assert store.get_cached(CHAT_KEY).status == SleepStatus.AWAKE
+        assert len(ctx.sent) == 1
+        assert "已起床" in ctx.sent[0][0]
+
+    async def test_goes_to_bed_for_a_night_that_started_while_down(
+        self, wired, monkeypatch
+    ):
+        plugin_mod, store, ctx = wired
+        monkeypatch.setattr(
+            plugin_mod, "_discover_chat_keys", lambda: _async_set({CHAT_KEY})
+        )
+
+        # Booting at 02:00 local, three hours past bedtime.
+        now = BEDTIME + timedelta(hours=3)
+        await plugin_mod._boot_reconcile(store, now)
+
+        state = store.get_cached(CHAT_KEY)
+        assert state.status == SleepStatus.ASLEEP
+        assert state.cycle.sleep_date == "2026-08-17"
+        # Backdated, otherwise the morning report claims a three-hour night.
+        assert state.cycle.sleep_segments[0].open_at == state.cycle.sleep_at
+
+    async def test_hydrates_channels_that_never_spoke(self, wired, monkeypatch):
+        plugin_mod, store, _ctx = wired
+        monkeypatch.setattr(
+            plugin_mod, "_discover_chat_keys", lambda: _async_set({CHAT_KEY})
+        )
+
+        # Daytime: nothing to settle, but the channel must still be watched or it
+        # will never fall asleep tonight.
+        await plugin_mod._boot_reconcile(store, BEDTIME - timedelta(hours=6))
+
+        assert CHAT_KEY in store.known_chat_keys()
+
+
+class TestBedtimeDetection:
+    async def test_bedtime_is_not_missed_by_a_slow_maintenance_loop(self, wired):
+        plugin_mod, store, _ctx = wired
+        await store.hydrate(CHAT_KEY)
+
+        # A tick 40 minutes after bedtime: the old 30-second look-back window
+        # skipped the night entirely whenever the interval was raised.
+        late_tick = BEDTIME + timedelta(minutes=40)
+        await plugin_mod._check_sleep_transition(store, CHAT_KEY, late_tick)
+
+        state = store.get_cached(CHAT_KEY)
+        assert state.status == SleepStatus.ASLEEP
+        assert state.cycle.sleep_date == "2026-08-17"
+
+    async def test_does_not_restart_the_same_night_twice(self, wired):
+        plugin_mod, store, _ctx = wired
+        await store.hydrate(CHAT_KEY)
+
+        first_tick = BEDTIME + timedelta(minutes=5)
+        await plugin_mod._check_sleep_transition(store, CHAT_KEY, first_tick)
+        opened_at = store.get_cached(CHAT_KEY).cycle.sleep_segments[0].open_at
+
+        await plugin_mod._check_sleep_transition(
+            store, CHAT_KEY, BEDTIME + timedelta(hours=2)
+        )
+
+        state = store.get_cached(CHAT_KEY)
+        assert len(state.cycle.sleep_segments) == 1
+        assert state.cycle.sleep_segments[0].open_at == opened_at
+
+    async def test_does_not_nap_after_this_nights_wake_up(self, wired):
+        plugin_mod, store, _ctx = wired
+        await store.hydrate(CHAT_KEY)
+
+        # 08:15 local, inside the wake range but past most wake points.
+        morning = datetime(2026, 8, 18, 0, 15, tzinfo=UTC)
+        await plugin_mod._check_sleep_transition(store, CHAT_KEY, morning)
+
+        state = store.get_cached(CHAT_KEY)
+        if state.cycle is not None and morning >= state.cycle.planned_wake_at:
+            assert state.status == SleepStatus.AWAKE
+
+
+async def _async_set(value):
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Wake protocol, end to end through the hook
+# ---------------------------------------------------------------------------
+
+
+class TestWakeProtocolWiring:
+    async def _ask(self, plugin_mod, ctx, text="醒醒"):
+        return await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content=text, chat_key=CHAT_KEY)
+        )
+
+    async def test_the_second_message_reaches_the_llm(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+
+        await self._ask(plugin_mod, ctx)
+        signal = await self._ask(plugin_mod, ctx, "要")
+
+        assert signal == MsgSignal.FORCE_TRIGGER
+        state = store.get_cached(CHAT_KEY)
+        assert state.status == SleepStatus.AWAKE_EARLY
+        assert state.wake_decision_pending is True
+
+    async def test_a_refusal_also_reaches_the_llm(self, wired):
+        """The plugin does not decide what 「算了你睡吧」 meant; the model does."""
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+
+        await self._ask(plugin_mod, ctx)
+        signal = await self._ask(plugin_mod, ctx, "算了你睡吧")
+
+        assert signal == MsgSignal.FORCE_TRIGGER
+        assert store.get_cached(CHAT_KEY).wake_decision_pending is True
+        # Still only the question has been sent.
+        assert len(ctx.sent) == 1
+
+    async def test_the_model_declining_is_silent(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+        await self._ask(plugin_mod, ctx)
+        await self._ask(plugin_mod, ctx, "算了你睡吧")
+        ctx.sent.clear()
+
+        await plugin_mod.resume_sleep(ctx)
+
+        assert ctx.sent == [], "declining the wake must not send anything"
+        state = store.get_cached(CHAT_KEY)
+        assert state.status == SleepStatus.ASLEEP
+        assert state.snooze_until is not None
+
+    async def test_turning_in_after_a_real_conversation_announces(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+        await self._ask(plugin_mod, ctx)
+        await self._ask(plugin_mod, ctx, "要")
+        # The model replied and the user carried on, ending the decision round.
+        await self._ask(plugin_mod, ctx, "帮我查个东西")
+        ctx.sent.clear()
+
+        await plugin_mod.resume_sleep(ctx)
+        await _drain_deferred(plugin_mod)
+
+        assert len(ctx.sent) == 1
+        assert "已睡下" in ctx.sent[0][0]
+
+    async def test_the_decision_round_gets_its_own_instructions(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+        await self._ask(plugin_mod, ctx)
+        await self._ask(plugin_mod, ctx, "嗯？")
+
+        text = await plugin_mod.plugin.prompt_injects["sleep_status"](ctx)
+
+        assert "要不要叫醒你" in text
+        assert "resume_sleep" in text
+        assert "不要输出任何内容" in text
+        assert PERSONA in text
+
+    async def test_repeated_calls_do_not_spam_the_chat(self, wired, clock):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+
+        for _ in range(8):
+            await self._ask(plugin_mod, ctx, "在吗")
+            clock.advance(minutes=4)
+
+        # Eight valid calls across 32 minutes, two replies: one at the start and
+        # one after the 20-minute cooldown. Before the rate limit every single
+        # one of them got its own fixed reply and its own quality penalty.
+        assert len(ctx.sent) == 2
+        assert store.get_cached(CHAT_KEY).offers_sent_tonight == 2
+
+    async def test_urgent_message_skips_the_handshake(self, wired):
+        plugin_mod, store, ctx = wired
+        m.config.URGENT_KEYWORDS = "紧急,急事,救命,出事了"
+        await _put_asleep(store)
+
+        signal = await self._ask(plugin_mod, ctx, "出事了 快醒醒")
+
+        assert signal == MsgSignal.FORCE_TRIGGER
+        state = store.get_cached(CHAT_KEY)
+        assert state.status == SleepStatus.AWAKE_EARLY
+        assert state.woken_reason == "urgent"
+        assert ctx.sent == []
+
+    async def test_urgent_wake_is_reflected_in_the_prompt(self, wired):
+        plugin_mod, store, ctx = wired
+        m.config.URGENT_KEYWORDS = "紧急,急事,救命,出事了"
+        await _put_asleep(store)
+        # Urgent still has to be aimed at the bot: an @ or a call keyword.
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="救命", chat_key=CHAT_KEY, is_tome=True)
+        )
+
+        text = await plugin_mod.plugin.prompt_injects["sleep_status"](ctx)
+        assert "紧急叫醒" in text
+
+
+class TestQualityBreakdownPersisted:
+    async def test_settlement_stores_every_term(self, wired):
+        plugin_mod, store, ctx = wired
+        state = await _put_asleep(store)
+
+        await plugin_mod._settle_wake(store, CHAT_KEY, state.cycle.planned_wake_at)
+
+        breakdown = store.get_cached(CHAT_KEY).cycle.quality_breakdown
+        assert breakdown is not None
+        reported, _hours = _parse_notice(ctx.sent[0][0])
+        assert breakdown["score"] == reported
+        assert set(breakdown) >= {
+            "base",
+            "penalty_fragmentation",
+            "penalty_calls",
+            "penalty_wakes",
+            "jitter",
+            "raw",
+            "target_hours",
+            "effective_hours",
+        }
+
+
+# ---------------------------------------------------------------------------
+# Night-time scheduled tasks
+# ---------------------------------------------------------------------------
+
+
+class TestNightTimerPolicy:
+    async def test_run_lets_the_reminder_through(self, wired):
+        plugin_mod, store, ctx = wired
+        m.config.NIGHT_TIMER_POLICY = "run"
+        await _put_asleep(store)
+
+        signal = await plugin_mod.plugin.on_system_message(ctx, "定时提醒：吃药")
+
+        # The host only starts a round for callers passing trigger_agent=True,
+        # so letting this through wakes the timer service and nothing else.
+        assert signal == MsgSignal.CONTINUE
+
+    async def test_run_charges_the_round_to_sleep_quality(self, wired):
+        plugin_mod, store, ctx = wired
+        m.config.NIGHT_TIMER_POLICY = "run"
+        m.config.NIGHT_DUTY_ASSUMED_MINUTES = 6
+        await _put_asleep(store)
+
+        await plugin_mod.plugin.on_system_message(ctx, "定时提醒：吃药")
+
+        cycle = store.get_cached(CHAT_KEY).cycle
+        assert len(cycle.timer_intervals) == 1
+        interval = cycle.timer_intervals[0]
+        assert (interval.end_at - interval.start_at) == timedelta(minutes=6)
+        # Night duty overlays the night; it does not break the sleep segment.
+        assert cycle.sleep_segments[-1].close_at is None
+
+    async def test_block_keeps_the_reminder_out_of_the_llm(self, wired):
+        plugin_mod, store, ctx = wired
+        m.config.NIGHT_TIMER_POLICY = "block"
+        await _put_asleep(store)
+
+        signal = await plugin_mod.plugin.on_system_message(ctx, "定时提醒：吃药")
+
+        assert signal == MsgSignal.BLOCK_TRIGGER
+        assert store.get_cached(CHAT_KEY).cycle.timer_intervals == []
+
+    async def test_awake_channels_are_untouched(self, wired):
+        plugin_mod, store, ctx = wired
+        m.config.NIGHT_TIMER_POLICY = "block"
+        await store.save(ChatSleepState(chat_key=CHAT_KEY))
+
+        assert await plugin_mod.plugin.on_system_message(ctx, "x") == MsgSignal.CONTINUE
+
+    async def test_the_gate_only_blocks_under_the_block_policy(self, wired):
+        plugin_mod, store, _ctx = wired
+        await _put_asleep(store)
+
+        m.config.NIGHT_TIMER_POLICY = "run"
+        assert plugin_mod._night_timer_blocked(CHAT_KEY) is False
+
+        m.config.NIGHT_TIMER_POLICY = "block"
+        assert plugin_mod._night_timer_blocked(CHAT_KEY) is True
+
+    async def test_night_duty_prompt_tells_the_bot_it_is_on_duty(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+
+        text = await plugin_mod.plugin.prompt_injects["sleep_status"](ctx)
+        assert "夜里值班" in text
+        assert "继续睡" in text
+
+
+class TestScheduleGate:
+    async def test_wrapper_is_actually_installed_and_reversible(self):
+        """The first version registered the timer methods for restoration
+        without ever wrapping them, so the gate never existed."""
+        from nekro_auto_sleep.runtime import (
+            is_wrapped,
+            make_schedule_agent_task_wrapper,
+            unwrap_callable,
+            wrap_callable,
+        )
+
+        class FakeService:
+            def __init__(self):
+                self.calls = []
+
+            async def schedule_agent_task(self, chat_key):
+                self.calls.append(chat_key)
+                return "ran"
+
+        service = FakeService()
+        blocked = {"value": False}
+        wrapper = make_schedule_agent_task_wrapper(lambda ck: blocked["value"])
+
+        assert wrap_callable(service, "schedule_agent_task", wrapper) is True
+        assert is_wrapped(service, "schedule_agent_task")
+
+        assert await service.schedule_agent_task(CHAT_KEY) == "ran"
+        blocked["value"] = True
+        assert await service.schedule_agent_task(CHAT_KEY) is None
+        assert service.calls == [CHAT_KEY]
+
+        assert unwrap_callable(service, "schedule_agent_task") is True
+        assert not is_wrapped(service, "schedule_agent_task")
+        assert await service.schedule_agent_task(CHAT_KEY) == "ran"
+
+
+class TestInstallWraps:
+    """`_install_wraps` must actually wrap, not just remember to unwrap.
+
+    The first version appended `(timer_service, "_execute_task")` to the
+    restore list without ever calling `wrap_callable`, so the gate it was
+    supposed to install never existed while the bookkeeping said it did. A test
+    that only exercises `wrap_callable` on a fake object cannot see that.
+    """
+
+    async def test_the_gate_is_installed_and_removed_for_real(self, wired):
+        from nekro_agent.services.message_service import message_service as ms
+        from nekro_auto_sleep.runtime import is_wrapped
+
+        plugin_mod, _store, _ctx = wired
+        plugin_mod._installed_wraps.clear()
+        try:
+            assert plugin_mod._install_wraps() is True
+            assert is_wrapped(ms, "schedule_agent_task"), "gate reported but not installed"
+            assert (ms, "schedule_agent_task") in plugin_mod._installed_wraps
+        finally:
+            plugin_mod._uninstall_wraps()
+
+        assert not is_wrapped(ms, "schedule_agent_task")
+        assert plugin_mod._installed_wraps == []
+
+    async def test_the_installed_gate_honours_the_policy(self, wired):
+        from nekro_agent.services.message_service import message_service as ms
+
+        plugin_mod, store, _ctx = wired
+        await _put_asleep(store)
+        plugin_mod._installed_wraps.clear()
+        try:
+            plugin_mod._install_wraps()
+
+            m.config.NIGHT_TIMER_POLICY = "run"
+            assert await ms.schedule_agent_task(CHAT_KEY) == "scheduled"
+
+            m.config.NIGHT_TIMER_POLICY = "block"
+            assert await ms.schedule_agent_task(CHAT_KEY) is None
+        finally:
+            plugin_mod._uninstall_wraps()
+
+
+# ---------------------------------------------------------------------------
+# Schedule overrides and operator commands
+# ---------------------------------------------------------------------------
+
+
+def _cmd_context(chat_key: str = CHAT_KEY):
+    from tests.hoststub import CommandExecutionContext
+
+    return CommandExecutionContext(chat_key=chat_key)
+
+
+class TestScheduleLayering:
+    async def test_global_config_is_the_default(self, wired):
+        plugin_mod, _store, _ctx = wired
+        schedule = await plugin_mod._resolve_schedule_for(CHAT_KEY)
+
+        assert schedule.timezone == "Asia/Shanghai"
+        assert schedule.sleep_time == "23:00"
+        assert set(schedule.sources.values()) == {"global"}
+
+    async def test_channel_override_wins(self, wired):
+        plugin_mod, _store, _ctx = wired
+        await plugin_mod._get_overrides().set_channel(
+            CHAT_KEY, ScheduleOverride(timezone="Asia/Tokyo", sleep_time="01:00")
+        )
+        plugin_mod.invalidate_settings_cache(CHAT_KEY)
+
+        schedule = await plugin_mod._resolve_schedule_for(CHAT_KEY)
+        assert schedule.timezone == "Asia/Tokyo"
+        assert schedule.sleep_time == "01:00"
+        # Untouched fields still come from the global config.
+        assert schedule.wake_time_start == "06:45"
+        assert schedule.sources["timezone"] == "channel"
+        assert schedule.sources["wake_time_start"] == "global"
+
+    async def test_channel_beats_persona_beats_global(self, wired):
+        plugin_mod, _store, _ctx = wired
+        overrides = plugin_mod._get_overrides()
+        await overrides.set_preset(1, ScheduleOverride(sleep_time="22:00", timezone="Asia/Tokyo"))
+        await overrides.set_channel(CHAT_KEY, ScheduleOverride(sleep_time="00:30"))
+        plugin_mod.invalidate_settings_cache()
+
+        schedule = await plugin_mod._resolve_schedule_for(CHAT_KEY)
+        assert schedule.sleep_time == "00:30"  # channel
+        assert schedule.timezone == "Asia/Tokyo"  # persona
+        assert schedule.wake_time_end == "08:30"  # global
+        assert schedule.sources == {
+            "timezone": "preset",
+            "sleep_time": "channel",
+            "wake_time_start": "global",
+            "wake_time_end": "global",
+        }
+
+    async def test_bedtime_follows_the_channel_override(self, wired, clock):
+        plugin_mod, store, _ctx = wired
+        await store.hydrate(CHAT_KEY)
+        await plugin_mod._get_overrides().set_channel(
+            CHAT_KEY, ScheduleOverride(sleep_time="01:00")
+        )
+        plugin_mod.invalidate_settings_cache(CHAT_KEY)
+
+        # 23:30 local: past the global bedtime, before the one this channel set.
+        await plugin_mod._check_sleep_transition(
+            store, CHAT_KEY, BEDTIME + timedelta(minutes=30)
+        )
+        assert store.get_cached(CHAT_KEY).status == SleepStatus.AWAKE
+
+        # 01:30 local.
+        await plugin_mod._check_sleep_transition(
+            store, CHAT_KEY, BEDTIME + timedelta(hours=2, minutes=30)
+        )
+        assert store.get_cached(CHAT_KEY).status == SleepStatus.ASLEEP
+
+    async def test_the_cycle_records_the_schedule_it_actually_slept_on(self, wired):
+        """The snapshot drives the cycle boundaries, not just the decision to sleep.
+
+        Deciding with the channel schedule but building the cycle from the global
+        one would put bedtime and the wake range in the wrong timezone for the
+        whole night.
+        """
+        plugin_mod, store, _ctx = wired
+        await store.hydrate(CHAT_KEY)
+        await plugin_mod._get_overrides().set_channel(
+            CHAT_KEY, ScheduleOverride(timezone="Asia/Tokyo", sleep_time="01:00")
+        )
+        plugin_mod.invalidate_settings_cache(CHAT_KEY)
+
+        await plugin_mod._check_sleep_transition(
+            store, CHAT_KEY, BEDTIME + timedelta(hours=2, minutes=30)
+        )
+
+        cycle = store.get_cached(CHAT_KEY).cycle
+        assert cycle.config_snapshot.timezone == "Asia/Tokyo"
+        assert cycle.config_snapshot.sleep_time == "01:00"
+        assert cycle.sleep_at.astimezone(ZoneInfo("Asia/Tokyo")).strftime("%H:%M") == "01:00"
+
+
+class TestOperatorCommands:
+    async def test_status_reports_the_schedule_and_its_origin(self, wired):
+        plugin_mod, _store, _ctx = wired
+        await plugin_mod._get_overrides().set_channel(
+            CHAT_KEY, ScheduleOverride(timezone="Asia/Tokyo")
+        )
+        plugin_mod.invalidate_settings_cache(CHAT_KEY)
+
+        response = await plugin_mod.plugin.commands["sleep.status"](_cmd_context())
+
+        assert response.status == "success"
+        assert "Asia/Tokyo" in response.message
+        assert "本频道" in response.message
+        assert PERSONA in response.message
+
+    async def test_status_shows_last_nights_scoring_terms(self, wired):
+        plugin_mod, store, _ctx = wired
+        state = await _put_asleep(store)
+        await plugin_mod._settle_wake(store, CHAT_KEY, state.cycle.planned_wake_at)
+
+        response = await plugin_mod.plugin.commands["sleep.status"](_cmd_context())
+
+        assert "上一夜" in response.message
+        assert "整夜无扰" in response.message
+
+    async def test_now_puts_it_to_bed_immediately(self, wired, clock):
+        plugin_mod, store, _ctx = wired
+        clock.now = BEDTIME - timedelta(hours=1)  # 22:00, an hour early
+        await store.hydrate(CHAT_KEY)
+
+        response = await plugin_mod.plugin.commands["sleep.now"](_cmd_context())
+
+        assert response.status == "success"
+        state = store.get_cached(CHAT_KEY)
+        assert state.status == SleepStatus.ASLEEP
+        # The night is measured from when it actually turned in, not from 23:00.
+        assert state.cycle.sleep_at == clock.now
+
+    async def test_wake_settles_and_reports(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+        ctx.sent.clear()
+
+        response = await plugin_mod.plugin.commands["sleep.wake"](_cmd_context())
+
+        assert response.status == "success"
+        assert store.get_cached(CHAT_KEY).status == SleepStatus.AWAKE
+        assert any("已起床" in text for text, _ in ctx.sent)
+
+    async def test_wake_refuses_when_already_awake(self, wired):
+        plugin_mod, store, _ctx = wired
+        await store.hydrate(CHAT_KEY)
+        response = await plugin_mod.plugin.commands["sleep.wake"](_cmd_context())
+        assert response.status == "error"
+
+    async def test_skip_keeps_it_up_for_one_night(self, wired, clock):
+        plugin_mod, store, _ctx = wired
+        await store.hydrate(CHAT_KEY)
+
+        await plugin_mod.plugin.commands["sleep.skip"](_cmd_context())
+        await plugin_mod._check_sleep_transition(
+            store, CHAT_KEY, BEDTIME + timedelta(minutes=30)
+        )
+
+        state = store.get_cached(CHAT_KEY)
+        assert state.status == SleepStatus.AWAKE
+        assert state.skip_sleep_date == "2026-08-17"
+
+    async def test_a_skipped_night_does_not_rewrite_state_every_tick(self, wired):
+        """The maintenance loop runs every 15 seconds all night long."""
+        plugin_mod, store, _ctx = wired
+        await store.hydrate(CHAT_KEY)
+        await plugin_mod.plugin.commands["sleep.skip"](_cmd_context())
+
+        writes_before = store.test_backend.set_calls
+        for minutes in (30, 60, 90):
+            await plugin_mod._check_sleep_transition(
+                store, CHAT_KEY, BEDTIME + timedelta(minutes=minutes)
+            )
+
+        assert store.test_backend.set_calls == writes_before
+
+    async def test_set_and_unset_a_channel_override(self, wired):
+        plugin_mod, _store, _ctx = wired
+        commands = plugin_mod.plugin.commands
+
+        ok = await commands["sleep.set"](_cmd_context(), "tz", "Asia/Tokyo")
+        assert ok.status == "success"
+        assert (await plugin_mod._resolve_schedule_for(CHAT_KEY)).timezone == "Asia/Tokyo"
+
+        await commands["sleep.unset"](_cmd_context())
+        assert (await plugin_mod._resolve_schedule_for(CHAT_KEY)).timezone == "Asia/Shanghai"
+
+    async def test_set_rejects_nonsense(self, wired):
+        plugin_mod, _store, _ctx = wired
+        commands = plugin_mod.plugin.commands
+
+        assert (await commands["sleep.set"](_cmd_context(), "tz", "Mars/Olympus")).status == "error"
+        assert (await commands["sleep.set"](_cmd_context(), "bed", "25 点")).status == "error"
+        assert (await commands["sleep.set"](_cmd_context(), "nope", "x")).status == "error"
+        # Nothing was written.
+        assert (await plugin_mod._resolve_schedule_for(CHAT_KEY)).timezone == "Asia/Shanghai"
+
+    async def test_set_can_target_the_persona(self, wired):
+        plugin_mod, _store, _ctx = wired
+
+        ok = await plugin_mod.plugin.commands["sleep.set"](
+            _cmd_context(), "bed", "22:00", "preset"
+        )
+        assert ok.status == "success"
+
+        schedule = await plugin_mod._resolve_schedule_for(CHAT_KEY)
+        assert schedule.sleep_time == "22:00"
+        assert schedule.sources["sleep_time"] == "preset"
+
+
+class TestUpgradeWarnings:
+    """Plugin config is persisted per field, so an upgrade keeps v1 values.
+
+    Found on a real install: after deploying v2 the score still read 60% for
+    every rough night, because the saved config still carried the v1 floor.
+    """
+
+    async def test_a_stale_v1_floor_is_called_out(self, wired):
+        plugin_mod, _store, _ctx = wired
+        m.config.QUALITY_MIN = 60
+
+        warnings = plugin_mod.collect_upgrade_warnings()
+        assert len(warnings) == 1
+        assert "20" in warnings[0]
+
+    async def test_a_sane_floor_says_nothing(self, wired):
+        plugin_mod, _store, _ctx = wired
+        m.config.QUALITY_MIN = 20
+        assert plugin_mod.collect_upgrade_warnings() == []
+
+    async def test_status_surfaces_the_warning(self, wired):
+        plugin_mod, _store, _ctx = wired
+        m.config.QUALITY_MIN = 60
+
+        response = await plugin_mod.plugin.commands["sleep.status"](_cmd_context())
+        assert "睡眠质量下限" in response.message
+
+    async def test_status_marks_a_clipped_score(self, wired):
+        plugin_mod, store, _ctx = wired
+        m.config.QUALITY_MIN = 60
+        state = await _put_asleep(store)
+        # A night that barely happened: the raw score lands far below the floor.
+        await plugin_mod._settle_wake(
+            store, CHAT_KEY, state.cycle.sleep_at + timedelta(minutes=1)
+        )
+
+        response = await plugin_mod.plugin.commands["sleep.status"](_cmd_context())
+        assert "被下限" in response.message
+
+
+class TestHostLogBridge:
+    """The domain layer logs through stdlib logging; the host uses loguru.
+
+    Nothing bridged them, so on a real install every INFO the plugin emitted
+    vanished and every WARNING landed on bare stderr with no timestamp and no
+    plugin tag. That is how "did boot reconciliation run?" became unanswerable
+    from the log.
+    """
+
+    class _Recorder:
+        def __init__(self):
+            self.lines: list[tuple[str, str]] = []
+
+        def _make(self, level):
+            def _log(message, *args):
+                self.lines.append((level, str(message)))
+
+            return _log
+
+        def __getattr__(self, name):
+            return self._make(name)
+
+    async def test_domain_logs_reach_the_host_logger(self, monkeypatch):
+        import logging
+
+        recorder = self._Recorder()
+        monkeypatch.setattr(m.plugin, "logger", recorder, raising=False)
+        try:
+            m._install_log_bridge()
+            logging.getLogger("nekro_auto_sleep.engine").warning("夜间提示被限流")
+            assert ("warning", "夜间提示被限流") in recorder.lines
+        finally:
+            m._remove_log_bridge()
+
+    async def test_removing_the_bridge_detaches_it(self, monkeypatch):
+        import logging
+
+        recorder = self._Recorder()
+        monkeypatch.setattr(m.plugin, "logger", recorder, raising=False)
+        m._install_log_bridge()
+        m._remove_log_bridge()
+
+        logging.getLogger("nekro_auto_sleep.engine").warning("不该出现")
+        assert recorder.lines == []
+
+    async def test_wiring_layer_logs_also_reach_the_host(self, monkeypatch):
+        recorder = self._Recorder()
+        monkeypatch.setattr(m.plugin, "logger", recorder, raising=False)
+        try:
+            m._install_log_bridge()
+            m.logger.info("接线层这条也要能看见")
+            assert ("info", "接线层这条也要能看见") in recorder.lines
+        finally:
+            m._remove_log_bridge()
+
+    async def test_percent_placeholders_are_interpolated(self, monkeypatch):
+        """loguru formats with braces, stdlib with percent.
+
+        Handing a `%s` template straight to the host logger printed it
+        literally and dropped the argument, which is what the first version of
+        this bridge did to every line it forwarded.
+        """
+        recorder = self._Recorder()
+        monkeypatch.setattr(m.plugin, "logger", recorder, raising=False)
+        try:
+            m._install_log_bridge()
+            m.logger.info("启动对账：%d 个频道", 62)
+            assert ("info", "启动对账：62 个频道") in recorder.lines
+        finally:
+            m._remove_log_bridge()
+
+
+class TestToolExposure:
+    async def test_resume_sleep_is_hidden_while_awake(self, wired):
+        plugin_mod, store, ctx = wired
+        await store.save(ChatSleepState(chat_key=CHAT_KEY))
+        assert await plugin_mod.plugin.collect_methods(ctx) == []
+
+    async def test_resume_sleep_is_hidden_while_asleep(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+        assert await plugin_mod.plugin.collect_methods(ctx) == []
+
+    async def test_resume_sleep_appears_once_woken(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="醒醒", chat_key=CHAT_KEY)
+        )
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="要", chat_key=CHAT_KEY)
+        )
+
+        methods = await plugin_mod.plugin.collect_methods(ctx)
+        assert len(methods) == 1
+        assert methods[0] is plugin_mod.resume_sleep
+
+
+# ---------------------------------------------------------------------------
+# Two instances sharing one group
+# ---------------------------------------------------------------------------
+
+INST_A = "onebot_v11-inst1-group_555000"
+INST_B = "onebot_v11-inst2-group_555000"
+
+
+class TestSharedGroupIsolation:
+    """Same群, two accounts. In the fork the instance segment is part of the
+    chat_key, so everything downstream is keyed apart — but only if nothing
+    quietly falls back to the global config."""
+
+    def test_the_wake_draw_is_independent_per_instance(self):
+        from datetime import date
+
+        from nekro_auto_sleep.schedule import pick_wake_time
+
+        start = datetime(2026, 8, 17, 22, 45, tzinfo=UTC)
+        end = datetime(2026, 8, 18, 0, 30, tzinfo=UTC)
+
+        differing = 0
+        for offset in range(14):
+            day = date(2026, 8, 1) + timedelta(days=offset)
+            a = pick_wake_time(INST_A, day, start, end, 1)
+            b = pick_wake_time(INST_B, day, start, end, 1)
+            if a != b:
+                differing += 1
+            # and each is stable for its own instance
+            assert a == pick_wake_time(INST_A, day, start, end, 1)
+
+        # Two independent draws over a 106-minute window; identical every night
+        # would mean the instance segment stopped reaching the seed.
+        assert differing >= 12, f"only {differing}/14 nights differed"
+
+    async def test_each_instance_keeps_its_own_night(self, wired):
+        plugin_mod, store, _ctx = wired
+        snap = plugin_mod._make_config_snapshot()
+
+        state_a = transition_to_sleep(ChatSleepState(chat_key=INST_A), BEDTIME, snap)
+        await store.save(state_a)
+        await store.hydrate(INST_B)
+
+        assert store.get_cached(INST_A).status == SleepStatus.ASLEEP
+        assert store.get_cached(INST_B).status == SleepStatus.AWAKE
+
+    async def test_instance_config_overrides_reach_the_background_loop(self, wired):
+        """The maintenance loop carries no inbound context.
+
+        `ScopedPluginConfig` resolves per-instance config from a contextvar the
+        adapter sets on the way in — a background task has none, so without an
+        explicit lookup both accounts would sleep on the global schedule no
+        matter what the operator configured.
+        """
+        from tests.hoststub import set_instance_config_override
+
+        plugin_mod, _store, _ctx = wired
+        set_instance_config_override(
+            plugin_mod.plugin.key, "inst2", {"SLEEP_TIME": "01:30"}
+        )
+        plugin_mod.invalidate_settings_cache()
+
+        a = await plugin_mod._settings_for(INST_A)
+        b = await plugin_mod._settings_for(INST_B)
+
+        assert a.instance_key == "inst1"
+        assert b.instance_key == "inst2"
+        assert a.schedule.sleep_time == "23:00"
+        assert b.schedule.sleep_time == "01:30"
+        assert b.schedule.sources["sleep_time"] == "instance"
+        # Everything it did not override still comes from the global config.
+        assert b.schedule.wake_time_start == "06:45"
+
+    async def test_the_two_instances_go_to_bed_at_their_own_times(self, wired):
+        from tests.hoststub import set_instance_config_override
+
+        plugin_mod, store, _ctx = wired
+        set_instance_config_override(
+            plugin_mod.plugin.key, "inst2", {"SLEEP_TIME": "01:30"}
+        )
+        plugin_mod.invalidate_settings_cache()
+        await store.hydrate(INST_A)
+        await store.hydrate(INST_B)
+
+        # 23:30 local: past inst1's bedtime, well before inst2's.
+        tick = BEDTIME + timedelta(minutes=30)
+        await plugin_mod._check_sleep_transition(store, INST_A, tick)
+        await plugin_mod._check_sleep_transition(store, INST_B, tick)
+
+        assert store.get_cached(INST_A).status == SleepStatus.ASLEEP
+        assert store.get_cached(INST_B).status == SleepStatus.AWAKE
+
+        # 02:00 local.
+        later = BEDTIME + timedelta(hours=3)
+        await plugin_mod._check_sleep_transition(store, INST_B, later)
+        assert store.get_cached(INST_B).status == SleepStatus.ASLEEP
+
+    async def test_the_cycle_records_the_instance_schedule(self, wired):
+        from tests.hoststub import set_instance_config_override
+
+        plugin_mod, store, _ctx = wired
+        set_instance_config_override(
+            plugin_mod.plugin.key, "inst2", {"SLEEP_TIME": "01:30", "QUALITY_MIN": 35}
+        )
+        plugin_mod.invalidate_settings_cache()
+        await store.hydrate(INST_B)
+
+        await plugin_mod._check_sleep_transition(
+            store, INST_B, BEDTIME + timedelta(hours=3)
+        )
+
+        cycle = store.get_cached(INST_B).cycle
+        assert cycle.config_snapshot.sleep_time == "01:30"
+        # Not just the schedule: the whole snapshot has to be the instance's.
+        assert cycle.config_snapshot.quality_min == 35
+
+
+# ---------------------------------------------------------------------------
+# Two of our own bots in one group
+# ---------------------------------------------------------------------------
+
+
+class TestOwnBotMessages:
+    """Observed live: both instances in a shared group are asleep, one sends
+    【X已经睡了 要叫醒X吗？】, and that text contains the persona name — which is
+    a wake keyword. Unguarded, each bot reads the other's prompt as somebody
+    calling it and they answer each other until the nightly cap runs out."""
+
+    OWN = "1284126956"
+    HUMAN = "430185439"
+
+    def _msg(self, sender: str, text: str):
+        return ChatMessage(content=text, chat_key=CHAT_KEY, platform_userid=sender)
+
+    async def test_a_sibling_bot_prompt_does_not_start_the_protocol(self, wired):
+        from tests.hoststub import set_own_bot_accounts
+
+        plugin_mod, store, ctx = wired
+        set_own_bot_accounts([self.OWN])
+        plugin_mod.invalidate_own_accounts_cache()
+        await _put_asleep(store)
+
+        signal = await plugin_mod.plugin.on_user_message(
+            ctx, self._msg(self.OWN, f"【{PERSONA}已经睡了 要叫醒{PERSONA}吗？】")
+        )
+
+        assert signal == MsgSignal.BLOCK_TRIGGER
+        assert ctx.sent == [], "answering a sibling bot is how the loop starts"
+        state = store.get_cached(CHAT_KEY)
+        assert state.pending_offer is None
+        assert state.offers_sent_tonight == 0
+        assert state.cycle.wake_attempts == []
+
+    async def test_a_sibling_bot_cannot_answer_a_live_question(self, wired):
+        from tests.hoststub import set_own_bot_accounts
+
+        plugin_mod, store, ctx = wired
+        set_own_bot_accounts([self.OWN])
+        plugin_mod.invalidate_own_accounts_cache()
+        await _put_asleep(store)
+
+        await plugin_mod.plugin.on_user_message(ctx, self._msg(self.HUMAN, "醒醒"))
+        ctx.sent.clear()
+
+        signal = await plugin_mod.plugin.on_user_message(ctx, self._msg(self.OWN, "要"))
+
+        assert signal == MsgSignal.BLOCK_TRIGGER
+        assert store.get_cached(CHAT_KEY).status == SleepStatus.ASLEEP
+
+    async def test_a_sibling_bot_does_not_keep_it_awake(self, wired):
+        from tests.hoststub import set_own_bot_accounts
+
+        plugin_mod, store, ctx = wired
+        set_own_bot_accounts([self.OWN])
+        plugin_mod.invalidate_own_accounts_cache()
+        await _put_asleep(store)
+        await plugin_mod.plugin.on_user_message(ctx, self._msg(self.HUMAN, "醒醒"))
+        await plugin_mod.plugin.on_user_message(ctx, self._msg(self.HUMAN, "要"))
+        deadline = store.get_cached(CHAT_KEY).idle_sleep_deadline
+
+        await plugin_mod.plugin.on_user_message(ctx, self._msg(self.OWN, "在群里刷屏"))
+
+        assert store.get_cached(CHAT_KEY).idle_sleep_deadline == deadline
+
+    async def test_humans_are_unaffected(self, wired):
+        from tests.hoststub import set_own_bot_accounts
+
+        plugin_mod, store, ctx = wired
+        set_own_bot_accounts([self.OWN])
+        plugin_mod.invalidate_own_accounts_cache()
+        await _put_asleep(store)
+
+        signal = await plugin_mod.plugin.on_user_message(ctx, self._msg(self.HUMAN, "醒醒"))
+
+        assert signal == MsgSignal.BLOCK_TRIGGER
+        assert len(ctx.sent) == 1
+        assert store.get_cached(CHAT_KEY).offers_sent_tonight == 1
+
+    async def test_daytime_traffic_passes_through_untouched(self, wired):
+        from tests.hoststub import set_own_bot_accounts
+
+        plugin_mod, store, ctx = wired
+        set_own_bot_accounts([self.OWN])
+        plugin_mod.invalidate_own_accounts_cache()
+        await store.save(ChatSleepState(chat_key=CHAT_KEY))
+
+        signal = await plugin_mod.plugin.on_user_message(ctx, self._msg(self.OWN, "白天说话"))
+        assert signal == MsgSignal.CONTINUE
+
+
+class TestSchemaVersionStamp:
+    async def test_a_migrated_row_is_written_back_at_the_current_version(self, wired):
+        """Pydantic keeps the version it validated, so a v1 row that had been
+        migrated kept advertising v1 forever and the newer-schema guard was
+        reading a number that no longer described the row."""
+        from nekro_auto_sleep.models import SCHEMA_VERSION
+
+        plugin_mod, store, _ctx = wired
+        legacy = ChatSleepState(chat_key=CHAT_KEY)
+        legacy = legacy.model_copy(update={"schema_version": 1})
+        assert legacy.schema_version == 1
+
+        await store.save(legacy)
+        store.invalidate_cache(CHAT_KEY)
+        reloaded = await store.load(CHAT_KEY)
+
+        assert reloaded.schema_version == SCHEMA_VERSION
+
+
+# ---------------------------------------------------------------------------
+# Flavour: bedtime heads-up, groggy window, dream line, weekend hours
+# ---------------------------------------------------------------------------
+
+# 2026-08-17 is a Monday, so BEDTIME sits on a weekday night.
+FRIDAY_BEDTIME = datetime(2026, 8, 21, 15, 0, tzinfo=UTC)  # Fri 23:00 +08
+
+
+class TestBedtimeHeadsUp:
+    async def test_off_by_default(self, wired, clock):
+        plugin_mod, store, ctx = wired
+        await store.hydrate(CHAT_KEY)
+        clock.now = BEDTIME - timedelta(minutes=5)
+
+        await plugin_mod._maybe_bedtime_notice(store, CHAT_KEY, clock.now)
+        assert ctx.sent == []
+
+    async def _ready(self, plugin_mod, store, minutes=10, seen_ago_hours=1):
+        m.config.BEDTIME_NOTICE_MINUTES = minutes
+        await store.hydrate(CHAT_KEY)
+
+        async def _seen(state):
+            return state.model_copy(
+                update={"last_seen_at": BEDTIME - timedelta(hours=seen_ago_hours)}
+            )
+
+        await store.with_state(CHAT_KEY, _seen)
+
+    async def test_fires_once_inside_the_window(self, wired, clock):
+        plugin_mod, store, ctx = wired
+        await self._ready(plugin_mod, store)
+        moment = BEDTIME - timedelta(minutes=5)
+
+        await plugin_mod._maybe_bedtime_notice(store, CHAT_KEY, moment)
+        await plugin_mod._maybe_bedtime_notice(store, CHAT_KEY, moment + timedelta(minutes=1))
+
+        assert len(ctx.sent) == 1, ctx.sent
+        assert PERSONA in ctx.sent[0][0]
+        assert store.get_cached(CHAT_KEY).bedtime_notice_date == "2026-08-17"
+
+    async def test_silent_outside_the_window(self, wired):
+        plugin_mod, store, ctx = wired
+        await self._ready(plugin_mod, store, minutes=10)
+
+        await plugin_mod._maybe_bedtime_notice(
+            store, CHAT_KEY, BEDTIME - timedelta(minutes=30)
+        )
+        assert ctx.sent == []
+
+    async def test_skips_a_channel_nobody_has_spoken_in(self, wired):
+        plugin_mod, store, ctx = wired
+        await self._ready(plugin_mod, store, seen_ago_hours=72)
+
+        await plugin_mod._maybe_bedtime_notice(
+            store, CHAT_KEY, BEDTIME - timedelta(minutes=5)
+        )
+        assert ctx.sent == []
+
+    async def test_backfills_last_seen_from_history_on_a_fresh_install(self, wired):
+        """`last_seen_at` only fills in while the plugin runs.
+
+        Without a backfill every channel looks quiet for the first day or two
+        after deploying and the heads-up never fires — which reads as broken.
+        """
+        from tests.hoststub import set_last_message_at
+
+        plugin_mod, store, ctx = wired
+        m.config.BEDTIME_NOTICE_MINUTES = 10
+        await store.hydrate(CHAT_KEY)
+        assert store.get_cached(CHAT_KEY).last_seen_at is None
+        set_last_message_at(CHAT_KEY, int((BEDTIME - timedelta(hours=2)).timestamp()))
+
+        await plugin_mod._maybe_bedtime_notice(
+            store, CHAT_KEY, BEDTIME - timedelta(minutes=5)
+        )
+
+        assert len(ctx.sent) == 1
+        assert store.get_cached(CHAT_KEY).last_seen_at is not None
+
+    async def test_a_channel_with_no_history_at_all_stays_silent(self, wired):
+        from tests.hoststub import set_last_message_at
+
+        plugin_mod, store, ctx = wired
+        m.config.BEDTIME_NOTICE_MINUTES = 10
+        await store.hydrate(CHAT_KEY)
+        set_last_message_at(CHAT_KEY, None)
+
+        await plugin_mod._maybe_bedtime_notice(
+            store, CHAT_KEY, BEDTIME - timedelta(minutes=5)
+        )
+        assert ctx.sent == []
+
+    async def test_skips_a_night_the_operator_cancelled(self, wired):
+        plugin_mod, store, ctx = wired
+        await self._ready(plugin_mod, store)
+
+        async def _skip(state):
+            return state.model_copy(update={"skip_sleep_date": "2026-08-17"})
+
+        await store.with_state(CHAT_KEY, _skip)
+
+        await plugin_mod._maybe_bedtime_notice(
+            store, CHAT_KEY, BEDTIME - timedelta(minutes=5)
+        )
+        assert ctx.sent == []
+
+
+class TestGrogginess:
+    async def _just_woke(self, plugin_mod, store):
+        state = await _put_asleep(store)
+        await plugin_mod._settle_wake(store, CHAT_KEY, state.cycle.planned_wake_at)
+        return store.get_cached(CHAT_KEY)
+
+    async def test_the_prompt_says_it_just_got_up(self, wired):
+        plugin_mod, store, _ctx = wired
+        state = await self._just_woke(plugin_mod, store)
+
+        text = plugin_mod._render_sleep_context(
+            state, state.cycle.settled_at + timedelta(minutes=5), groggy_seconds=1800
+        )
+        assert "刚起床" in text
+        assert "迷糊" in text
+
+    async def test_it_wears_off(self, wired):
+        plugin_mod, store, _ctx = wired
+        state = await self._just_woke(plugin_mod, store)
+
+        text = plugin_mod._render_sleep_context(
+            state, state.cycle.settled_at + timedelta(hours=2), groggy_seconds=1800
+        )
+        assert text == ""
+
+    async def test_zero_disables_it(self, wired):
+        plugin_mod, store, _ctx = wired
+        state = await self._just_woke(plugin_mod, store)
+
+        text = plugin_mod._render_sleep_context(
+            state, state.cycle.settled_at + timedelta(minutes=1), groggy_seconds=0
+        )
+        assert text == ""
+
+    async def test_the_hook_passes_the_configured_window(self, wired, clock):
+        plugin_mod, store, ctx = wired
+        m.config.GROGGY_MINUTES = 30
+        state = await self._just_woke(plugin_mod, store)
+        clock.now = state.cycle.settled_at + timedelta(minutes=3)
+
+        text = await plugin_mod.plugin.prompt_injects["sleep_status"](ctx)
+        assert "刚起床" in text
+
+
+class TestDreamLine:
+    async def test_off_by_default(self, wired):
+        plugin_mod, store, ctx = wired
+        state = await _put_asleep(store)
+
+        await plugin_mod._settle_wake(store, CHAT_KEY, state.cycle.planned_wake_at)
+
+        assert any("已起床" in text for text, _ in ctx.sent)
+        assert ctx.system_pushes == []
+
+    async def test_asks_for_a_dream_when_enabled(self, wired):
+        plugin_mod, store, ctx = wired
+        m.config.DREAM_LINE = True
+        state = await _put_asleep(store)
+
+        await plugin_mod._settle_wake(store, CHAT_KEY, state.cycle.planned_wake_at)
+
+        assert len(ctx.system_pushes) == 1
+        prompt, trigger = ctx.system_pushes[0]
+        assert "梦" in prompt
+        assert trigger is True
+
+    async def test_no_dream_when_the_wake_up_was_not_announced(self, wired):
+        plugin_mod, store, ctx = wired
+        m.config.DREAM_LINE = True
+        m.config.WAKE_NOTICE_POLICY = "never"
+        state = await _put_asleep(store)
+
+        await plugin_mod._settle_wake(store, CHAT_KEY, state.cycle.planned_wake_at)
+
+        assert ctx.sent == []
+        assert ctx.system_pushes == []
+
+
+class TestWeekendHours:
+    async def _weekend(self, plugin_mod, store):
+        m.config.WEEKEND_DAYS = "4,5"
+        m.config.WEEKEND_SLEEP_TIME = "01:00"
+        plugin_mod.invalidate_settings_cache()
+        await store.hydrate(CHAT_KEY)
+
+    async def test_a_weekday_night_is_untouched(self, wired):
+        plugin_mod, store, _ctx = wired
+        await self._weekend(plugin_mod, store)
+
+        # Monday 23:30 local.
+        await plugin_mod._check_sleep_transition(
+            store, CHAT_KEY, BEDTIME + timedelta(minutes=30)
+        )
+        assert store.get_cached(CHAT_KEY).status == SleepStatus.ASLEEP
+
+    async def test_friday_night_stays_up_past_the_weekday_bedtime(self, wired):
+        plugin_mod, store, _ctx = wired
+        await self._weekend(plugin_mod, store)
+
+        # Friday 23:30 local: past 23:00, before the weekend 01:00.
+        await plugin_mod._check_sleep_transition(
+            store, CHAT_KEY, FRIDAY_BEDTIME + timedelta(minutes=30)
+        )
+        assert store.get_cached(CHAT_KEY).status == SleepStatus.AWAKE
+
+    async def test_friday_night_turns_in_at_the_weekend_hour(self, wired):
+        plugin_mod, store, _ctx = wired
+        await self._weekend(plugin_mod, store)
+
+        # Saturday 01:30 local.
+        await plugin_mod._check_sleep_transition(
+            store, CHAT_KEY, FRIDAY_BEDTIME + timedelta(hours=2, minutes=30)
+        )
+        state = store.get_cached(CHAT_KEY)
+        assert state.status == SleepStatus.ASLEEP
+        assert state.cycle.config_snapshot.sleep_time == "01:00"
+
+    async def test_the_weekend_swap_needs_an_actual_override(self, wired):
+        plugin_mod, store, _ctx = wired
+        m.config.WEEKEND_DAYS = "4,5"
+        m.config.WEEKEND_SLEEP_TIME = ""
+        plugin_mod.invalidate_settings_cache()
+        await store.hydrate(CHAT_KEY)
+
+        await plugin_mod._check_sleep_transition(
+            store, CHAT_KEY, FRIDAY_BEDTIME + timedelta(minutes=30)
+        )
+        assert store.get_cached(CHAT_KEY).status == SleepStatus.ASLEEP
+
+
+class TestWeekdayParsing:
+    def test_parses_and_clamps(self):
+        from nekro_auto_sleep.schedule import parse_weekday_list
+
+        assert parse_weekday_list("4,5") == {4, 5}
+        assert parse_weekday_list("") == set()
+        assert parse_weekday_list("0, 6 ,9,abc") == {0, 6}
+
+    def test_keyed_on_the_evening(self):
+        from datetime import date
+
+        from nekro_auto_sleep.schedule import is_weekend_night
+
+        assert is_weekend_night(date(2026, 8, 21), {4, 5}) is True  # Friday
+        assert is_weekend_night(date(2026, 8, 22), {4, 5}) is True  # Saturday
+        assert is_weekend_night(date(2026, 8, 23), {4, 5}) is False  # Sunday night
+        assert is_weekend_night(date(2026, 8, 17), {4, 5}) is False  # Monday
+
+
+class TestSpacedCommandForm:
+    """`/sleep status` is what people type; the host only resolves `/sleep.status`.
+
+    `detect_command` splits the line at the first space, so a group registered
+    as `sleep.status` leaves the bare name `sleep` unregistered — and an
+    unresolved command answers with silence, which reads as "the update did not
+    install". Reported from the live instance.
+    """
+
+    async def test_the_spaced_form_reaches_the_same_handler(self, wired):
+        plugin_mod, _store, _ctx = wired
+        commands = plugin_mod.plugin.commands
+
+        spaced = await commands["sleep"](_cmd_context(), "status")
+        dotted = await commands["sleep.status"](_cmd_context())
+
+        assert spaced.status == "success"
+        assert spaced.message == dotted.message
+
+    async def test_it_defaults_to_status(self, wired):
+        plugin_mod, _store, _ctx = wired
+        response = await plugin_mod.plugin.commands["sleep"](_cmd_context())
+        assert response.status == "success"
+        assert PERSONA in response.message
+
+    async def test_arguments_are_forwarded(self, wired):
+        plugin_mod, _store, _ctx = wired
+        commands = plugin_mod.plugin.commands
+
+        ok = await commands["sleep"](_cmd_context(), "set", "tz", "Asia/Tokyo")
+        assert ok.status == "success"
+        assert (await plugin_mod._resolve_schedule_for(CHAT_KEY)).timezone == "Asia/Tokyo"
+
+    async def test_an_unknown_subcommand_says_so(self, wired):
+        plugin_mod, _store, _ctx = wired
+        response = await plugin_mod.plugin.commands["sleep"](_cmd_context(), "nope")
+        assert response.status == "error"
+        assert "status" in response.message
+
+    async def test_mutating_subcommands_need_a_super_user(self, wired):
+        from tests.hoststub import CommandExecutionContext
+
+        plugin_mod, store, _ctx = wired
+        await store.hydrate(CHAT_KEY)
+        plain = CommandExecutionContext(chat_key=CHAT_KEY, is_super_user=False)
+
+        refused = await plugin_mod.plugin.commands["sleep"](plain, "now")
+        assert refused.status == "error"
+        assert store.get_cached(CHAT_KEY).status == SleepStatus.AWAKE
+
+        # Reading is still allowed.
+        assert (await plugin_mod.plugin.commands["sleep"](plain, "status")).status == "success"
+
+    async def test_too_many_arguments_answer_instead_of_crashing(self, wired):
+        """The sub-handler raises TypeError; the user should see a message."""
+        plugin_mod, _store, _ctx = wired
+        response = await plugin_mod.plugin.commands["sleep"](
+            _cmd_context(), "unset", "channel", "extra"
+        )
+        assert response.status == "error"
+        assert "参数" in response.message
+
+
+class TestIdleSleepBack:
+    """Woken at 23:01, still up at 02:17 with the deadline nine minutes out.
+
+    The idle timer refreshed on every message in the channel, so a group that
+    keeps chatting among itself all night pushed the deadline forward forever
+    and the bot never went back to bed. Reported from the live instance.
+    """
+
+    WAKER = "u1"
+    BYSTANDER = "u2"
+
+    def _msg(self, sender: str, text: str, is_tome: bool = False):
+        return ChatMessage(
+            content=text, chat_key=CHAT_KEY, platform_userid=sender, is_tome=is_tome
+        )
+
+    async def _woken(self, plugin_mod, store, ctx):
+        await _put_asleep(store)
+        await plugin_mod.plugin.on_user_message(ctx, self._msg(self.WAKER, "醒醒"))
+        await plugin_mod.plugin.on_user_message(ctx, self._msg(self.WAKER, "要"))
+        return store.get_cached(CHAT_KEY).idle_sleep_deadline
+
+    async def test_bystander_chatter_does_not_keep_it_up(self, wired, clock):
+        plugin_mod, store, ctx = wired
+        deadline = await self._woken(plugin_mod, store, ctx)
+
+        clock.advance(minutes=5)
+        for _ in range(5):
+            await plugin_mod.plugin.on_user_message(
+                ctx, self._msg(self.BYSTANDER, "他们在聊别的")
+            )
+
+        assert store.get_cached(CHAT_KEY).idle_sleep_deadline == deadline
+
+    async def test_the_waker_carrying_on_does_keep_it_up(self, wired, clock):
+        plugin_mod, store, ctx = wired
+        deadline = await self._woken(plugin_mod, store, ctx)
+
+        clock.advance(minutes=5)
+        await plugin_mod.plugin.on_user_message(
+            ctx, self._msg(self.WAKER, "帮我看个东西")
+        )
+
+        assert store.get_cached(CHAT_KEY).idle_sleep_deadline > deadline
+
+    async def test_someone_else_addressing_it_also_counts(self, wired, clock):
+        plugin_mod, store, ctx = wired
+        deadline = await self._woken(plugin_mod, store, ctx)
+
+        clock.advance(minutes=5)
+        await plugin_mod.plugin.on_user_message(
+            ctx, self._msg(self.BYSTANDER, "在吗", is_tome=True)
+        )
+
+        assert store.get_cached(CHAT_KEY).idle_sleep_deadline > deadline
+
+    async def test_it_goes_back_to_sleep_once_the_deadline_passes(self, wired, clock):
+        plugin_mod, store, ctx = wired
+        await self._woken(plugin_mod, store, ctx)
+
+        # A noisy room, but nobody is talking to the bot.
+        for minute in range(1, 13):
+            clock.advance(minutes=1)
+            await plugin_mod.plugin.on_user_message(
+                ctx, self._msg(self.BYSTANDER, f"闲聊 {minute}")
+            )
+            await plugin_mod._maintain_chat(store, CHAT_KEY, clock.now)
+
+        assert store.get_cached(CHAT_KEY).status == SleepStatus.ASLEEP
+
+
+class TestResumeSleepInstruction:
+    async def test_the_prompt_tells_it_that_saying_so_is_not_enough(self, wired):
+        """The model kept replying "好的我去睡了" without calling the tool."""
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="醒醒", chat_key=CHAT_KEY)
+        )
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="要", chat_key=CHAT_KEY)
+        )
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="继续聊", chat_key=CHAT_KEY)
+        )
+
+        text = await plugin_mod.plugin.prompt_injects["sleep_status"](ctx)
+
+        assert "resume_sleep" in text
+        assert "让你去睡" in text
+        assert "并不会真的睡下" in text
+
+
+class TestPluginMetadata:
+    async def test_the_url_points_at_this_repository(self):
+        assert "nekro-auto-sleep" in m.plugin.init_kwargs["url"]
+
+
+class TestPromptDormancy:
+    async def test_the_plugin_never_goes_dormant_in_the_prompt(self):
+        """A dormant plugin shows a brief and no methods.
+
+        `resume_sleep` matters exactly when somebody tells the bot to go back to
+        sleep; hiding it behind `extend_plugin_activation` meant the model
+        agreed to sleep and then could not. Token cost is already handled by
+        `mount_collect_methods`, which withholds the method except while the bot
+        is awake before its alarm.
+        """
+        assert m.plugin.init_kwargs["allow_sleep"] is False
+
+
+class TestToolNameReachesTheModel:
+    """The prompt has to name the callable exactly as the sandbox exposes it.
+
+    The host renders `* {func.__name__}` and the sandbox binds that same name,
+    while the injection said "call resume_sleep" — and the function was called
+    `resume_sleep_tool`. The model agreed to go to sleep and then called a name
+    that did not exist. Reported from the live instance.
+    """
+
+    async def test_the_injection_names_the_real_callable(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="醒醒", chat_key=CHAT_KEY)
+        )
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="要", chat_key=CHAT_KEY)
+        )
+
+        deciding = await plugin_mod.plugin.prompt_injects["sleep_status"](ctx)
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="继续聊", chat_key=CHAT_KEY)
+        )
+        awake = await plugin_mod.plugin.prompt_injects["sleep_status"](ctx)
+
+        # Substring matching would let `resume_sleep_tool` pass, which is
+        # exactly the name that did not exist in the sandbox. Every mention has
+        # to be the real callable and nothing else.
+        import re
+
+        name = plugin_mod.resume_sleep.__name__
+        for text in (deciding, awake):
+            mentions = set(re.findall(r"resume_sleep\w*", text))
+            assert mentions == {name}, mentions
+            assert f"{name}()" in text
+
+    async def test_the_collected_method_is_that_same_callable(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="醒醒", chat_key=CHAT_KEY)
+        )
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="要", chat_key=CHAT_KEY)
+        )
+
+        methods = await plugin_mod.plugin.collect_methods(ctx)
+        assert [f.__name__ for f in methods] == [plugin_mod.resume_sleep.__name__]
+
+    async def test_the_tool_carries_its_own_documentation(self, wired):
+        """Without a docstring the host falls back to registration metadata and
+        warns, leaving the model a signature line instead of a spec."""
+        doc = (m.resume_sleep.__doc__ or "").strip()
+        assert doc
+        assert "唯一" in doc, "the docstring must say that saying it is not doing it"
+
+
+class TestSleepNoticeOrdering:
+    """【persona已睡下】 must land *under* the goodnight, not above it.
+
+    `resume_sleep` is a tool call made in the middle of an agent round, but the
+    model's own reply is only sent once that round finishes. Sending the bracket
+    line straight from the tool put it first — seen in the live chat as
+    【千咲已睡下】 followed by "我先接着去睡啦".
+    """
+
+    async def _awake_and_chatting(self, plugin_mod, store, ctx):
+        await _put_asleep(store)
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="醒醒", chat_key=CHAT_KEY)
+        )
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="要", chat_key=CHAT_KEY)
+        )
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="帮我查个东西", chat_key=CHAT_KEY)
+        )
+        ctx.sent.clear()
+
+    async def test_it_waits_for_the_round_to_finish(self, wired):
+        import asyncio
+
+        from nekro_agent.services.message_service import message_service as ms
+
+        plugin_mod, store, ctx = wired
+        await self._awake_and_chatting(plugin_mod, store, ctx)
+
+        finished = asyncio.Event()
+        round_task = asyncio.create_task(finished.wait())
+        ms.running_tasks[CHAT_KEY] = round_task
+        try:
+            await plugin_mod.resume_sleep(ctx)
+
+            # The round is still going: nothing may have been said yet.
+            await asyncio.sleep(0)
+            assert ctx.sent == [], "the notice jumped ahead of the reply"
+
+            # The model finishes and its reply goes out.
+            finished.set()
+            await round_task
+            ctx.sent.append(("我先接着去睡啦", True))
+
+            await _drain_deferred(plugin_mod)
+        finally:
+            ms.running_tasks.pop(CHAT_KEY, None)
+
+        assert [text for text, _ in ctx.sent] == ["我先接着去睡啦", f"【{PERSONA}已睡下】"]
+
+    async def test_the_declined_path_still_says_nothing_at_all(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="醒醒", chat_key=CHAT_KEY)
+        )
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="算了你睡吧", chat_key=CHAT_KEY)
+        )
+        ctx.sent.clear()
+
+        await plugin_mod.resume_sleep(ctx)
+        await _drain_deferred(plugin_mod)
+
+        assert ctx.sent == []
+
+    async def test_cleanup_cancels_anything_still_pending(self, wired):
+        import asyncio
+
+        from nekro_agent.services.message_service import message_service as ms
+
+        plugin_mod, store, ctx = wired
+        await self._awake_and_chatting(plugin_mod, store, ctx)
+
+        never = asyncio.Event()
+        round_task = asyncio.create_task(never.wait())
+        ms.running_tasks[CHAT_KEY] = round_task
+        try:
+            await plugin_mod.resume_sleep(ctx)
+            assert plugin_mod._deferred_sends
+
+            for task in list(plugin_mod._deferred_sends):
+                task.cancel()
+            plugin_mod._deferred_sends.clear()
+        finally:
+            round_task.cancel()
+            ms.running_tasks.pop(CHAT_KEY, None)
+
+        assert ctx.sent == []
