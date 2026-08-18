@@ -275,8 +275,8 @@ class SleepConfig(ConfigBase):
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="叫醒确认窗口（秒）", en_US="Wake Confirm Window (s)"),
             i18n_description=i18n.i18n_text(
-                zh_CN="首次呼叫后，同一用户需在此秒数内再次呼叫才能叫醒，10-1800",
-                en_US="After the first call, the same user must call again within this many seconds to wake up, 10-1800",
+                zh_CN="发出「要叫醒吗」之后，多久之内的回答还算数。超时则问题作废，下次呼叫重新问，10-1800",
+                en_US="How long the wake-up question stays open for an answer; after that it lapses, 10-1800",
             ),
         ).model_dump(),
     )
