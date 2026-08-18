@@ -11,7 +11,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 PLUGIN_KEY = "Akiyo_dayo.nekro_auto_sleep"
 DATA_KEY = "state.v1"
 
@@ -95,7 +95,6 @@ class ConfigSnapshot(BaseModel):
     wake_time_start: str
     wake_time_end: str
     wake_random_step_minutes: int
-    near_wake_ratio: float
     wake_confirm_window_seconds: int
     history_mode: Literal["preserve", "strict"]
     call_keywords: list[str]
@@ -104,6 +103,23 @@ class ConfigSnapshot(BaseModel):
     quality_min: int
     quality_max: int
     quality_jitter_points: float
+
+    # Schema v2 additions. All defaulted so a v1 payload still validates and
+    # migrates in place instead of resetting the night.
+    near_wake_minutes: int = 60
+    sleep_target_hours: float = 8.0
+    affirmative_keywords: list[str] = Field(default_factory=list)
+    negative_keywords: list[str] = Field(default_factory=list)
+    urgent_keywords: list[str] = Field(default_factory=list)
+    answer_scope: Literal["offeree", "anyone"] = "offeree"
+    unclear_answer: Literal["ignore", "wake"] = "ignore"
+    max_offers_per_night: int = 3
+    offer_cooldown_minutes: int = 20
+    snooze_minutes: int = 30
+
+    # Deprecated in v2, kept so v1 payloads keep validating; the near-wake test
+    # now uses `near_wake_minutes`.
+    near_wake_ratio: float = 0.15
 
 
 class SleepCycle(BaseModel):
@@ -116,12 +132,20 @@ class SleepCycle(BaseModel):
     planned_wake_at: datetime
     config_snapshot: ConfigSnapshot
     quality_seed: str
+    # Midpoint of the configured wake range, in seconds after bedtime. Used as
+    # the 100% reference when SLEEP_TARGET_HOURS is left on auto, so a night
+    # that runs long scores above 100 and a short one below, instead of every
+    # undisturbed night landing on the same number.
+    target_sleep_seconds: float = 0.0
     sleep_segments: list[SleepSegment] = Field(default_factory=list)
     wake_attempts: list[WakeAttempt] = Field(default_factory=list)
     timer_intervals: list[TimerInterval] = Field(default_factory=list)
     notification_status: NotificationStatus = NotificationStatus.PENDING
     settled_at: datetime | None = None
     ended_while_early_awake: bool = False
+    # Every term that produced the reported percentage. Persisted so a score
+    # that looks wrong can be explained instead of reverse-engineered.
+    quality_breakdown: dict[str, float] | None = None
 
     @field_validator("sleep_at", "planned_wake_at", "settled_at", mode="before")
     @classmethod
@@ -132,7 +156,11 @@ class SleepCycle(BaseModel):
 
 
 class PendingWakeOffer(BaseModel):
-    """A pending first-call wake offer for a specific user in a chat."""
+    """The wake-up question currently awaiting an answer in a chat.
+
+    One per chat, not one per user: the bot asked out loud, and whoever is
+    allowed to answer (see `answer_scope`) answers the same question.
+    """
 
     user_id: str
     offered_at: datetime
@@ -153,7 +181,12 @@ class ChatSleepState(BaseModel):
     chat_key: str
     status: SleepStatus = SleepStatus.AWAKE
     last_seen_at: datetime | None = None
-    pending_wake_offers: dict[str, PendingWakeOffer] = Field(default_factory=dict)
+    pending_offer: PendingWakeOffer | None = None
+    # Anti-spam: without these a chat that says the wake word every few minutes
+    # got a fixed reply every time, and every one of them cost sleep quality.
+    offers_sent_tonight: int = 0
+    last_offer_at: datetime | None = None
+    snooze_until: datetime | None = None
     idle_sleep_deadline: datetime | None = None
     cycle: SleepCycle | None = None
     # Wake provenance, used to render the sleep-status prompt injection for the
@@ -162,8 +195,16 @@ class ChatSleepState(BaseModel):
     # stays at 1 and a rollback keeps reading state instead of resetting it.
     woken_at: datetime | None = None
     woken_by: str | None = None
+    woken_reason: str | None = None
 
-    @field_validator("last_seen_at", "idle_sleep_deadline", "woken_at", mode="before")
+    @field_validator(
+        "last_seen_at",
+        "idle_sleep_deadline",
+        "woken_at",
+        "last_offer_at",
+        "snooze_until",
+        mode="before",
+    )
     @classmethod
     def _parse_utc(cls, v: object) -> object:
         if isinstance(v, str) and v.endswith("Z"):

@@ -119,18 +119,38 @@ class TestIsInSleepWindow:
 
 
 class TestIsNearWake:
-    def test_near_end(self):
-        sleep_at = datetime(2026, 8, 13, 15, 0, tzinfo=UTC)
-        wake_at = datetime(2026, 8, 14, 0, 30, tzinfo=UTC)
-        # Last 15% of ~9.5 hours = ~85 min before wake
-        near_time = wake_at - timedelta(minutes=30)
-        assert is_near_wake(near_time, sleep_at, wake_at, 0.15) is True
+    """An absolute window now, not a fraction of the night.
 
-    def test_not_near(self):
-        sleep_at = datetime(2026, 8, 13, 15, 0, tzinfo=UTC)
-        wake_at = datetime(2026, 8, 14, 0, 30, tzinfo=UTC)
-        early = sleep_at + timedelta(hours=1)
-        assert is_near_wake(early, sleep_at, wake_at, 0.15) is False
+    With a fraction the wording drifted every night along with the random wake
+    point, and lengthening the configured night silently widened it.
+    """
+
+    SLEEP_AT = datetime(2026, 8, 13, 15, 0, tzinfo=UTC)
+    WAKE_AT = datetime(2026, 8, 14, 0, 30, tzinfo=UTC)
+
+    def test_inside_the_window(self):
+        near = self.WAKE_AT - timedelta(minutes=30)
+        assert is_near_wake(near, self.SLEEP_AT, self.WAKE_AT, 60) is True
+
+    def test_outside_the_window(self):
+        early = self.SLEEP_AT + timedelta(hours=1)
+        assert is_near_wake(early, self.SLEEP_AT, self.WAKE_AT, 60) is False
+
+    def test_boundary_is_inclusive(self):
+        edge = self.WAKE_AT - timedelta(minutes=60)
+        assert is_near_wake(edge, self.SLEEP_AT, self.WAKE_AT, 60) is True
+
+    def test_window_does_not_widen_with_a_longer_night(self):
+        long_wake = self.SLEEP_AT + timedelta(hours=14)
+        moment = long_wake - timedelta(minutes=90)
+        assert is_near_wake(moment, self.SLEEP_AT, long_wake, 60) is False
+
+    def test_zero_window_only_matches_the_wake_moment(self):
+        assert is_near_wake(self.WAKE_AT, self.SLEEP_AT, self.WAKE_AT, 0) is True
+        assert (
+            is_near_wake(self.WAKE_AT - timedelta(minutes=1), self.SLEEP_AT, self.WAKE_AT, 0)
+            is False
+        )
 
 
 class TestFindSleepDate:

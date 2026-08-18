@@ -37,7 +37,7 @@ from .engine import (
     ActionSendWakeNotice,
     handle_idle_sleep_back,
     handle_resume_sleep,
-    handle_valid_call_while_asleep,
+    handle_message_while_asleep,
     has_active_timer_lease,
     is_idle_expired,
     mark_notice_failed,
@@ -57,7 +57,7 @@ from .models import (
     SourceType,
 )
 from .persistence import SleepStateStore
-from .quality import compute_quality
+from .quality import compute_quality, compute_quality_detail
 from .runtime import (
     chat_key_locks,
     current_source,
@@ -176,14 +176,14 @@ class SleepConfig(ConfigBase):
             ),
         ).model_dump(),
     )
-    NEAR_WAKE_RATIO: float = Field(
-        default=0.15,
-        title="接近起床判定比例",
+    NEAR_WAKE_MINUTES: int = Field(
+        default=60,
+        title="接近起床提前量（分钟）",
         json_schema_extra=ExtraField(
-            i18n_title=i18n.i18n_text(zh_CN="接近起床判定比例", en_US="Near Wake Ratio"),
+            i18n_title=i18n.i18n_text(zh_CN="接近起床提前量（分钟）", en_US="Near Wake Window (min)"),
             i18n_description=i18n.i18n_text(
-                zh_CN="睡眠区间末尾的比例，在此范围内提示语改为「还没起床」，0-0.5",
-                en_US="Ratio of sleep window end; within this range the prompt changes to 'not yet awake', 0-0.5",
+                zh_CN="距离计划起床还有这么多分钟时，提示语改为「还没起床」，0-720",
+                en_US="Within this many minutes of the planned wake-up the prompt changes to 'not up yet', 0-720",
             ),
         ).model_dump(),
     )
@@ -195,6 +195,99 @@ class SleepConfig(ConfigBase):
             i18n_description=i18n.i18n_text(
                 zh_CN="首次呼叫后，同一用户需在此秒数内再次呼叫才能叫醒，10-1800",
                 en_US="After the first call, the same user must call again within this many seconds to wake up, 10-1800",
+            ),
+        ).model_dump(),
+    )
+    AFFIRMATIVE_KEYWORDS: str = Field(
+        default="要,嗯,好,是,对,叫醒,醒醒,起床,快,醒来,yes,ok,wake",
+        title="肯定回答关键词",
+        json_schema_extra=ExtraField(
+            is_textarea=True,
+            i18n_title=i18n.i18n_text(zh_CN="肯定回答关键词", en_US="Affirmative Keywords"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="回答这些词表示同意叫醒，逗号或换行分隔",
+                en_US="Answering with any of these means yes, wake up; comma or newline separated",
+            ),
+        ).model_dump(),
+    )
+    NEGATIVE_KEYWORDS: str = Field(
+        default="不用,不要,算了,没事,别吵,别叫,睡吧,晚安,继续睡,no",
+        title="否定回答关键词",
+        json_schema_extra=ExtraField(
+            is_textarea=True,
+            i18n_title=i18n.i18n_text(zh_CN="否定回答关键词", en_US="Negative Keywords"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="回答这些词表示不用叫醒，之后进入静默期。与肯定词冲突时以否定为准",
+                en_US="Answering with any of these means do not wake up, then a snooze starts. Negatives win ties",
+            ),
+        ).model_dump(),
+    )
+    URGENT_KEYWORDS: str = Field(
+        default="紧急,急事,救命,出事了",
+        title="紧急唤醒关键词",
+        json_schema_extra=ExtraField(
+            is_textarea=True,
+            i18n_title=i18n.i18n_text(zh_CN="紧急唤醒关键词", en_US="Urgent Keywords"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="包含这些词时一步直接叫醒，跳过两段式确认；留空则关闭该通道",
+                en_US="Messages containing these wake the bot immediately, skipping the two-step handshake; empty disables it",
+            ),
+        ).model_dump(),
+    )
+    ANSWER_SCOPE: str = Field(
+        default="offeree",
+        title="谁的回答算数",
+        json_schema_extra=ExtraField(
+            placeholder="offeree",
+            i18n_title=i18n.i18n_text(zh_CN="谁的回答算数", en_US="Answer Scope"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="offeree: 只有被问的那个人的回答算数；anyone: 群里任何人都能回答",
+                en_US="offeree: only the person who was asked can answer; anyone: anybody in the chat can",
+            ),
+        ).model_dump(),
+    )
+    UNCLEAR_ANSWER: str = Field(
+        default="ignore",
+        title="答非所问时的处理",
+        json_schema_extra=ExtraField(
+            placeholder="ignore",
+            i18n_title=i18n.i18n_text(zh_CN="答非所问时的处理", en_US="Unclear Answer Handling"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="ignore: 既不叫醒也不重复提示，问题继续等；wake: 当作同意叫醒（旧版行为）",
+                en_US="ignore: stay asleep and keep the question open; wake: treat it as consent (old behaviour)",
+            ),
+        ).model_dump(),
+    )
+    MAX_OFFERS_PER_NIGHT: int = Field(
+        default=3,
+        title="每夜最多提示次数",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(zh_CN="每夜最多提示次数", en_US="Max Offers Per Night"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="同一晚最多发送几次「要叫醒吗」，超出后静默，1-20",
+                en_US="How many wake-up questions the bot may ask in one night before staying silent, 1-20",
+            ),
+        ).model_dump(),
+    )
+    OFFER_COOLDOWN_MINUTES: int = Field(
+        default=20,
+        title="提示冷却（分钟）",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(zh_CN="提示冷却（分钟）", en_US="Offer Cooldown (min)"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="两次「要叫醒吗」之间的最短间隔，0-240",
+                en_US="Minimum gap between two wake-up questions, 0-240",
+            ),
+        ).model_dump(),
+    )
+    SNOOZE_MINUTES: int = Field(
+        default=30,
+        title="拒绝后静默时长（分钟）",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(zh_CN="拒绝后静默时长（分钟）", en_US="Snooze After Refusal (min)"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="有人明确说不用叫醒后，这段时间内不再提示，0-480",
+                en_US="After somebody declines, stay silent for this long, 0-480",
             ),
         ).model_dump(),
     )
@@ -301,8 +394,19 @@ class SleepConfig(ConfigBase):
             ),
         ).model_dump(),
     )
+    SLEEP_TARGET_HOURS: float = Field(
+        default=0.0,
+        title="目标睡眠时长（小时）",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(zh_CN="目标睡眠时长（小时）", en_US="Sleep Target (hours)"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="质量百分比以此为 100% 的基准，睡得比它久就会超过 100%；填 0 表示自动取起床窗口中点，0-16",
+                en_US="Duration that counts as 100%; sleeping longer scores above 100%. 0 means auto (midpoint of the wake range), 0-16",
+            ),
+        ).model_dump(),
+    )
     QUALITY_MIN: int = Field(
-        default=60,
+        default=20,
         title="睡眠质量下限",
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="睡眠质量下限", en_US="Quality Min"),
@@ -324,7 +428,7 @@ class SleepConfig(ConfigBase):
         ).model_dump(),
     )
     QUALITY_JITTER_POINTS: float = Field(
-        default=4.0,
+        default=2.0,
         title="质量稳定扰动幅度",
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="质量稳定扰动幅度", en_US="Quality Jitter Points"),
@@ -399,13 +503,26 @@ def _parse_keywords() -> list[str]:
     return [k.strip() for k in raw.replace("\n", ",").split(",") if k.strip()]
 
 
+def _message_text(message: ChatMessage) -> str:
+    for attr in ("content", "content_text"):
+        value = getattr(message, attr, None)
+        if isinstance(value, str):
+            return value
+    return str(message)
+
+
 def _is_valid_call(message: ChatMessage, persona_name: str) -> bool:
-    """Check if a message constitutes a valid wake-up call (spec §6.1)."""
+    """Whether a message counts as calling for the bot (spec §6.1).
+
+    Only decides whether the bot should *offer* to wake up. Once a question is
+    outstanding, the reply is read by `classify_answer` instead, which is what
+    lets a bare "要" work and a bare "算了" stop meaning yes.
+    """
     if hasattr(message, "channel_type") and message.channel_type == "private":
         return True
     if hasattr(message, "is_tome") and message.is_tome:
         return True
-    text = message.content if hasattr(message, "content") else str(message)
+    text = _message_text(message)
     if persona_name and persona_name in text:
         return True
     keywords = _parse_keywords()
@@ -462,7 +579,7 @@ def _make_config_snapshot() -> Any:
         wake_time_start=config.WAKE_TIME_START,
         wake_time_end=config.WAKE_TIME_END,
         wake_random_step_minutes=config.WAKE_RANDOM_STEP_MINUTES,
-        near_wake_ratio=config.NEAR_WAKE_RATIO,
+        near_wake_ratio=0.15,  # deprecated in schema v2, kept for rollback
         wake_confirm_window_seconds=config.WAKE_CONFIRM_WINDOW_SECONDS,
         history_mode=config.HISTORY_MODE,
         call_keywords=config.CALL_KEYWORDS,
@@ -471,6 +588,16 @@ def _make_config_snapshot() -> Any:
         quality_min=config.QUALITY_MIN,
         quality_max=config.QUALITY_MAX,
         quality_jitter_points=config.QUALITY_JITTER_POINTS,
+        near_wake_minutes=config.NEAR_WAKE_MINUTES,
+        sleep_target_hours=config.SLEEP_TARGET_HOURS,
+        affirmative_keywords=config.AFFIRMATIVE_KEYWORDS,
+        negative_keywords=config.NEGATIVE_KEYWORDS,
+        urgent_keywords=config.URGENT_KEYWORDS,
+        answer_scope=config.ANSWER_SCOPE,
+        unclear_answer=config.UNCLEAR_ANSWER,
+        max_offers_per_night=config.MAX_OFFERS_PER_NIGHT,
+        offer_cooldown_minutes=config.OFFER_COOLDOWN_MINUTES,
+        snooze_minutes=config.SNOOZE_MINUTES,
     )
 
 
@@ -504,20 +631,13 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage) -> MsgSignal | No
             return state
 
         if state.status == SleepStatus.ASLEEP:
-            if not _is_valid_call(message, persona_name):
-                # BLOCK_TRIGGER, not BLOCK_ALL: the host returns on BLOCK_ALL
-                # *before* writing the message to DBChatMessage, so blocking
-                # everything meant the bot woke up with no memory of the night
-                # at all. Only `strict` history mode still drops the record.
-                _result_signal = (
-                    MsgSignal.BLOCK_ALL
-                    if config.HISTORY_MODE == "strict"
-                    else MsgSignal.BLOCK_TRIGGER
-                )
-                return state
-
-            state, action = handle_valid_call_while_asleep(
-                state, now_utc, user_id, persona_name
+            state, action = handle_message_while_asleep(
+                state,
+                now_utc,
+                user_id,
+                _message_text(message),
+                persona_name,
+                _is_valid_call(message, persona_name),
             )
             _result_action = action
 
@@ -526,13 +646,16 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage) -> MsgSignal | No
                 # the state, so every round of this early-awake stretch can
                 # rebuild the wake context instead of only the first one.
                 _result_signal = MsgSignal.FORCE_TRIGGER
-            elif isinstance(action, ActionSendFixed):
-                if action.block_mode == "strict":
-                    _result_signal = MsgSignal.BLOCK_ALL
-                else:
-                    _result_signal = MsgSignal.BLOCK_TRIGGER
             else:
-                _result_signal = MsgSignal.CONTINUE
+                # Everything else stays out of the LLM but stays in the history:
+                # the host returns on BLOCK_ALL *before* writing the message to
+                # DBChatMessage, so blocking everything meant the bot woke up
+                # with no memory of the night at all.
+                _result_signal = (
+                    MsgSignal.BLOCK_ALL
+                    if config.HISTORY_MODE == "strict"
+                    else MsgSignal.BLOCK_TRIGGER
+                )
 
             return state
 
@@ -619,9 +742,10 @@ def _render_sleep_context(state: ChatSleepState, now_utc: datetime) -> str:
     if state.status == SleepStatus.AWAKE_EARLY and state.woken_at is not None:
         awake_seconds = max(0.0, (now_utc - state.woken_at).total_seconds())
         who = f"用户 {state.woken_by} " if state.woken_by else ""
+        verb = "紧急叫醒" if state.woken_reason == "urgent" else "提前叫醒"
         lines = [
             f"[睡眠状态] 你今晚 {bedtime} 就寝，原定 {planned} 自然醒。",
-            f"{_fmt_local(state.woken_at, tz_name)} {who}把你提前叫醒了，"
+            f"{_fmt_local(state.woken_at, tz_name)} {who}把你{verb}了，"
             f"到现在醒了约 {int(awake_seconds // 60)} 分钟"
             f"（当前 {_fmt_local(now_utc, tz_name)}）。",
             f"{bedtime} 之后的消息你都是在睡着时收到的，刚醒来才看见，"
@@ -845,6 +969,13 @@ async def _settle_wake(
         logger.warning("Cannot build ctx for %s, using fallback name: %s", chat_key, exc)
 
     notice_action: ActionSendWakeNotice | None = None
+    breakdown: dict[str, float] | None = None
+
+    def _score(cycle: SleepCycle, seconds: float) -> int:
+        nonlocal breakdown
+        detail = compute_quality_detail(cycle, seconds)
+        breakdown = detail.as_dict()
+        return detail.score
 
     async def _wake(s: ChatSleepState) -> ChatSleepState:
         nonlocal notice_action
@@ -861,10 +992,16 @@ async def _settle_wake(
                 )
                 policy = "never"
         new_state, action = settle_natural_wake(
-            s, now_utc, persona_name, compute_quality, policy
+            s, now_utc, persona_name, _score, policy
         )
         if isinstance(action, ActionSendWakeNotice):
             notice_action = action
+        if breakdown is not None and new_state.cycle is not None:
+            # Keep every term behind the percentage, so a score that looks wrong
+            # can be explained instead of reverse-engineered.
+            new_state.cycle = new_state.cycle.model_copy(
+                update={"quality_breakdown": breakdown}
+            )
         return new_state
 
     await store.with_state(chat_key, _wake)

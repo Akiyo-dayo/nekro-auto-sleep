@@ -9,13 +9,16 @@ from zoneinfo import ZoneInfo
 
 from nekro_auto_sleep.engine import (
     ActionForceWake,
+    ActionNone,
     ActionSendFixed,
     ActionSendWakeNotice,
     close_sleep_segment,
     compute_actual_sleep_seconds,
     handle_idle_sleep_back,
     handle_resume_sleep,
-    handle_valid_call_while_asleep,
+    classify_answer,
+    handle_message_while_asleep,
+    offer_is_live,
     is_idle_expired,
     open_sleep_segment,
     refresh_idle_deadline,
@@ -48,61 +51,169 @@ class TestTransitionToSleep:
         assert new_state.cycle.sleep_segments[0].close_at is None
 
 
+BED = datetime(2026, 8, 13, 15, 0, tzinfo=UTC)  # 23:00 Shanghai
+NIGHT = BED + timedelta(hours=1)
+
+
+def _sleeping(default_snapshot) -> ChatSleepState:
+    return transition_to_sleep(ChatSleepState(chat_key=CHAT_KEY), BED, default_snapshot)
+
+
+def _call(state, now, user="user1", text="醒醒", valid=True):
+    return handle_message_while_asleep(state, now, user, text, "Bot", valid)
+
+
+class TestAnswerClassification:
+    @pytest.mark.parametrize("text", ["要", "嗯", "叫醒他", "好啊", "wake up", "OK"])
+    def test_affirmative(self, default_snapshot, text):
+        assert classify_answer(text, default_snapshot) == "yes"
+
+    @pytest.mark.parametrize("text", ["不用", "算了", "让他睡吧", "晚安", "no"])
+    def test_negative(self, default_snapshot, text):
+        assert classify_answer(text, default_snapshot) == "no"
+
+    @pytest.mark.parametrize("text", ["今天天气不错", "", "?"])
+    def test_unclear(self, default_snapshot, text):
+        assert classify_answer(text, default_snapshot) == "unclear"
+
+    def test_negative_beats_affirmative_in_one_sentence(self, default_snapshot):
+        # "不用叫醒了" holds both a negative and an affirmative keyword. Reading
+        # it as consent is exactly how a refusal used to wake the bot up.
+        assert classify_answer("不用叫醒了", default_snapshot) == "no"
+
+
 class TestWakeProtocol:
-    def _make_sleeping_state(self, default_snapshot) -> ChatSleepState:
-        state = ChatSleepState(chat_key=CHAT_KEY)
-        now = datetime(2026, 8, 13, 15, 0, tzinfo=UTC)
-        return transition_to_sleep(state, now, default_snapshot)
-
     def test_first_call_sends_fixed(self, default_snapshot):
-        state = self._make_sleeping_state(default_snapshot)
-        now = datetime(2026, 8, 13, 16, 0, tzinfo=UTC)
-        new_state, action = handle_valid_call_while_asleep(
-            state, now, "user1", "小明"
-        )
+        state, action = _call(_sleeping(default_snapshot), NIGHT)
         assert isinstance(action, ActionSendFixed)
-        assert "小明已经睡了" in action.text
-        assert "user1" in new_state.pending_wake_offers
+        assert "已经睡了" in action.text
+        assert state.status == SleepStatus.ASLEEP
+        assert offer_is_live(state, NIGHT)
 
-    def test_first_call_near_wake_different_text(self, default_snapshot):
-        state = self._make_sleeping_state(default_snapshot)
-        # Near planned wake time
-        near = state.cycle.planned_wake_at - timedelta(minutes=5)
-        _new_state, action = handle_valid_call_while_asleep(
-            state, near, "user1", "小明"
-        )
-        assert isinstance(action, ActionSendFixed)
+    def test_near_wake_changes_the_wording(self, default_snapshot):
+        state = _sleeping(default_snapshot)
+        near = state.cycle.planned_wake_at - timedelta(minutes=30)
+        _state, action = _call(state, near)
         assert "还没起床" in action.text
 
-    def test_second_call_within_window(self, default_snapshot):
-        state = self._make_sleeping_state(default_snapshot)
-        now1 = datetime(2026, 8, 13, 16, 0, tzinfo=UTC)
-        state, _ = handle_valid_call_while_asleep(state, now1, "user1", "Bot")
+    def test_plain_yes_wakes_the_bot(self, default_snapshot):
+        """The whole point: the bot asks a yes/no question, so "要" must work."""
+        state = _sleeping(default_snapshot)
+        state, _ = _call(state, NIGHT)
+        state, action = _call(state, NIGHT + timedelta(seconds=20), text="要")
 
-        now2 = now1 + timedelta(seconds=60)
-        state, action = handle_valid_call_while_asleep(state, now2, "user1", "Bot")
         assert isinstance(action, ActionForceWake)
         assert state.status == SleepStatus.AWAKE_EARLY
+        assert state.woken_by == "user1"
 
-    def test_different_user_cannot_confirm(self, default_snapshot):
-        state = self._make_sleeping_state(default_snapshot)
-        now1 = datetime(2026, 8, 13, 16, 0, tzinfo=UTC)
-        state, _ = handle_valid_call_while_asleep(state, now1, "user1", "Bot")
+    def test_plain_no_keeps_it_asleep_and_snoozes(self, default_snapshot):
+        state = _sleeping(default_snapshot)
+        state, _ = _call(state, NIGHT)
+        state, action = _call(state, NIGHT + timedelta(seconds=20), text="算了")
 
-        now2 = now1 + timedelta(seconds=60)
-        state, action = handle_valid_call_while_asleep(state, now2, "user2", "Bot")
-        assert isinstance(action, ActionSendFixed)
+        assert isinstance(action, ActionNone)
+        assert state.status == SleepStatus.ASLEEP
+        assert state.pending_offer is None
+        assert state.snooze_until == NIGHT + timedelta(seconds=20, minutes=30)
+
+    def test_snooze_silences_later_calls(self, default_snapshot):
+        state = _sleeping(default_snapshot)
+        state, _ = _call(state, NIGHT)
+        state, _ = _call(state, NIGHT + timedelta(seconds=20), text="算了")
+
+        state, action = _call(state, NIGHT + timedelta(minutes=10))
+        assert isinstance(action, ActionNone)
+        assert state.offers_sent_tonight == 1
+
+    def test_unclear_answer_neither_wakes_nor_reprompts(self, default_snapshot):
+        state = _sleeping(default_snapshot)
+        state, _ = _call(state, NIGHT)
+        state, action = _call(state, NIGHT + timedelta(seconds=20), text="你在哪")
+
+        assert isinstance(action, ActionNone)
+        assert state.status == SleepStatus.ASLEEP
+        assert offer_is_live(state, NIGHT + timedelta(seconds=20))
+
+    def test_unclear_can_be_configured_to_wake(self, default_snapshot):
+        snap = default_snapshot.model_copy(update={"unclear_answer": "wake"})
+        state = transition_to_sleep(ChatSleepState(chat_key=CHAT_KEY), BED, snap)
+        state, _ = _call(state, NIGHT)
+        state, action = _call(state, NIGHT + timedelta(seconds=20), text="你在哪")
+        assert isinstance(action, ActionForceWake)
+
+    def test_bystander_cannot_answer_by_default(self, default_snapshot):
+        state = _sleeping(default_snapshot)
+        state, _ = _call(state, NIGHT, user="user1")
+        state, action = _call(state, NIGHT + timedelta(seconds=20), user="user2", text="要")
+
+        assert isinstance(action, ActionNone)
         assert state.status == SleepStatus.ASLEEP
 
-    def test_expired_offer_resets(self, default_snapshot):
-        state = self._make_sleeping_state(default_snapshot)
-        now1 = datetime(2026, 8, 13, 16, 0, tzinfo=UTC)
-        state, _ = handle_valid_call_while_asleep(state, now1, "user1", "Bot")
+    def test_bystander_can_answer_with_open_scope(self, default_snapshot):
+        snap = default_snapshot.model_copy(update={"answer_scope": "anyone"})
+        state = transition_to_sleep(ChatSleepState(chat_key=CHAT_KEY), BED, snap)
+        state, _ = _call(state, NIGHT, user="user1")
+        state, action = _call(state, NIGHT + timedelta(seconds=20), user="user2", text="要")
+        assert isinstance(action, ActionForceWake)
 
-        now2 = now1 + timedelta(seconds=200)  # Past 180s window
-        state, action = handle_valid_call_while_asleep(state, now2, "user1", "Bot")
+    def test_ordinary_message_never_creates_an_offer(self, default_snapshot):
+        state, action = _call(_sleeping(default_snapshot), NIGHT, text="随便聊聊", valid=False)
+        assert isinstance(action, ActionNone)
+        assert state.pending_offer is None
+        assert state.cycle.wake_attempts == []
+
+    def test_urgent_wakes_in_one_step(self, default_snapshot):
+        state, action = _call(_sleeping(default_snapshot), NIGHT, text="出事了！快醒醒")
+        assert isinstance(action, ActionForceWake)
+        assert action.reason == "urgent"
+        assert state.status == SleepStatus.AWAKE_EARLY
+        assert state.woken_reason == "urgent"
+
+
+class TestOfferRateLimit:
+    def test_cooldown_between_offers(self, default_snapshot):
+        state = _sleeping(default_snapshot)
+        state, first = _call(state, NIGHT)
+        assert isinstance(first, ActionSendFixed)
+
+        # Offer expires after 180s; calling again 5 minutes later is inside the
+        # 20-minute cooldown, so the bot stays quiet instead of asking again.
+        state, action = _call(state, NIGHT + timedelta(minutes=5))
+        assert isinstance(action, ActionNone)
+        assert state.offers_sent_tonight == 1
+
+    def test_asks_again_after_the_cooldown(self, default_snapshot):
+        state = _sleeping(default_snapshot)
+        state, _ = _call(state, NIGHT)
+        state, action = _call(state, NIGHT + timedelta(minutes=25))
         assert isinstance(action, ActionSendFixed)
-        assert state.status == SleepStatus.ASLEEP
+        assert state.offers_sent_tonight == 2
+
+    def test_nightly_cap(self, default_snapshot):
+        state = _sleeping(default_snapshot)
+        now = NIGHT
+        for _ in range(3):
+            state, action = _call(state, now)
+            assert isinstance(action, ActionSendFixed)
+            now += timedelta(minutes=25)
+
+        state, action = _call(state, now)
+        assert isinstance(action, ActionNone)
+        assert state.offers_sent_tonight == 3
+
+    def test_every_ignored_call_is_still_charged_to_quality(self, default_snapshot):
+        state = _sleeping(default_snapshot)
+        state, _ = _call(state, NIGHT)
+        state, _ = _call(state, NIGHT + timedelta(minutes=25))
+        state, _ = _call(state, NIGHT + timedelta(minutes=25, seconds=20), text="要")
+
+        attempts = state.cycle.wake_attempts
+        assert len(attempts) == 2
+        # Answering confirms only the call that was actually answered; the one
+        # the bot slept through stays on the record as unanswered, which is what
+        # the quality model charges for. The old protocol flipped every earlier
+        # attempt by that user to confirmed and erased the evidence.
+        assert [a.is_confirmed for a in attempts] == [False, True]
 
 
 class TestResumeSleep:
@@ -162,7 +273,9 @@ class TestNaturalWake:
         state = transition_to_sleep(state, now, default_snapshot)
 
         call_time = now + timedelta(hours=1)
-        state, _ = handle_valid_call_while_asleep(state, call_time, "user1", "Bot")
+        state, _ = handle_message_while_asleep(
+            state, call_time, "user1", "醒醒", "Bot", True
+        )
 
         wake_time = state.cycle.planned_wake_at
         state, action = settle_natural_wake(
@@ -203,9 +316,11 @@ class TestNaturalWake:
         state = transition_to_sleep(state, now, default_snapshot)
 
         call_time = now + timedelta(hours=1)
-        state, _ = handle_valid_call_while_asleep(state, call_time, "user1", "Bot")
-        state, _ = handle_valid_call_while_asleep(
-            state, call_time + timedelta(seconds=30), "user1", "Bot"
+        state, _ = handle_message_while_asleep(
+            state, call_time, "user1", "醒醒", "Bot", True
+        )
+        state, _ = handle_message_while_asleep(
+            state, call_time + timedelta(seconds=30), "user1", "要", "Bot", True
         )
         assert state.status == SleepStatus.AWAKE_EARLY
 

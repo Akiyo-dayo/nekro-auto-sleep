@@ -1,0 +1,14 @@
+08-18 01:41:21 [INFO] nekro_agent.core.logger | <module>:417| loguru diagnose 已关闭（NEKRO_LOG_DIAGNOSE 未设置，按默认关闭）：异常类型/消息/调用栈照常记录，不渲染局部变量
+08-18 01:41:21 [WARNING] nekro_agent.core.logger | <module>:420| ⚠️ 数据库口令仍是出厂默认值（NEKRO_POSTGRES_PASSWORD）。它逐字等于包名，任何「扫一遍日志/备份里有没有口令」的工具都无法把它与正常文本区分开——也就是说它一旦泄漏，你不会从任何告警里知道。上线前必须改掉，见 docs/akiyo-fork/PRELAUNCH_CHECKLIST.md §1.3
+08-18 01:41:26 [ERROR] nekro_agent.core.logger | exception_handler:96| Uncaught exception occurred
+Traceback (most recent call last):
+> File "C:\Users\Administrator\Desktop\Akiyo\NekroAgent_ByAkiyo\nekro_agent\core\logger.py", line 94, in exception_handler
+    raise value  # noqa: TRY301
+  File "<string>", line 3, in <module>
+  File "C:\Users\Administrator\Desktop\Akiyo\nekro-auto-sleep\nekro_auto_sleep\__init__.py", line 32, in <module>
+    from .engine import (
+ImportError: cannot import name 'handle_valid_call_while_asleep' from 'nekro_auto_sleep.engine' (C:\Users\Administrator\Desktop\Akiyo\nekro-auto-sleep\nekro_auto_sleep\engine.py)
+08-18 01:43:32 [INFO] nekro_agent.core.logger | <module>:417| loguru diagnose 已关闭（NEKRO_LOG_DIAGNOSE 未设置，按默认关闭）：异常类型/消息/调用栈照常记录，不渲染局部变量
+08-18 01:43:32 [WARNING] nekro_agent.core.logger | <module>:420| ⚠️ 数据库口令仍是出厂默认值（NEKRO_POSTGRES_PASSWORD）。它逐字等于包名，任何「扫一遍日志/备份里有没有口令」的工具都无法把它与正常文本区分开——也就是说它一旦泄漏，你不会从任何告警里知道。上线前必须改掉，见 docs/akiyo-fork/PRELAUNCH_CHECKLIST.md §1.3
+08-18 01:44:26 [INFO] nekro_agent.core.logger | <module>:417| loguru diagnose 已关闭（NEKRO_LOG_DIAGNOSE 未设置，按默认关闭）：异常类型/消息/调用栈照常记录，不渲染局部变量
+08-18 01:44:26 [WARNING] nekro_agent.core.logger | <module>:420| ⚠️ 数据库口令仍是出厂默认值（NEKRO_POSTGRES_PASSWORD）。它逐字等于包名，任何「扫一遍日志/备份里有没有口令」的工具都无法把它与正常文本区分开——也就是说它一旦泄漏，你不会从任何告警里知道。上线前必须改掉，见 docs/akiyo-fork/PRELAUNCH_CHECKLIST.md §1.3

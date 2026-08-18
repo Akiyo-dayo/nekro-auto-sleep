@@ -122,12 +122,17 @@ def is_near_wake(
     now_utc: datetime,
     sleep_at_utc: datetime,
     wake_at_utc: datetime,
-    near_wake_ratio: float,
+    near_wake_minutes: int,
 ) -> bool:
-    """Check if now_utc is in the last near_wake_ratio portion of the sleep window."""
-    total = (wake_at_utc - sleep_at_utc).total_seconds()
-    threshold = wake_at_utc - timedelta(seconds=total * max(0.0, min(0.5, near_wake_ratio)))
-    return now_utc >= threshold
+    """Whether now_utc falls in the final stretch before the planned wake-up.
+
+    An absolute window rather than a fraction of the night: with a fraction the
+    "not up yet" wording drifted every night along with the random wake point,
+    and a longer configured night silently widened it.
+    """
+    minutes = max(0, min(720, near_wake_minutes))
+    threshold = wake_at_utc - timedelta(minutes=minutes)
+    return sleep_at_utc <= now_utc and now_utc >= threshold
 
 
 def current_local_date(tz: ZoneInfo, now_utc: datetime | None = None) -> date:
@@ -175,6 +180,13 @@ def next_sleep_at(
     return candidate.astimezone(ZoneInfo("UTC"))
 
 
+def parse_keyword_list(raw: str | list[str]) -> list[str]:
+    """Split a comma/newline separated keyword field into a clean list."""
+    if isinstance(raw, str):
+        return [k.strip() for k in raw.replace("\n", ",").split(",") if k.strip()]
+    return [str(k).strip() for k in raw if str(k).strip()]
+
+
 def create_config_snapshot(
     timezone: str,
     sleep_time: str,
@@ -190,13 +202,19 @@ def create_config_snapshot(
     quality_min: int,
     quality_max: int,
     quality_jitter_points: float,
+    *,
+    near_wake_minutes: int = 60,
+    sleep_target_hours: float = 8.0,
+    affirmative_keywords: str | list[str] = (),
+    negative_keywords: str | list[str] = (),
+    urgent_keywords: str | list[str] = (),
+    answer_scope: str = "offeree",
+    unclear_answer: str = "ignore",
+    max_offers_per_night: int = 3,
+    offer_cooldown_minutes: int = 20,
+    snooze_minutes: int = 30,
 ) -> ConfigSnapshot:
     """Create a ConfigSnapshot from current config values."""
-    if isinstance(call_keywords, str):
-        kw_list = [k.strip() for k in call_keywords.replace("\n", ",").split(",") if k.strip()]
-    else:
-        kw_list = list(call_keywords)
-
     return ConfigSnapshot(
         timezone=timezone,
         sleep_time=sleep_time,
@@ -206,10 +224,20 @@ def create_config_snapshot(
         near_wake_ratio=near_wake_ratio,
         wake_confirm_window_seconds=wake_confirm_window_seconds,
         history_mode=history_mode,  # type: ignore[arg-type]
-        call_keywords=kw_list,
+        call_keywords=parse_keyword_list(call_keywords),
         fallback_persona_name=fallback_persona_name,
         early_wake_idle_minutes=early_wake_idle_minutes,
         quality_min=quality_min,
         quality_max=quality_max,
         quality_jitter_points=quality_jitter_points,
+        near_wake_minutes=near_wake_minutes,
+        sleep_target_hours=sleep_target_hours,
+        affirmative_keywords=parse_keyword_list(affirmative_keywords),
+        negative_keywords=parse_keyword_list(negative_keywords),
+        urgent_keywords=parse_keyword_list(urgent_keywords),
+        answer_scope=answer_scope,  # type: ignore[arg-type]
+        unclear_answer=unclear_answer,  # type: ignore[arg-type]
+        max_offers_per_night=max_offers_per_night,
+        offer_cooldown_minutes=offer_cooldown_minutes,
+        snooze_minutes=snooze_minutes,
     )

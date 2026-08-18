@@ -56,10 +56,10 @@ class ActionSendFixed(SleepAction):
 
 
 class ActionForceWake(SleepAction):
-    """User confirmed wake — FORCE_TRIGGER this message, inject wake info."""
+    """The call was answered (or was urgent) — FORCE_TRIGGER this message."""
 
-    def __init__(self, inject_text: str):
-        self.inject_text = inject_text
+    def __init__(self, reason: str = "confirmed"):
+        self.reason = reason
 
 
 class ActionSendWakeNotice(SleepAction):
@@ -108,6 +108,10 @@ def create_sleep_cycle(
         config_snapshot.wake_random_step_minutes,
     )
 
+    target_seconds = (
+        (wake_start - sleep_at).total_seconds() + (wake_end - sleep_at).total_seconds()
+    ) / 2
+
     return SleepCycle(
         cycle_id=generate_cycle_id(chat_key, sd),
         sleep_date=sleep_date_local,
@@ -116,6 +120,7 @@ def create_sleep_cycle(
         planned_wake_at=planned_wake,
         config_snapshot=config_snapshot,
         quality_seed=generate_quality_seed(chat_key, sd),
+        target_sleep_seconds=max(0.0, target_seconds),
         sleep_segments=[],
         wake_attempts=[],
         timer_intervals=[],
@@ -182,7 +187,10 @@ def transition_to_sleep(
         update={
             "status": SleepStatus.ASLEEP,
             "cycle": cycle,
-            "pending_wake_offers": {},
+            "pending_offer": None,
+            "offers_sent_tonight": 0,
+            "last_offer_at": None,
+            "snooze_until": None,
             "idle_sleep_deadline": None,
         }
     )
@@ -195,17 +203,19 @@ def transition_to_awake_early(
     now_utc: datetime,
     user_id: str,
     idle_minutes: int,
+    reason: str = "confirmed",
 ) -> ChatSleepState:
-    """ASLEEP -> AWAKE_EARLY: user confirmed second wake call."""
+    """ASLEEP -> AWAKE_EARLY: the wake-up question was answered yes."""
     state = close_sleep_segment(state, now_utc)
     deadline = now_utc + timedelta(minutes=idle_minutes)
     state = state.model_copy(
         update={
             "status": SleepStatus.AWAKE_EARLY,
-            "pending_wake_offers": {},
+            "pending_offer": None,
             "idle_sleep_deadline": deadline,
             "woken_at": now_utc,
             "woken_by": user_id,
+            "woken_reason": reason,
         }
     )
     return state
@@ -225,9 +235,10 @@ def transition_to_awake(
         update={
             "status": SleepStatus.AWAKE,
             "idle_sleep_deadline": None,
-            "pending_wake_offers": {},
+            "pending_offer": None,
             "woken_at": None,
             "woken_by": None,
+            "woken_reason": None,
         }
     )
     return state
@@ -244,6 +255,7 @@ def transition_resume_sleep(
             "idle_sleep_deadline": None,
             "woken_at": None,
             "woken_by": None,
+            "woken_reason": None,
         }
     )
     state = open_sleep_segment(state, now_utc)
@@ -255,76 +267,195 @@ def transition_resume_sleep(
 # ---------------------------------------------------------------------------
 
 
-def handle_valid_call_while_asleep(
+AnswerIntent = Literal["yes", "no", "unclear"]
+
+
+def classify_answer(text: str, snap: ConfigSnapshot) -> AnswerIntent:
+    """Read a reply to "shall I wake X up?" as yes / no / neither.
+
+    Negatives win ties on purpose. "不用叫了" contains both a negative and an
+    affirmative keyword, and the old protocol — which counted *any* second
+    message in a private chat as confirmation — turned every such refusal into
+    a wake-up.
+    """
+    stripped = (text or "").strip().lower()
+    if not stripped:
+        return "unclear"
+    if any(kw and kw.lower() in stripped for kw in snap.negative_keywords):
+        return "no"
+    if any(kw and kw.lower() in stripped for kw in snap.affirmative_keywords):
+        return "yes"
+    return "unclear"
+
+
+def is_urgent(text: str, snap: ConfigSnapshot) -> bool:
+    """An emergency skips the two-step handshake."""
+    stripped = (text or "").strip().lower()
+    return any(kw and kw.lower() in stripped for kw in snap.urgent_keywords)
+
+
+def _record_attempt(
     state: ChatSleepState,
     now_utc: datetime,
     user_id: str,
-    persona_name: str,
-) -> tuple[ChatSleepState, SleepAction]:
-    """Handle a valid user call during ASLEEP state.
+    confirmed: bool,
+) -> ChatSleepState:
+    if state.cycle is None:
+        return state
+    attempts = list(state.cycle.wake_attempts)
+    attempts.append(
+        WakeAttempt(
+            user_id=user_id,
+            chat_key=state.chat_key,
+            attempted_at=now_utc,
+            is_confirmed=confirmed,
+            confirmed_at=now_utc if confirmed else None,
+        )
+    )
+    state.cycle = state.cycle.model_copy(update={"wake_attempts": attempts})
+    return state
 
-    Returns (new_state, action) where action tells the caller what to do.
+
+def _confirm_latest_attempt(state: ChatSleepState, now_utc: datetime) -> ChatSleepState:
+    """Mark only the most recent unanswered call as the one that worked.
+
+    The previous version flipped every unconfirmed attempt by that user, which
+    erased the record of the pings they had already been ignored on — and those
+    pings are exactly what the quality model is supposed to charge for.
+    """
+    if state.cycle is None:
+        return state
+    attempts = list(state.cycle.wake_attempts)
+    for i in range(len(attempts) - 1, -1, -1):
+        if not attempts[i].is_confirmed:
+            attempts[i] = attempts[i].model_copy(
+                update={"is_confirmed": True, "confirmed_at": now_utc}
+            )
+            break
+    state.cycle = state.cycle.model_copy(update={"wake_attempts": attempts})
+    return state
+
+
+def offer_is_live(state: ChatSleepState, now_utc: datetime) -> bool:
+    return state.pending_offer is not None and now_utc <= state.pending_offer.expires_at
+
+
+def _may_answer(state: ChatSleepState, user_id: str, snap: ConfigSnapshot) -> bool:
+    if snap.answer_scope == "anyone":
+        return True
+    return state.pending_offer is not None and state.pending_offer.user_id == user_id
+
+
+def _offer_is_suppressed(
+    state: ChatSleepState,
+    now_utc: datetime,
+    snap: ConfigSnapshot,
+) -> str | None:
+    """Why the bot should stay quiet instead of asking again, if it should."""
+    if state.snooze_until is not None and now_utc < state.snooze_until:
+        return "snoozed"
+    if state.offers_sent_tonight >= max(0, snap.max_offers_per_night):
+        return "nightly limit"
+    if state.last_offer_at is not None:
+        cooldown = timedelta(minutes=max(0, snap.offer_cooldown_minutes))
+        if now_utc - state.last_offer_at < cooldown:
+            return "cooldown"
+    return None
+
+
+def handle_message_while_asleep(
+    state: ChatSleepState,
+    now_utc: datetime,
+    user_id: str,
+    text: str,
+    persona_name: str,
+    is_valid_call: bool,
+) -> tuple[ChatSleepState, SleepAction]:
+    """Handle one inbound message while the chat is ASLEEP.
+
+    Two phases. With no question outstanding, a valid call gets one — subject to
+    a per-night cap, a cooldown and a snooze, so a chat that keeps saying the
+    wake word at 3am gets one reply, not one per message. With a question
+    outstanding, the message is read as an answer instead of as another call,
+    which is what makes plain "要" work and plain "算了" stop meaning yes.
     """
     if state.cycle is None:
         return state, ActionNone()
 
     snap = state.cycle.config_snapshot
-    confirm_window = timedelta(seconds=snap.wake_confirm_window_seconds)
 
-    pending = dict(state.pending_wake_offers)
-    existing = pending.get(user_id)
-
-    if existing is not None and now_utc <= existing.expires_at:
-        # Second call within window -> confirm wake
-        wake_attempts = list(state.cycle.wake_attempts)
-        for i, wa in enumerate(wake_attempts):
-            if wa.user_id == user_id and not wa.is_confirmed:
-                wake_attempts[i] = wa.model_copy(
-                    update={"is_confirmed": True, "confirmed_at": now_utc}
-                )
-
-        state.cycle = state.cycle.model_copy(update={"wake_attempts": wake_attempts})
-        pending.pop(user_id, None)
-        state = state.model_copy(update={"pending_wake_offers": pending})
-
+    if is_valid_call and is_urgent(text, snap):
+        state = _record_attempt(state, now_utc, user_id, confirmed=True)
+        state = state.model_copy(update={"pending_offer": None})
         state = transition_to_awake_early(
-            state, now_utc, user_id, snap.early_wake_idle_minutes
+            state, now_utc, user_id, snap.early_wake_idle_minutes, reason="urgent"
         )
+        return state, ActionForceWake(reason="urgent")
 
-        inject = "你刚刚被用户提前叫醒了。"
-        return state, ActionForceWake(inject_text=inject)
+    if offer_is_live(state, now_utc):
+        if not _may_answer(state, user_id, snap):
+            return state, ActionNone()
 
-    # First call or expired previous offer -> send fixed prompt
-    pending[user_id] = PendingWakeOffer(
-        user_id=user_id,
-        offered_at=now_utc,
-        expires_at=now_utc + confirm_window,
+        intent = classify_answer(text, snap)
+        if intent == "unclear" and snap.unclear_answer == "wake" and is_valid_call:
+            intent = "yes"
+
+        if intent == "yes":
+            state = _confirm_latest_attempt(state, now_utc)
+            state = transition_to_awake_early(
+                state, now_utc, user_id, snap.early_wake_idle_minutes
+            )
+            return state, ActionForceWake()
+
+        if intent == "no":
+            # Explicitly told to stay asleep: drop the question and stop asking
+            # for a while, rather than treating the refusal as consent.
+            state = state.model_copy(
+                update={
+                    "pending_offer": None,
+                    "snooze_until": now_utc
+                    + timedelta(minutes=max(0, snap.snooze_minutes)),
+                }
+            )
+            return state, ActionNone()
+
+        # Neither yes nor no: stay asleep, keep the question alive, say nothing.
+        return state, ActionNone()
+
+    if not is_valid_call:
+        return state, ActionNone()
+
+    suppressed = _offer_is_suppressed(state, now_utc, snap)
+    if suppressed is not None:
+        logger.debug("Not offering to wake %s (%s)", state.chat_key, suppressed)
+        return state, ActionNone()
+
+    state = _record_attempt(state, now_utc, user_id, confirmed=False)
+    state = state.model_copy(
+        update={
+            "pending_offer": PendingWakeOffer(
+                user_id=user_id,
+                offered_at=now_utc,
+                expires_at=now_utc
+                + timedelta(seconds=snap.wake_confirm_window_seconds),
+            ),
+            "offers_sent_tonight": state.offers_sent_tonight + 1,
+            "last_offer_at": now_utc,
+        }
     )
-
-    wake_attempts = list(state.cycle.wake_attempts)
-    wake_attempts.append(
-        WakeAttempt(
-            user_id=user_id,
-            chat_key=state.chat_key,
-            attempted_at=now_utc,
-        )
-    )
-    state.cycle = state.cycle.model_copy(update={"wake_attempts": wake_attempts})
-    state = state.model_copy(update={"pending_wake_offers": pending})
 
     near = is_near_wake(
         now_utc,
         state.cycle.sleep_at,
         state.cycle.planned_wake_at,
-        snap.near_wake_ratio,
+        snap.near_wake_minutes,
     )
-
     if near:
-        text = f"【{persona_name}还没起床 要叫醒{persona_name}吗？】"
+        prompt = f"【{persona_name}还没起床 要叫醒{persona_name}吗？】"
     else:
-        text = f"【{persona_name}已经睡了 要叫醒{persona_name}吗？】"
+        prompt = f"【{persona_name}已经睡了 要叫醒{persona_name}吗？】"
 
-    return state, ActionSendFixed(text=text, block_mode=snap.history_mode)
+    return state, ActionSendFixed(text=prompt, block_mode=snap.history_mode)
 
 
 # ---------------------------------------------------------------------------
@@ -521,17 +652,12 @@ def cleanup_expired_offers(
     state: ChatSleepState,
     now_utc: datetime,
 ) -> ChatSleepState:
-    """Remove expired pending wake offers (lazy cleanup)."""
-    if not state.pending_wake_offers:
+    """Drop the pending wake-up question once it has expired (lazy cleanup)."""
+    if state.pending_offer is None:
         return state
-    active = {
-        uid: offer
-        for uid, offer in state.pending_wake_offers.items()
-        if now_utc <= offer.expires_at
-    }
-    if len(active) != len(state.pending_wake_offers):
-        state = state.model_copy(update={"pending_wake_offers": active})
-    return state
+    if now_utc <= state.pending_offer.expires_at:
+        return state
+    return state.model_copy(update={"pending_offer": None})
 
 
 # ---------------------------------------------------------------------------

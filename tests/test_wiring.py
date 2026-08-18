@@ -20,7 +20,6 @@ from zoneinfo import ZoneInfo
 import nekro_auto_sleep as m
 from nekro_auto_sleep.engine import (
     compute_actual_sleep_seconds,
-    handle_valid_call_while_asleep,
     transition_to_sleep,
 )
 from nekro_auto_sleep.models import ChatSleepState, SleepStatus
@@ -80,6 +79,11 @@ def wired(monkeypatch, clock):
     m.config.HISTORY_MODE = "preserve"
     m.config.WAKE_NOTICE_POLICY = "always"
     m.config.FALLBACK_PERSONA_NAME = "Bot"
+    m.config.ANSWER_SCOPE = "offeree"
+    m.config.UNCLEAR_ANSWER = "ignore"
+    m.config.MAX_OFFERS_PER_NIGHT = 3
+    m.config.OFFER_COOLDOWN_MINUTES = 20
+    m.config.SNOOZE_MINUTES = 30
 
     ctx = AgentCtx(CHAT_KEY, FakeChatChannel(CHAT_KEY, preset_name=PERSONA))
     set_ctx_factory(lambda chat_key: ctx)
@@ -224,7 +228,7 @@ class TestMessageSignals:
             ctx, ChatMessage(content="醒醒", chat_key=CHAT_KEY)
         )
         signal = await plugin_mod.plugin.on_user_message(
-            ctx, ChatMessage(content="醒醒", chat_key=CHAT_KEY)
+            ctx, ChatMessage(content="要", chat_key=CHAT_KEY)
         )
 
         assert signal == MsgSignal.FORCE_TRIGGER
@@ -264,7 +268,7 @@ class TestWakeContext:
             ctx, ChatMessage(content="醒醒", chat_key=CHAT_KEY)
         )
         await plugin_mod.plugin.on_user_message(
-            ctx, ChatMessage(content="醒醒", chat_key=CHAT_KEY)
+            ctx, ChatMessage(content="要", chat_key=CHAT_KEY)
         )
 
     async def test_context_survives_more_than_one_round(self, wired):
@@ -407,3 +411,99 @@ class TestBedtimeDetection:
 
 async def _async_set(value):
     return value
+
+
+# ---------------------------------------------------------------------------
+# Wake protocol, end to end through the hook
+# ---------------------------------------------------------------------------
+
+
+class TestWakeProtocolWiring:
+    async def _ask(self, plugin_mod, ctx, text="醒醒"):
+        return await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content=text, chat_key=CHAT_KEY)
+        )
+
+    async def test_saying_yes_wakes_the_bot(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+
+        await self._ask(plugin_mod, ctx)
+        signal = await self._ask(plugin_mod, ctx, "要")
+
+        assert signal == MsgSignal.FORCE_TRIGGER
+        assert store.get_cached(CHAT_KEY).status == SleepStatus.AWAKE_EARLY
+
+    async def test_saying_no_leaves_it_asleep(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+
+        await self._ask(plugin_mod, ctx)
+        signal = await self._ask(plugin_mod, ctx, "算了你睡吧")
+
+        assert signal == MsgSignal.BLOCK_TRIGGER
+        state = store.get_cached(CHAT_KEY)
+        assert state.status == SleepStatus.ASLEEP
+        assert state.snooze_until is not None
+        # Only the question was sent; declining gets no reply at all.
+        assert len(ctx.sent) == 1
+
+    async def test_repeated_calls_do_not_spam_the_chat(self, wired, clock):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+
+        for _ in range(8):
+            await self._ask(plugin_mod, ctx, "在吗")
+            clock.advance(minutes=4)
+
+        # Eight valid calls across 32 minutes, two replies: one at the start and
+        # one after the 20-minute cooldown. Before the rate limit every single
+        # one of them got its own fixed reply and its own quality penalty.
+        assert len(ctx.sent) == 2
+        assert store.get_cached(CHAT_KEY).offers_sent_tonight == 2
+
+    async def test_urgent_message_skips_the_handshake(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+
+        signal = await self._ask(plugin_mod, ctx, "出事了 快醒醒")
+
+        assert signal == MsgSignal.FORCE_TRIGGER
+        state = store.get_cached(CHAT_KEY)
+        assert state.status == SleepStatus.AWAKE_EARLY
+        assert state.woken_reason == "urgent"
+        assert ctx.sent == []
+
+    async def test_urgent_wake_is_reflected_in_the_prompt(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+        # Urgent still has to be aimed at the bot: an @ or a call keyword.
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="救命", chat_key=CHAT_KEY, is_tome=True)
+        )
+
+        text = await plugin_mod.plugin.prompt_injects["sleep_status"](ctx)
+        assert "紧急叫醒" in text
+
+
+class TestQualityBreakdownPersisted:
+    async def test_settlement_stores_every_term(self, wired):
+        plugin_mod, store, ctx = wired
+        state = await _put_asleep(store)
+
+        await plugin_mod._settle_wake(store, CHAT_KEY, state.cycle.planned_wake_at)
+
+        breakdown = store.get_cached(CHAT_KEY).cycle.quality_breakdown
+        assert breakdown is not None
+        reported, _hours = _parse_notice(ctx.sent[0][0])
+        assert breakdown["score"] == reported
+        assert set(breakdown) >= {
+            "base",
+            "penalty_fragmentation",
+            "penalty_calls",
+            "penalty_wakes",
+            "jitter",
+            "raw",
+            "target_hours",
+            "effective_hours",
+        }

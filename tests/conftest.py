@@ -75,9 +75,19 @@ def default_snapshot() -> ConfigSnapshot:
         call_keywords="醒醒,起床,在吗",
         fallback_persona_name="Bot",
         early_wake_idle_minutes=10,
-        quality_min=60,
+        quality_min=20,
         quality_max=120,
-        quality_jitter_points=4.0,
+        quality_jitter_points=2.0,
+        near_wake_minutes=60,
+        sleep_target_hours=0.0,
+        affirmative_keywords="要,嗯,好,是,对,叫醒,醒醒,起床,快,醒来,yes,ok,wake",
+        negative_keywords="不用,不要,算了,没事,别吵,别叫,睡吧,晚安,继续睡,no",
+        urgent_keywords="紧急,急事,救命,出事了",
+        answer_scope="offeree",
+        unclear_answer="ignore",
+        max_offers_per_night=3,
+        offer_cooldown_minutes=20,
+        snooze_minutes=30,
     )
 
 
