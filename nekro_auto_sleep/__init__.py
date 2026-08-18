@@ -77,7 +77,77 @@ from .schedule import (
     resolve_schedule,
 )
 
-logger = logging.getLogger("nekro_auto_sleep")
+# The domain layer logs through stdlib `logging` so it stays host-free. The host
+# logs through loguru and never bridged the two, so on a real install every
+# INFO the plugin emitted went nowhere and every WARNING landed on bare stderr
+# with no timestamp and no plugin tag — which is how "did boot reconciliation
+# even run?" became unanswerable from the log. `_HostLogBridge` forwards the
+# domain layer into the host logger; the wiring layer below uses it directly.
+_domain_logger = logging.getLogger("nekro_auto_sleep")
+logger = _domain_logger
+
+
+class _HostLogBridge(logging.Handler):
+    """Forward stdlib records from the domain layer into the host logger."""
+
+    _METHODS = {"debug", "info", "warning", "error", "critical"}
+
+    def __init__(self, host_logger: Any) -> None:
+        super().__init__()
+        self._host = host_logger
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            level = record.levelname.lower()
+            if level not in self._METHODS:
+                level = "info"
+
+            # Everything goes through stdlib, including the wiring layer, so
+            # `%s` placeholders are interpolated here by `getMessage()`. Handing
+            # the raw template to loguru instead would print it literally: it
+            # formats with `{}`, not `%`.
+            target = self._host
+            opt = getattr(target, "opt", None)
+            if callable(opt):
+                try:
+                    candidate = opt(depth=6)
+                    if hasattr(candidate, level):
+                        target = candidate
+                except Exception:
+                    pass
+
+            emit = getattr(target, level, None)
+            if emit is not None:
+                emit(record.getMessage())
+        except Exception:  # pragma: no cover - logging must never raise
+            pass
+
+
+_log_bridge: logging.Handler | None = None
+
+
+def _install_log_bridge() -> None:
+    """Route this package into the host log, once."""
+    global _log_bridge
+
+    host_logger = getattr(plugin, "logger", None)
+    if host_logger is None:
+        return
+
+    if _log_bridge is not None:
+        return
+    _log_bridge = _HostLogBridge(host_logger)
+    _domain_logger.addHandler(_log_bridge)
+    _domain_logger.setLevel(logging.INFO)
+    _domain_logger.propagate = False
+
+
+def _remove_log_bridge() -> None:
+    global _log_bridge
+
+    if _log_bridge is not None:
+        _domain_logger.removeHandler(_log_bridge)
+        _log_bridge = None
 
 # ---------------------------------------------------------------------------
 # Plugin instance
@@ -1254,7 +1324,14 @@ async def _check_sleep_transition(
             return transition_to_awake(new_state, now_utc)
         return new_state
 
-    await store.with_state(chat_key, _sleep)
+    state = await store.with_state(chat_key, _sleep)
+    if state.status == SleepStatus.ASLEEP and state.cycle is not None:
+        logger.info(
+            "%s 入睡（%s），计划 %s 起床",
+            chat_key,
+            _fmt_local(state.cycle.sleep_at, schedule.timezone),
+            _fmt_local(state.cycle.planned_wake_at, schedule.timezone),
+        )
 
 
 async def _settle_wake(
@@ -1282,6 +1359,7 @@ async def _settle_wake(
 
     notice_action: ActionSendWakeNotice | None = None
     breakdown: dict[str, float] | None = None
+    policy_used: str = ""
 
     def _score(cycle: SleepCycle, seconds: float) -> int:
         nonlocal breakdown
@@ -1303,6 +1381,8 @@ async def _settle_wake(
                     cfg.WAKE_NOTICE_GRACE_MINUTES,
                 )
                 policy = "never"
+        nonlocal policy_used
+        policy_used = policy
         new_state, action = settle_natural_wake(
             s, now_utc, persona_name, _score, policy
         )
@@ -1319,6 +1399,7 @@ async def _settle_wake(
     await store.with_state(chat_key, _wake)
 
     if notice_action is None:
+        logger.info("%s 自然醒，未播报（策略 %s）", chat_key, policy_used or cfg.WAKE_NOTICE_POLICY)
         return
 
     if ctx is None:
@@ -1337,6 +1418,7 @@ async def _settle_wake(
             return mark_notice_sent(s)
 
         await store.with_state(chat_key, _mark_sent)
+        logger.info("%s 已起床并播报：%s", chat_key, notice_action.text)
     except Exception as exc:
         logger.error("Failed to send wake notice for %s: %s", chat_key, exc)
 
@@ -1414,7 +1496,7 @@ async def _reconcile_chat(
 async def _boot_reconcile(store: SleepStateStore, now_utc: datetime) -> None:
     """Hydrate every known channel and settle whatever the downtime skipped."""
     chat_keys = await _discover_chat_keys()
-    logger.info("Boot reconciliation over %d chat_key(s)", len(chat_keys))
+    logger.info("启动对账：%d 个频道", len(chat_keys))
 
     for chat_key in sorted(chat_keys):
         try:
@@ -1458,7 +1540,7 @@ def _install_wraps() -> bool:
         logger.error("Cannot import message_service: %s", exc)
         return False
 
-    logger.info("Night timer policy: %s", config.NIGHT_TIMER_POLICY)
+    logger.info("夜间定时任务策略：%s", config.NIGHT_TIMER_POLICY)
     return success
 
 
@@ -1478,6 +1560,9 @@ def _uninstall_wraps() -> None:
 async def init() -> None:
     global _store, _overrides, _maintenance_task
 
+    _install_log_bridge()
+    logger.info("自动睡眠插件启动中")
+
     _store = SleepStateStore(plugin.store)
     _overrides = ScheduleOverrideStore(plugin.store)
     invalidate_schedule_cache()
@@ -1495,7 +1580,14 @@ async def init() -> None:
             logger.error("Boot reconciliation aborted: %s", exc)
 
     _maintenance_task = asyncio.create_task(_maintenance_loop())
-    logger.info("Auto-sleep plugin initialized")
+    logger.info(
+        "自动睡眠已就绪：作息 %s → %s~%s（%s），起床播报 %s",
+        config.SLEEP_TIME,
+        config.WAKE_TIME_START,
+        config.WAKE_TIME_END,
+        config.TIMEZONE,
+        config.WAKE_NOTICE_POLICY,
+    )
 
 
 @plugin.mount_cleanup_method()
@@ -1513,6 +1605,7 @@ async def cleanup() -> None:
     _uninstall_wraps()
 
     invalidate_schedule_cache()
+    _remove_log_bridge()
     _overrides = None
 
     if _store:

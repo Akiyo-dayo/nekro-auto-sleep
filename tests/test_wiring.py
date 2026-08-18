@@ -981,6 +981,78 @@ class TestUpgradeWarnings:
         assert "被下限" in response.message
 
 
+class TestHostLogBridge:
+    """The domain layer logs through stdlib logging; the host uses loguru.
+
+    Nothing bridged them, so on a real install every INFO the plugin emitted
+    vanished and every WARNING landed on bare stderr with no timestamp and no
+    plugin tag. That is how "did boot reconciliation run?" became unanswerable
+    from the log.
+    """
+
+    class _Recorder:
+        def __init__(self):
+            self.lines: list[tuple[str, str]] = []
+
+        def _make(self, level):
+            def _log(message, *args):
+                self.lines.append((level, str(message)))
+
+            return _log
+
+        def __getattr__(self, name):
+            return self._make(name)
+
+    async def test_domain_logs_reach_the_host_logger(self, monkeypatch):
+        import logging
+
+        recorder = self._Recorder()
+        monkeypatch.setattr(m.plugin, "logger", recorder, raising=False)
+        try:
+            m._install_log_bridge()
+            logging.getLogger("nekro_auto_sleep.engine").warning("夜间提示被限流")
+            assert ("warning", "夜间提示被限流") in recorder.lines
+        finally:
+            m._remove_log_bridge()
+
+    async def test_removing_the_bridge_detaches_it(self, monkeypatch):
+        import logging
+
+        recorder = self._Recorder()
+        monkeypatch.setattr(m.plugin, "logger", recorder, raising=False)
+        m._install_log_bridge()
+        m._remove_log_bridge()
+
+        logging.getLogger("nekro_auto_sleep.engine").warning("不该出现")
+        assert recorder.lines == []
+
+    async def test_wiring_layer_logs_also_reach_the_host(self, monkeypatch):
+        recorder = self._Recorder()
+        monkeypatch.setattr(m.plugin, "logger", recorder, raising=False)
+        try:
+            m._install_log_bridge()
+            m.logger.info("接线层这条也要能看见")
+            assert ("info", "接线层这条也要能看见") in recorder.lines
+        finally:
+            m._remove_log_bridge()
+
+    async def test_percent_placeholders_are_interpolated(self, monkeypatch):
+        """loguru formats with braces, stdlib with percent.
+
+        Handing a `%s` template straight to the host logger printed it
+        literally and dropped the argument, which is what the first version of
+        this bridge did to every line it forwarded.
+        """
+        recorder = self._Recorder()
+        monkeypatch.setattr(m.plugin, "logger", recorder, raising=False)
+        try:
+            m._install_log_bridge()
+            m.logger.info("启动对账：%d 个频道", 62)
+            assert ("info", "启动对账：62 个频道") in recorder.lines
+        finally:
+            m._remove_log_bridge()
+
+
 class TestToolExposure:
     async def test_resume_sleep_is_hidden_while_awake(self, wired):
         plugin_mod, store, ctx = wired
