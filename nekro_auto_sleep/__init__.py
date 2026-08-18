@@ -12,6 +12,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timedelta
+from dataclasses import dataclass
 from typing import Any
 
 from zoneinfo import ZoneInfo
@@ -471,11 +472,29 @@ _overrides: ScheduleOverrideStore | None = None
 _maintenance_task: asyncio.Task[None] | None = None
 _installed_wraps: list[tuple[Any, str]] = []
 
-# Resolved schedules are cached because the maintenance loop asks for one per
-# channel per tick and resolution costs a preset lookup. Overrides change by
+# Resolved settings are cached because the maintenance loop asks for them per
+# channel per tick and resolving costs a channel lookup. Overrides change by
 # hand, so a long TTL plus explicit invalidation on write is plenty.
-_SCHEDULE_CACHE_TTL_SECONDS = 300.0
-_schedule_cache: dict[str, tuple[float, ResolvedSchedule]] = {}
+_SETTINGS_CACHE_TTL_SECONDS = 300.0
+_settings_cache: dict[str, tuple[float, "ChatSettings"]] = {}
+
+
+@dataclass(frozen=True)
+class ChatSettings:
+    """Everything that varies per channel, resolved once.
+
+    `config` is the plugin config as it applies to *this channel's instance*.
+    In the Akiyo fork two accounts can sit in the same group; they get separate
+    chat_keys, so they already keep separate nights — but their config would
+    still have come from the global file, because background tasks carry no
+    instance context for `ScopedPluginConfig` to pick up. Resolving it
+    explicitly here is what makes two bots in one group able to keep genuinely
+    different hours.
+    """
+
+    instance_key: str
+    config: Any
+    schedule: ResolvedSchedule
 
 # How long after an early wake the bot is still told it *just* woke up. The wake
 # context itself is rendered from persisted state for the whole AWAKE_EARLY
@@ -534,50 +553,115 @@ def _global_schedule() -> ResolvedSchedule:
     )
 
 
-async def _preset_id_for(chat_key: str) -> object:
-    """The preset a channel is currently running, or None."""
+async def _channel_and_preset(chat_key: str) -> tuple[object, object]:
+    """The channel row and the preset it is running, for override targeting."""
+    channel = await _channel_for(chat_key)
+    return channel, getattr(channel, "preset_id", None)
+
+
+async def _channel_for(chat_key: str):
+    """The channel row, or None when it cannot be looked up."""
     try:
         from nekro_agent.models.db_chat_channel import DBChatChannel
 
-        channel = await DBChatChannel.get_channel(chat_key=chat_key)
-        return getattr(channel, "preset_id", None)
+        return await DBChatChannel.get_channel(chat_key=chat_key)
     except Exception as exc:
-        logger.debug("Cannot resolve preset for %s: %s", chat_key, exc)
+        logger.debug("Cannot load channel %s: %s", chat_key, exc)
         return None
 
 
-def invalidate_schedule_cache(chat_key: str | None = None) -> None:
+def _instance_config(instance_key: str):
+    """The plugin config as it applies to one adapter instance.
+
+    Fork-only: upstream has no per-instance config layer, and the probe below
+    simply falls through to the global config there. Resolved by explicit
+    instance_key rather than through the host contextvar, because the
+    maintenance loop is a background task and carries no inbound context.
+    """
+    if not instance_key:
+        return config
+    try:
+        from nekro_agent.services.plugin.scope import resolve_scoped_config
+    except ImportError:
+        return config
+    try:
+        return resolve_scoped_config(
+            plugin.key, SleepConfig, plugin.get_global_config(SleepConfig), instance_key
+        )
+    except Exception as exc:
+        logger.warning("Cannot resolve config for instance %r: %s", instance_key, exc)
+        return config
+
+
+def _instance_schedule_fields(instance_key: str) -> set[str]:
+    """Which schedule fields this instance actually overrides (for provenance)."""
+    if not instance_key:
+        return set()
+    try:
+        from nekro_agent.services.plugin.scope import load_instance_config_overrides
+
+        overrides = load_instance_config_overrides(plugin.key, instance_key)
+    except Exception:
+        return set()
+    mapping = {
+        "TIMEZONE": "timezone",
+        "SLEEP_TIME": "sleep_time",
+        "WAKE_TIME_START": "wake_time_start",
+        "WAKE_TIME_END": "wake_time_end",
+    }
+    return {field for key, field in mapping.items() if key in overrides}
+
+
+def invalidate_settings_cache(chat_key: str | None = None) -> None:
     if chat_key is None:
-        _schedule_cache.clear()
+        _settings_cache.clear()
     else:
-        _schedule_cache.pop(chat_key, None)
+        _settings_cache.pop(chat_key, None)
 
 
-async def _resolve_schedule_for(chat_key: str) -> ResolvedSchedule:
-    """The schedule in force for one channel: channel > persona > global."""
-    cached = _schedule_cache.get(chat_key)
-    if cached is not None and (time.monotonic() - cached[0]) < _SCHEDULE_CACHE_TTL_SECONDS:
+# Kept under the old name so existing callers and docs stay valid.
+invalidate_schedule_cache = invalidate_settings_cache
+
+
+async def _settings_for(chat_key: str) -> ChatSettings:
+    """Resolve one channel: channel > persona > instance > global."""
+    cached = _settings_cache.get(chat_key)
+    if cached is not None and (time.monotonic() - cached[0]) < _SETTINGS_CACHE_TTL_SECONDS:
         return cached[1]
+
+    channel = await _channel_for(chat_key)
+    instance_key = str(getattr(channel, "instance_key", "") or "")
+    preset_id = getattr(channel, "preset_id", None)
+    effective = _instance_config(instance_key)
 
     channel_override: ScheduleOverride | None = None
     preset_override: ScheduleOverride | None = None
     try:
         overrides = _get_overrides()
         channel_override = await overrides.get_channel(chat_key)
-        preset_override = await overrides.get_preset(await _preset_id_for(chat_key))
+        preset_override = await overrides.get_preset(preset_id)
     except Exception as exc:
         logger.warning("Cannot load schedule overrides for %s: %s", chat_key, exc)
 
     schedule = resolve_schedule(
-        timezone=config.TIMEZONE,
-        sleep_time=config.SLEEP_TIME,
-        wake_time_start=config.WAKE_TIME_START,
-        wake_time_end=config.WAKE_TIME_END,
+        timezone=effective.TIMEZONE,
+        sleep_time=effective.SLEEP_TIME,
+        wake_time_start=effective.WAKE_TIME_START,
+        wake_time_end=effective.WAKE_TIME_END,
         preset_override=preset_override,
         channel_override=channel_override,
     )
-    _schedule_cache[chat_key] = (time.monotonic(), schedule)
-    return schedule
+    for field in _instance_schedule_fields(instance_key):
+        if schedule.sources.get(field) == "global":
+            schedule.sources[field] = "instance"
+
+    settings = ChatSettings(instance_key=instance_key, config=effective, schedule=schedule)
+    _settings_cache[chat_key] = (time.monotonic(), settings)
+    return settings
+
+
+async def _resolve_schedule_for(chat_key: str) -> ResolvedSchedule:
+    return (await _settings_for(chat_key)).schedule
 
 
 # ---------------------------------------------------------------------------
@@ -689,32 +773,36 @@ def _night_timer_blocked(chat_key: str) -> bool:
     return _is_sleeping(chat_key)
 
 
-def _make_config_snapshot(schedule: ResolvedSchedule | None = None) -> Any:
+def _make_config_snapshot(
+    schedule: ResolvedSchedule | None = None,
+    cfg: Any = None,
+) -> Any:
     schedule = schedule or _global_schedule()
+    cfg = cfg if cfg is not None else config
     return create_config_snapshot(
         timezone=schedule.timezone,
         sleep_time=schedule.sleep_time,
         wake_time_start=schedule.wake_time_start,
         wake_time_end=schedule.wake_time_end,
-        wake_random_step_minutes=config.WAKE_RANDOM_STEP_MINUTES,
+        wake_random_step_minutes=cfg.WAKE_RANDOM_STEP_MINUTES,
         near_wake_ratio=0.15,  # deprecated in schema v2, kept for rollback
-        wake_confirm_window_seconds=config.WAKE_CONFIRM_WINDOW_SECONDS,
-        history_mode=config.HISTORY_MODE,
-        call_keywords=config.CALL_KEYWORDS,
-        fallback_persona_name=config.FALLBACK_PERSONA_NAME,
-        early_wake_idle_minutes=config.EARLY_WAKE_IDLE_MINUTES,
-        quality_min=config.QUALITY_MIN,
-        quality_max=config.QUALITY_MAX,
-        quality_jitter_points=config.QUALITY_JITTER_POINTS,
-        near_wake_minutes=config.NEAR_WAKE_MINUTES,
-        sleep_target_hours=config.SLEEP_TARGET_HOURS,
-        urgent_keywords=config.URGENT_KEYWORDS,
-        answer_scope=config.ANSWER_SCOPE,
-        max_offers_per_night=config.MAX_OFFERS_PER_NIGHT,
-        offer_cooldown_minutes=config.OFFER_COOLDOWN_MINUTES,
-        snooze_minutes=config.SNOOZE_MINUTES,
-        asleep_prompt=config.WAKE_PROMPT_ASLEEP,
-        near_wake_prompt=config.WAKE_PROMPT_NEAR_WAKE,
+        wake_confirm_window_seconds=cfg.WAKE_CONFIRM_WINDOW_SECONDS,
+        history_mode=cfg.HISTORY_MODE,
+        call_keywords=cfg.CALL_KEYWORDS,
+        fallback_persona_name=cfg.FALLBACK_PERSONA_NAME,
+        early_wake_idle_minutes=cfg.EARLY_WAKE_IDLE_MINUTES,
+        quality_min=cfg.QUALITY_MIN,
+        quality_max=cfg.QUALITY_MAX,
+        quality_jitter_points=cfg.QUALITY_JITTER_POINTS,
+        near_wake_minutes=cfg.NEAR_WAKE_MINUTES,
+        sleep_target_hours=cfg.SLEEP_TARGET_HOURS,
+        urgent_keywords=cfg.URGENT_KEYWORDS,
+        answer_scope=cfg.ANSWER_SCOPE,
+        max_offers_per_night=cfg.MAX_OFFERS_PER_NIGHT,
+        offer_cooldown_minutes=cfg.OFFER_COOLDOWN_MINUTES,
+        snooze_minutes=cfg.SNOOZE_MINUTES,
+        asleep_prompt=cfg.WAKE_PROMPT_ASLEEP,
+        near_wake_prompt=cfg.WAKE_PROMPT_NEAR_WAKE,
     )
 
 
@@ -733,6 +821,7 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage) -> MsgSignal | No
     now_utc = _utcnow()
     persona_name = await _get_persona_name(ctx)
     user_id = _get_user_id(message)
+    history_mode = (await _settings_for(chat_key)).config.HISTORY_MODE
 
     async def _process(state: ChatSleepState) -> ChatSleepState:
         nonlocal _result_signal, _result_action
@@ -773,7 +862,7 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage) -> MsgSignal | No
                 # with no memory of the night at all.
                 _result_signal = (
                     MsgSignal.BLOCK_ALL
-                    if config.HISTORY_MODE == "strict"
+                    if history_mode == "strict"
                     else MsgSignal.BLOCK_TRIGGER
                 )
 
@@ -794,7 +883,7 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage) -> MsgSignal | No
         try:
             await ctx.send_text(
                 _result_action.text,
-                record=_result_action.block_mode != "strict",
+                record=history_mode != "strict",
             )
         except Exception as exc:
             logger.error("Failed to send wake offer: %s", exc)
@@ -820,7 +909,8 @@ async def on_system_message(ctx: AgentCtx, message: str) -> MsgSignal | None:
     if current_source.get() == SourceType.INTERNAL_WAKE_NOTICE:
         return MsgSignal.CONTINUE
 
-    if config.NIGHT_TIMER_POLICY == "block":
+    cfg = (await _settings_for(chat_key)).config
+    if cfg.NIGHT_TIMER_POLICY == "block":
         # Recorded so the morning context is continuous, but no agent round.
         return MsgSignal.BLOCK_TRIGGER
 
@@ -841,7 +931,8 @@ async def _record_night_duty(chat_key: str) -> None:
     stretch is charged as lost rest; the sleep segment itself is left open,
     because a timer is not the bot getting out of bed.
     """
-    minutes = max(0, min(120, config.NIGHT_DUTY_ASSUMED_MINUTES))
+    cfg = (await _settings_for(chat_key)).config
+    minutes = max(0, min(120, cfg.NIGHT_DUTY_ASSUMED_MINUTES))
     if minutes == 0:
         return
 
@@ -1102,7 +1193,8 @@ async def _check_sleep_transition(
     across bedtime, the sleep segment starts at the real bedtime rather than at
     startup, so the morning report does not claim a five-minute night.
     """
-    schedule = await _resolve_schedule_for(chat_key)
+    settings = await _settings_for(chat_key)
+    schedule = settings.schedule
     try:
         tz = ZoneInfo(schedule.timezone)
     except Exception as exc:
@@ -1127,7 +1219,7 @@ async def _check_sleep_transition(
         logger.info("Staying up tonight for %s (skip requested)", chat_key)
         return
 
-    snap = _make_config_snapshot(schedule)
+    snap = _make_config_snapshot(schedule, settings.config)
     segment_open_at = now_utc
     if backdate_segment:
         try:
@@ -1178,8 +1270,10 @@ async def _settle_wake(
     was measured against a still-open segment worth zero seconds, the duration
     was rebuilt afterwards from the closed one.
     """
+    settings = await _settings_for(chat_key)
+    cfg = settings.config
     ctx: AgentCtx | None = None
-    persona_name = config.FALLBACK_PERSONA_NAME
+    persona_name = cfg.FALLBACK_PERSONA_NAME
     try:
         ctx = await AgentCtx.create_by_chat_key(chat_key)
         persona_name = await _get_persona_name(ctx)
@@ -1197,16 +1291,16 @@ async def _settle_wake(
 
     async def _wake(s: ChatSleepState) -> ChatSleepState:
         nonlocal notice_action
-        policy = config.WAKE_NOTICE_POLICY
+        policy = cfg.WAKE_NOTICE_POLICY
         if s.cycle is not None:
             late_seconds = (now_utc - s.cycle.planned_wake_at).total_seconds()
-            grace_seconds = max(0, config.WAKE_NOTICE_GRACE_MINUTES) * 60
+            grace_seconds = max(0, cfg.WAKE_NOTICE_GRACE_MINUTES) * 60
             if late_seconds > grace_seconds:
                 logger.info(
                     "Wake-up for %s is %.0f min late (grace %d min); settling silently",
                     chat_key,
                     late_seconds / 60,
-                    config.WAKE_NOTICE_GRACE_MINUTES,
+                    cfg.WAKE_NOTICE_GRACE_MINUTES,
                 )
                 policy = "never"
         new_state, action = settle_natural_wake(
@@ -1623,9 +1717,10 @@ if _COMMANDS_AVAILABLE:
         store = _get_store()
         await store.hydrate(chat_key)
         now_utc = _utcnow()
-        schedule = await _resolve_schedule_for(chat_key)
+        settings = await _settings_for(chat_key)
+        schedule = settings.schedule
         sleep_date = await _current_sleep_date(chat_key, now_utc)
-        snap = _make_config_snapshot(schedule)
+        snap = _make_config_snapshot(schedule, settings.config)
 
         async def _sleep(state: ChatSleepState) -> ChatSleepState:
             if state.status != SleepStatus.AWAKE:
@@ -1689,7 +1784,7 @@ if _COMMANDS_AVAILABLE:
         chat_key = context.chat_key
         overrides = _get_overrides()
         if scope == "preset":
-            preset_id = await _preset_id_for(chat_key)
+            preset_id = (await _channel_and_preset(chat_key))[1]
             if preset_id is None:
                 return CmdCtl.failed("取不到当前人设，无法按人设设置")
             current = await overrides.get_preset(preset_id) or ScheduleOverride()
@@ -1714,7 +1809,7 @@ if _COMMANDS_AVAILABLE:
         chat_key = context.chat_key
         overrides = _get_overrides()
         if scope == "preset":
-            preset_id = await _preset_id_for(chat_key)
+            preset_id = (await _channel_and_preset(chat_key))[1]
             if preset_id is None:
                 return CmdCtl.failed("取不到当前人设")
             await overrides.set_preset(preset_id, ScheduleOverride())

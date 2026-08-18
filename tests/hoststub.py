@@ -93,6 +93,17 @@ class FakePreset:
         self.name = name
 
 
+def instance_key_of(chat_key: str) -> str:
+    """Pull the instance segment out of a fork-style chat_key.
+
+    `onebot_v11-inst1-group_123` -> "inst1"; the single-instance form
+    `onebot_v11-group_123` -> "". Two accounts sitting in the same group differ
+    only here, which is what keeps their nights apart.
+    """
+    parts = chat_key.split("-")
+    return parts[1] if len(parts) >= 3 else ""
+
+
 class FakeChatChannel:
     def __init__(
         self,
@@ -100,10 +111,14 @@ class FakeChatChannel:
         preset_name: str = "小助手",
         is_active: bool = True,
         preset_id: Optional[int] = 1,
+        instance_key: Optional[str] = None,
     ) -> None:
         self.chat_key = chat_key
         self.is_active = is_active
         self.preset_id = preset_id
+        self.instance_key = (
+            instance_key if instance_key is not None else instance_key_of(chat_key)
+        )
         self._preset = FakePreset(preset_name)
 
     async def get_preset(self) -> FakePreset:
@@ -217,6 +232,13 @@ class NekroPlugin:
             self._config_instance = (cls or self._config_cls)()
         return self._config_instance
 
+    def get_global_config(self, cls=None):
+        return self.get_config(cls)
+
+    @property
+    def key(self) -> str:
+        return f"{self.init_kwargs.get('author', 'anon')}.{self.init_kwargs.get('module_name', 'plugin')}"
+
     def mount_on_user_message(self) -> Callable:
         def decorator(func):
             self.on_user_message = func
@@ -275,6 +297,32 @@ class NekroPlugin:
             return func
 
         return decorator
+
+
+# --- nekro_agent.services.plugin.scope (fork only) ------------------------------
+
+_INSTANCE_OVERRIDES: dict[tuple[str, str], dict[str, Any]] = {}
+
+
+def set_instance_config_override(plugin_key: str, instance_key: str, values: dict) -> None:
+    """Test helper: pretend an operator saved per-instance plugin config."""
+    _INSTANCE_OVERRIDES[(plugin_key, instance_key)] = dict(values)
+
+
+def clear_instance_config_overrides() -> None:
+    _INSTANCE_OVERRIDES.clear()
+
+
+def load_instance_config_overrides(plugin_key: str, instance_key: str) -> dict:
+    return dict(_INSTANCE_OVERRIDES.get((plugin_key, instance_key), {}))
+
+
+def resolve_scoped_config(plugin_key: str, config_cls, global_config, instance_key: str):
+    """Mirror of the fork: merge the instance override over the global config."""
+    overrides = load_instance_config_overrides(plugin_key, instance_key)
+    if not overrides:
+        return global_config
+    return config_cls.model_validate({**global_config.model_dump(), **overrides})
 
 
 # --- nekro_agent.services.command.* --------------------------------------------
@@ -400,6 +448,14 @@ def install_host_stub() -> None:
 
     services = _module("nekro_agent.services")
     services.__path__ = []  # type: ignore[attr-defined]
+    plugin_pkg = _module("nekro_agent.services.plugin")
+    plugin_pkg.__path__ = []  # type: ignore[attr-defined]
+    _module(
+        "nekro_agent.services.plugin.scope",
+        resolve_scoped_config=resolve_scoped_config,
+        load_instance_config_overrides=load_instance_config_overrides,
+    )
+
     command_pkg = _module("nekro_agent.services.command")
     command_pkg.__path__ = []  # type: ignore[attr-defined]
     _module("nekro_agent.services.command.base", CommandPermission=CommandPermission)

@@ -27,6 +27,7 @@ from nekro_auto_sleep.persistence import ScheduleOverrideStore, SleepStateStore
 from nekro_auto_sleep.quality import compute_quality
 from tests.hoststub import (
     AgentCtx,
+    clear_instance_config_overrides,
     ChatMessage,
     FakeChatChannel,
     MsgSignal,
@@ -72,7 +73,7 @@ def wired(monkeypatch, clock):
     monkeypatch.setattr(m, "_store", store)
     monkeypatch.setattr(m, "_overrides", ScheduleOverrideStore(backend))
     store.test_backend = backend  # write counter, for the quiet-tick assertions
-    m.invalidate_schedule_cache()
+    m.invalidate_settings_cache()
 
     saved = m.config.model_dump()
     m.config.TIMEZONE = "Asia/Shanghai"
@@ -94,7 +95,8 @@ def wired(monkeypatch, clock):
     yield m, store, ctx
 
     reset_ctx_factory()
-    m.invalidate_schedule_cache()
+    clear_instance_config_overrides()
+    m.invalidate_settings_cache()
     for k, v in saved.items():
         setattr(m.config, k, v)
 
@@ -751,7 +753,7 @@ class TestScheduleLayering:
         await plugin_mod._get_overrides().set_channel(
             CHAT_KEY, ScheduleOverride(timezone="Asia/Tokyo", sleep_time="01:00")
         )
-        plugin_mod.invalidate_schedule_cache(CHAT_KEY)
+        plugin_mod.invalidate_settings_cache(CHAT_KEY)
 
         schedule = await plugin_mod._resolve_schedule_for(CHAT_KEY)
         assert schedule.timezone == "Asia/Tokyo"
@@ -766,7 +768,7 @@ class TestScheduleLayering:
         overrides = plugin_mod._get_overrides()
         await overrides.set_preset(1, ScheduleOverride(sleep_time="22:00", timezone="Asia/Tokyo"))
         await overrides.set_channel(CHAT_KEY, ScheduleOverride(sleep_time="00:30"))
-        plugin_mod.invalidate_schedule_cache()
+        plugin_mod.invalidate_settings_cache()
 
         schedule = await plugin_mod._resolve_schedule_for(CHAT_KEY)
         assert schedule.sleep_time == "00:30"  # channel
@@ -785,7 +787,7 @@ class TestScheduleLayering:
         await plugin_mod._get_overrides().set_channel(
             CHAT_KEY, ScheduleOverride(sleep_time="01:00")
         )
-        plugin_mod.invalidate_schedule_cache(CHAT_KEY)
+        plugin_mod.invalidate_settings_cache(CHAT_KEY)
 
         # 23:30 local: past the global bedtime, before the one this channel set.
         await plugin_mod._check_sleep_transition(
@@ -811,7 +813,7 @@ class TestScheduleLayering:
         await plugin_mod._get_overrides().set_channel(
             CHAT_KEY, ScheduleOverride(timezone="Asia/Tokyo", sleep_time="01:00")
         )
-        plugin_mod.invalidate_schedule_cache(CHAT_KEY)
+        plugin_mod.invalidate_settings_cache(CHAT_KEY)
 
         await plugin_mod._check_sleep_transition(
             store, CHAT_KEY, BEDTIME + timedelta(hours=2, minutes=30)
@@ -829,7 +831,7 @@ class TestOperatorCommands:
         await plugin_mod._get_overrides().set_channel(
             CHAT_KEY, ScheduleOverride(timezone="Asia/Tokyo")
         )
-        plugin_mod.invalidate_schedule_cache(CHAT_KEY)
+        plugin_mod.invalidate_settings_cache(CHAT_KEY)
 
         response = await plugin_mod.plugin.commands["sleep.status"](_cmd_context())
 
@@ -1003,3 +1005,120 @@ class TestToolExposure:
         methods = await plugin_mod.plugin.collect_methods(ctx)
         assert len(methods) == 1
         assert methods[0] is plugin_mod.resume_sleep_tool
+
+
+# ---------------------------------------------------------------------------
+# Two instances sharing one group
+# ---------------------------------------------------------------------------
+
+INST_A = "onebot_v11-inst1-group_555000"
+INST_B = "onebot_v11-inst2-group_555000"
+
+
+class TestSharedGroupIsolation:
+    """Same群, two accounts. In the fork the instance segment is part of the
+    chat_key, so everything downstream is keyed apart — but only if nothing
+    quietly falls back to the global config."""
+
+    def test_the_wake_draw_is_independent_per_instance(self):
+        from datetime import date
+
+        from nekro_auto_sleep.schedule import pick_wake_time
+
+        start = datetime(2026, 8, 17, 22, 45, tzinfo=UTC)
+        end = datetime(2026, 8, 18, 0, 30, tzinfo=UTC)
+
+        differing = 0
+        for offset in range(14):
+            day = date(2026, 8, 1) + timedelta(days=offset)
+            a = pick_wake_time(INST_A, day, start, end, 1)
+            b = pick_wake_time(INST_B, day, start, end, 1)
+            if a != b:
+                differing += 1
+            # and each is stable for its own instance
+            assert a == pick_wake_time(INST_A, day, start, end, 1)
+
+        # Two independent draws over a 106-minute window; identical every night
+        # would mean the instance segment stopped reaching the seed.
+        assert differing >= 12, f"only {differing}/14 nights differed"
+
+    async def test_each_instance_keeps_its_own_night(self, wired):
+        plugin_mod, store, _ctx = wired
+        snap = plugin_mod._make_config_snapshot()
+
+        state_a = transition_to_sleep(ChatSleepState(chat_key=INST_A), BEDTIME, snap)
+        await store.save(state_a)
+        await store.hydrate(INST_B)
+
+        assert store.get_cached(INST_A).status == SleepStatus.ASLEEP
+        assert store.get_cached(INST_B).status == SleepStatus.AWAKE
+
+    async def test_instance_config_overrides_reach_the_background_loop(self, wired):
+        """The maintenance loop carries no inbound context.
+
+        `ScopedPluginConfig` resolves per-instance config from a contextvar the
+        adapter sets on the way in — a background task has none, so without an
+        explicit lookup both accounts would sleep on the global schedule no
+        matter what the operator configured.
+        """
+        from tests.hoststub import set_instance_config_override
+
+        plugin_mod, _store, _ctx = wired
+        set_instance_config_override(
+            plugin_mod.plugin.key, "inst2", {"SLEEP_TIME": "01:30"}
+        )
+        plugin_mod.invalidate_settings_cache()
+
+        a = await plugin_mod._settings_for(INST_A)
+        b = await plugin_mod._settings_for(INST_B)
+
+        assert a.instance_key == "inst1"
+        assert b.instance_key == "inst2"
+        assert a.schedule.sleep_time == "23:00"
+        assert b.schedule.sleep_time == "01:30"
+        assert b.schedule.sources["sleep_time"] == "instance"
+        # Everything it did not override still comes from the global config.
+        assert b.schedule.wake_time_start == "06:45"
+
+    async def test_the_two_instances_go_to_bed_at_their_own_times(self, wired):
+        from tests.hoststub import set_instance_config_override
+
+        plugin_mod, store, _ctx = wired
+        set_instance_config_override(
+            plugin_mod.plugin.key, "inst2", {"SLEEP_TIME": "01:30"}
+        )
+        plugin_mod.invalidate_settings_cache()
+        await store.hydrate(INST_A)
+        await store.hydrate(INST_B)
+
+        # 23:30 local: past inst1's bedtime, well before inst2's.
+        tick = BEDTIME + timedelta(minutes=30)
+        await plugin_mod._check_sleep_transition(store, INST_A, tick)
+        await plugin_mod._check_sleep_transition(store, INST_B, tick)
+
+        assert store.get_cached(INST_A).status == SleepStatus.ASLEEP
+        assert store.get_cached(INST_B).status == SleepStatus.AWAKE
+
+        # 02:00 local.
+        later = BEDTIME + timedelta(hours=3)
+        await plugin_mod._check_sleep_transition(store, INST_B, later)
+        assert store.get_cached(INST_B).status == SleepStatus.ASLEEP
+
+    async def test_the_cycle_records_the_instance_schedule(self, wired):
+        from tests.hoststub import set_instance_config_override
+
+        plugin_mod, store, _ctx = wired
+        set_instance_config_override(
+            plugin_mod.plugin.key, "inst2", {"SLEEP_TIME": "01:30", "QUALITY_MIN": 35}
+        )
+        plugin_mod.invalidate_settings_cache()
+        await store.hydrate(INST_B)
+
+        await plugin_mod._check_sleep_transition(
+            store, INST_B, BEDTIME + timedelta(hours=3)
+        )
+
+        cycle = store.get_cached(INST_B).cycle
+        assert cycle.config_snapshot.sleep_time == "01:30"
+        # Not just the schedule: the whole snapshot has to be the instance's.
+        assert cycle.config_snapshot.quality_min == 35

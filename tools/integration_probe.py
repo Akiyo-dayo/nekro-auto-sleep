@@ -231,6 +231,60 @@ async def main() -> int:
     await m._get_overrides().set_channel(TEST_CHAT_KEY, ScheduleOverride())
     m.invalidate_schedule_cache(TEST_CHAT_KEY)
 
+    # --- multi-instance ------------------------------------------------------
+    from nekro_agent.models.db_chat_channel import DBChatChannel
+
+    rows = await DBChatChannel.filter(is_active=True).values(
+        "chat_key", "channel_id", "instance_key", "adapter_key"
+    )
+    by_group: dict[tuple[str, str], set[str]] = {}
+    for row in rows:
+        by_group.setdefault((row["adapter_key"], row["channel_id"]), set()).add(
+            row["instance_key"] or ""
+        )
+    shared = {g: insts for g, insts in by_group.items() if len(insts) > 1}
+    check(
+        "instance_key is populated on real channels",
+        any(row["instance_key"] for row in rows),
+        f"{len(rows)} channels, {len(shared)} group(s) shared by more than one instance"
+        + (f": {list(shared)[:3]}" if shared else ""),
+    )
+
+    if shared:
+        (adapter_key, channel_id), instances = next(iter(shared.items()))
+        keys = [
+            row["chat_key"]
+            for row in rows
+            if row["adapter_key"] == adapter_key and row["channel_id"] == channel_id
+        ]
+        settings = [await m._settings_for(k) for k in keys]
+        planned = []
+        from datetime import date as _date
+
+        from nekro_auto_sleep.schedule import compute_cycle_boundaries, pick_wake_time
+
+        for key, st in zip(keys, settings):
+            tz = ZoneInfo(st.schedule.timezone)
+            _bed, ws, we = compute_cycle_boundaries(
+                _date(2026, 8, 18),
+                tz,
+                st.schedule.sleep_time,
+                st.schedule.wake_time_start,
+                st.schedule.wake_time_end,
+            )
+            planned.append(pick_wake_time(key, _date(2026, 8, 18), ws, we, 1))
+        check(
+            "a shared group wakes each instance separately",
+            len({s.instance_key for s in settings}) == len(keys)
+            and len(set(planned)) == len(planned),
+            " | ".join(
+                f"{k.split('-')[1]}: {p.astimezone(ZoneInfo(st.schedule.timezone)):%H:%M}"
+                for k, p, st in zip(keys, planned, settings)
+            ),
+        )
+    else:
+        print("[SKIP] no group on this install is shared by two instances")
+
     # --- commands -----------------------------------------------------------
     from nekro_agent.services.command.schemas import CommandExecutionContext
 
