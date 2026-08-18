@@ -1309,3 +1309,225 @@ class TestSchemaVersionStamp:
         reloaded = await store.load(CHAT_KEY)
 
         assert reloaded.schema_version == SCHEMA_VERSION
+
+
+# ---------------------------------------------------------------------------
+# Flavour: bedtime heads-up, groggy window, dream line, weekend hours
+# ---------------------------------------------------------------------------
+
+# 2026-08-17 is a Monday, so BEDTIME sits on a weekday night.
+FRIDAY_BEDTIME = datetime(2026, 8, 21, 15, 0, tzinfo=UTC)  # Fri 23:00 +08
+
+
+class TestBedtimeHeadsUp:
+    async def test_off_by_default(self, wired, clock):
+        plugin_mod, store, ctx = wired
+        await store.hydrate(CHAT_KEY)
+        clock.now = BEDTIME - timedelta(minutes=5)
+
+        await plugin_mod._maybe_bedtime_notice(store, CHAT_KEY, clock.now)
+        assert ctx.sent == []
+
+    async def _ready(self, plugin_mod, store, minutes=10, seen_ago_hours=1):
+        m.config.BEDTIME_NOTICE_MINUTES = minutes
+        await store.hydrate(CHAT_KEY)
+
+        async def _seen(state):
+            return state.model_copy(
+                update={"last_seen_at": BEDTIME - timedelta(hours=seen_ago_hours)}
+            )
+
+        await store.with_state(CHAT_KEY, _seen)
+
+    async def test_fires_once_inside_the_window(self, wired, clock):
+        plugin_mod, store, ctx = wired
+        await self._ready(plugin_mod, store)
+        moment = BEDTIME - timedelta(minutes=5)
+
+        await plugin_mod._maybe_bedtime_notice(store, CHAT_KEY, moment)
+        await plugin_mod._maybe_bedtime_notice(store, CHAT_KEY, moment + timedelta(minutes=1))
+
+        assert len(ctx.sent) == 1, ctx.sent
+        assert PERSONA in ctx.sent[0][0]
+        assert store.get_cached(CHAT_KEY).bedtime_notice_date == "2026-08-17"
+
+    async def test_silent_outside_the_window(self, wired):
+        plugin_mod, store, ctx = wired
+        await self._ready(plugin_mod, store, minutes=10)
+
+        await plugin_mod._maybe_bedtime_notice(
+            store, CHAT_KEY, BEDTIME - timedelta(minutes=30)
+        )
+        assert ctx.sent == []
+
+    async def test_skips_a_channel_nobody_has_spoken_in(self, wired):
+        plugin_mod, store, ctx = wired
+        await self._ready(plugin_mod, store, seen_ago_hours=72)
+
+        await plugin_mod._maybe_bedtime_notice(
+            store, CHAT_KEY, BEDTIME - timedelta(minutes=5)
+        )
+        assert ctx.sent == []
+
+    async def test_skips_a_night_the_operator_cancelled(self, wired):
+        plugin_mod, store, ctx = wired
+        await self._ready(plugin_mod, store)
+
+        async def _skip(state):
+            return state.model_copy(update={"skip_sleep_date": "2026-08-17"})
+
+        await store.with_state(CHAT_KEY, _skip)
+
+        await plugin_mod._maybe_bedtime_notice(
+            store, CHAT_KEY, BEDTIME - timedelta(minutes=5)
+        )
+        assert ctx.sent == []
+
+
+class TestGrogginess:
+    async def _just_woke(self, plugin_mod, store):
+        state = await _put_asleep(store)
+        await plugin_mod._settle_wake(store, CHAT_KEY, state.cycle.planned_wake_at)
+        return store.get_cached(CHAT_KEY)
+
+    async def test_the_prompt_says_it_just_got_up(self, wired):
+        plugin_mod, store, _ctx = wired
+        state = await self._just_woke(plugin_mod, store)
+
+        text = plugin_mod._render_sleep_context(
+            state, state.cycle.settled_at + timedelta(minutes=5), groggy_seconds=1800
+        )
+        assert "刚起床" in text
+        assert "迷糊" in text
+
+    async def test_it_wears_off(self, wired):
+        plugin_mod, store, _ctx = wired
+        state = await self._just_woke(plugin_mod, store)
+
+        text = plugin_mod._render_sleep_context(
+            state, state.cycle.settled_at + timedelta(hours=2), groggy_seconds=1800
+        )
+        assert text == ""
+
+    async def test_zero_disables_it(self, wired):
+        plugin_mod, store, _ctx = wired
+        state = await self._just_woke(plugin_mod, store)
+
+        text = plugin_mod._render_sleep_context(
+            state, state.cycle.settled_at + timedelta(minutes=1), groggy_seconds=0
+        )
+        assert text == ""
+
+    async def test_the_hook_passes_the_configured_window(self, wired, clock):
+        plugin_mod, store, ctx = wired
+        m.config.GROGGY_MINUTES = 30
+        state = await self._just_woke(plugin_mod, store)
+        clock.now = state.cycle.settled_at + timedelta(minutes=3)
+
+        text = await plugin_mod.plugin.prompt_injects["sleep_status"](ctx)
+        assert "刚起床" in text
+
+
+class TestDreamLine:
+    async def test_off_by_default(self, wired):
+        plugin_mod, store, ctx = wired
+        state = await _put_asleep(store)
+
+        await plugin_mod._settle_wake(store, CHAT_KEY, state.cycle.planned_wake_at)
+
+        assert any("已起床" in text for text, _ in ctx.sent)
+        assert ctx.system_pushes == []
+
+    async def test_asks_for_a_dream_when_enabled(self, wired):
+        plugin_mod, store, ctx = wired
+        m.config.DREAM_LINE = True
+        state = await _put_asleep(store)
+
+        await plugin_mod._settle_wake(store, CHAT_KEY, state.cycle.planned_wake_at)
+
+        assert len(ctx.system_pushes) == 1
+        prompt, trigger = ctx.system_pushes[0]
+        assert "梦" in prompt
+        assert trigger is True
+
+    async def test_no_dream_when_the_wake_up_was_not_announced(self, wired):
+        plugin_mod, store, ctx = wired
+        m.config.DREAM_LINE = True
+        m.config.WAKE_NOTICE_POLICY = "never"
+        state = await _put_asleep(store)
+
+        await plugin_mod._settle_wake(store, CHAT_KEY, state.cycle.planned_wake_at)
+
+        assert ctx.sent == []
+        assert ctx.system_pushes == []
+
+
+class TestWeekendHours:
+    async def _weekend(self, plugin_mod, store):
+        m.config.WEEKEND_DAYS = "4,5"
+        m.config.WEEKEND_SLEEP_TIME = "01:00"
+        plugin_mod.invalidate_settings_cache()
+        await store.hydrate(CHAT_KEY)
+
+    async def test_a_weekday_night_is_untouched(self, wired):
+        plugin_mod, store, _ctx = wired
+        await self._weekend(plugin_mod, store)
+
+        # Monday 23:30 local.
+        await plugin_mod._check_sleep_transition(
+            store, CHAT_KEY, BEDTIME + timedelta(minutes=30)
+        )
+        assert store.get_cached(CHAT_KEY).status == SleepStatus.ASLEEP
+
+    async def test_friday_night_stays_up_past_the_weekday_bedtime(self, wired):
+        plugin_mod, store, _ctx = wired
+        await self._weekend(plugin_mod, store)
+
+        # Friday 23:30 local: past 23:00, before the weekend 01:00.
+        await plugin_mod._check_sleep_transition(
+            store, CHAT_KEY, FRIDAY_BEDTIME + timedelta(minutes=30)
+        )
+        assert store.get_cached(CHAT_KEY).status == SleepStatus.AWAKE
+
+    async def test_friday_night_turns_in_at_the_weekend_hour(self, wired):
+        plugin_mod, store, _ctx = wired
+        await self._weekend(plugin_mod, store)
+
+        # Saturday 01:30 local.
+        await plugin_mod._check_sleep_transition(
+            store, CHAT_KEY, FRIDAY_BEDTIME + timedelta(hours=2, minutes=30)
+        )
+        state = store.get_cached(CHAT_KEY)
+        assert state.status == SleepStatus.ASLEEP
+        assert state.cycle.config_snapshot.sleep_time == "01:00"
+
+    async def test_the_weekend_swap_needs_an_actual_override(self, wired):
+        plugin_mod, store, _ctx = wired
+        m.config.WEEKEND_DAYS = "4,5"
+        m.config.WEEKEND_SLEEP_TIME = ""
+        plugin_mod.invalidate_settings_cache()
+        await store.hydrate(CHAT_KEY)
+
+        await plugin_mod._check_sleep_transition(
+            store, CHAT_KEY, FRIDAY_BEDTIME + timedelta(minutes=30)
+        )
+        assert store.get_cached(CHAT_KEY).status == SleepStatus.ASLEEP
+
+
+class TestWeekdayParsing:
+    def test_parses_and_clamps(self):
+        from nekro_auto_sleep.schedule import parse_weekday_list
+
+        assert parse_weekday_list("4,5") == {4, 5}
+        assert parse_weekday_list("") == set()
+        assert parse_weekday_list("0, 6 ,9,abc") == {0, 6}
+
+    def test_keyed_on_the_evening(self):
+        from datetime import date
+
+        from nekro_auto_sleep.schedule import is_weekend_night
+
+        assert is_weekend_night(date(2026, 8, 21), {4, 5}) is True  # Friday
+        assert is_weekend_night(date(2026, 8, 22), {4, 5}) is True  # Saturday
+        assert is_weekend_night(date(2026, 8, 23), {4, 5}) is False  # Sunday night
+        assert is_weekend_night(date(2026, 8, 17), {4, 5}) is False  # Monday

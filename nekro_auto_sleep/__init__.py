@@ -74,6 +74,9 @@ from .schedule import (
     compute_cycle_boundaries,
     create_config_snapshot,
     find_sleep_date_for_now,
+    is_weekend_night,
+    next_sleep_at,
+    parse_weekday_list,
     resolve_schedule,
 )
 
@@ -359,6 +362,117 @@ class SleepConfig(ConfigBase):
             i18n_description=i18n.i18n_text(
                 zh_CN="有人明确说不用叫醒后，这段时间内不再提示，0-480",
                 en_US="After somebody declines, stay silent for this long, 0-480",
+            ),
+        ).model_dump(),
+    )
+    BEDTIME_NOTICE_MINUTES: int = Field(
+        default=0,
+        title="睡前预告提前量（分钟）",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(zh_CN="睡前预告提前量（分钟）", en_US="Bedtime Heads-up (min)"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="入睡前这么多分钟先说一句「有点困了」，0 表示不预告，0-120",
+                en_US="Say something sleepy this many minutes before bedtime; 0 disables it, 0-120",
+            ),
+        ).model_dump(),
+    )
+    BEDTIME_NOTICE_TEMPLATE: str = Field(
+        default="【{persona}有点困了，准备去睡了…】",
+        title="睡前预告文案",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(zh_CN="睡前预告文案", en_US="Bedtime Heads-up Text"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="{persona} 会替换为人设名。这条不经 LLM",
+                en_US="{persona} is replaced with the preset name; never goes through the LLM",
+            ),
+        ).model_dump(),
+    )
+    BEDTIME_NOTICE_QUIET_HOURS: int = Field(
+        default=24,
+        title="睡前预告静默门槛（小时）",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(zh_CN="睡前预告静默门槛（小时）", en_US="Bedtime Heads-up Quiet Threshold (h)"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="距上一条用户消息超过这么久的频道不预告，免得对着没人的群自言自语，1-720",
+                en_US="Skip channels with no user message for this long, so it does not talk to an empty room, 1-720",
+            ),
+        ).model_dump(),
+    )
+    GROGGY_MINUTES: int = Field(
+        default=30,
+        title="赖床时长（分钟）",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(zh_CN="赖床时长（分钟）", en_US="Groggy Window (min)"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="自然醒之后这段时间里，提示词会告诉 Bot 它刚起床、还迷糊着，0 表示关闭，0-240",
+                en_US="For this long after waking up the prompt tells the bot it is still half asleep; 0 disables it, 0-240",
+            ),
+        ).model_dump(),
+    )
+    DREAM_LINE: bool = Field(
+        default=False,
+        title="起床后说梦话",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(zh_CN="起床后说梦话", en_US="Dream Line"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="自然醒播报之后，再让 LLM 顺口说一句昨晚梦到了什么。**会多跑一轮 LLM**，默认关闭",
+                en_US="After the wake-up report, let the LLM add a line about last night's dream. Costs one extra LLM round; off by default",
+            ),
+        ).model_dump(),
+    )
+    DREAM_PROMPT: str = Field(
+        default="你刚刚自然醒来。可以顺口提一句昨晚梦到了什么，一句话就好，不要长篇大论，也不用解释自己在做梦。",
+        title="梦话提示词",
+        json_schema_extra=ExtraField(
+            is_textarea=True,
+            i18n_title=i18n.i18n_text(zh_CN="梦话提示词", en_US="Dream Prompt"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="开启说梦话后注入给 LLM 的系统提示",
+                en_US="System prompt used when the dream line is enabled",
+            ),
+        ).model_dump(),
+    )
+    WEEKEND_DAYS: str = Field(
+        default="",
+        title="周末作息适用星期",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(zh_CN="周末作息适用星期", en_US="Weekend Nights"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="以**就寝当天**计，0=周一…6=周日；填 4,5 表示周五、周六晚上用周末作息。留空表示不区分",
+                en_US="By the evening the night starts on; 0=Monday…6=Sunday. 4,5 means Friday and Saturday nights. Empty disables it",
+            ),
+        ).model_dump(),
+    )
+    WEEKEND_SLEEP_TIME: str = Field(
+        default="",
+        title="周末入睡时间",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(zh_CN="周末入睡时间", en_US="Weekend Bedtime"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="留空则沿用平日的入睡时间，格式 HH:MM",
+                en_US="Empty falls back to the weekday bedtime, format HH:MM",
+            ),
+        ).model_dump(),
+    )
+    WEEKEND_WAKE_TIME_START: str = Field(
+        default="",
+        title="周末起床范围（起始）",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(zh_CN="周末起床范围（起始）", en_US="Weekend Wake Range Start"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="留空则沿用平日，格式 HH:MM",
+                en_US="Empty falls back to the weekday value, format HH:MM",
+            ),
+        ).model_dump(),
+    )
+    WEEKEND_WAKE_TIME_END: str = Field(
+        default="",
+        title="周末起床范围（结束）",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(zh_CN="周末起床范围（结束）", en_US="Weekend Wake Range End"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="留空则沿用平日，格式 HH:MM",
+                en_US="Empty falls back to the weekday value, format HH:MM",
             ),
         ).model_dump(),
     )
@@ -780,6 +894,34 @@ async def _resolve_schedule_for(chat_key: str) -> ResolvedSchedule:
     return (await _settings_for(chat_key)).schedule
 
 
+def _weekend_variant(schedule: ResolvedSchedule, cfg: Any) -> ResolvedSchedule | None:
+    """The same schedule with the weekend hours swapped in, or None if unset."""
+    overrides = {
+        "sleep_time": (cfg.WEEKEND_SLEEP_TIME or "").strip(),
+        "wake_time_start": (cfg.WEEKEND_WAKE_TIME_START or "").strip(),
+        "wake_time_end": (cfg.WEEKEND_WAKE_TIME_END or "").strip(),
+    }
+    applied = {field: value for field, value in overrides.items() if value}
+    if not applied:
+        return None
+
+    sources = dict(schedule.sources)
+    sources.update(dict.fromkeys(applied, "weekend"))
+    return schedule.model_copy(update={**applied, "sources": sources})
+
+
+def _schedule_for_night(
+    schedule: ResolvedSchedule,
+    cfg: Any,
+    sleep_date,
+) -> ResolvedSchedule:
+    """Swap in the weekend hours when this night starts on a weekend evening."""
+    weekend_days = parse_weekday_list(cfg.WEEKEND_DAYS or "")
+    if not weekend_days or not is_weekend_night(sleep_date, weekend_days):
+        return schedule
+    return _weekend_variant(schedule, cfg) or schedule
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -1099,6 +1241,7 @@ def _render_sleep_context(
     state: ChatSleepState,
     now_utc: datetime,
     persona_name: str = "",
+    groggy_seconds: float = 0.0,
 ) -> str:
     """Describe the current sleep situation for the prompt.
 
@@ -1150,6 +1293,16 @@ def _render_sleep_context(
             lines.insert(0, "你刚刚被叫醒，还带着睡意。")
         return "\n".join(lines)
 
+    if state.status == SleepStatus.AWAKE and cycle.settled_at is not None:
+        awake_for = (now_utc - cycle.settled_at).total_seconds()
+        if 0 <= awake_for <= groggy_seconds:
+            return (
+                f"[睡眠状态] 你 {_fmt_local(cycle.settled_at, tz_name)} 刚起床，"
+                f"到现在才 {int(awake_for // 60)} 分钟，还有点迷糊、没完全清醒，"
+                "说话可以慢半拍，不用刻意提这件事。"
+            )
+        return ""
+
     if state.status == SleepStatus.ASLEEP:
         return (
             f"[睡眠状态] 你从 {bedtime} 起一直在睡觉，计划 {planned} 自然醒。"
@@ -1176,7 +1329,9 @@ async def inject_sleep_status(ctx: AgentCtx) -> str:
     if state.status == SleepStatus.AWAKE_EARLY and state.wake_decision_pending:
         persona_name = await _get_persona_name(ctx)
 
-    return _render_sleep_context(state, _utcnow(), persona_name)
+    cfg = (await _settings_for(ctx.chat_key)).config
+    groggy_seconds = max(0, min(240, cfg.GROGGY_MINUTES)) * 60
+    return _render_sleep_context(state, _utcnow(), persona_name, groggy_seconds)
 
 
 # ---------------------------------------------------------------------------
@@ -1287,6 +1442,7 @@ async def _maintain_chat(
         return
 
     if state.status == SleepStatus.AWAKE:
+        await _maybe_bedtime_notice(store, chat_key, now_utc)
         await _check_sleep_transition(store, chat_key, now_utc)
 
     elif state.status == SleepStatus.ASLEEP:
@@ -1304,6 +1460,72 @@ async def _maintain_chat(
                 async def _idle_back(s: ChatSleepState) -> ChatSleepState:
                     return handle_idle_sleep_back(s, now_utc)
                 await store.with_state(chat_key, _idle_back)
+
+
+async def _maybe_bedtime_notice(
+    store: SleepStateStore,
+    chat_key: str,
+    now_utc: datetime,
+) -> None:
+    """Say something sleepy shortly before turning in.
+
+    Quiet channels are skipped: a nightly "getting sleepy" into a room nobody
+    has spoken in for days is just noise.
+    """
+    settings = await _settings_for(chat_key)
+    cfg = settings.config
+    lead_minutes = max(0, min(120, cfg.BEDTIME_NOTICE_MINUTES))
+    if lead_minutes == 0:
+        return
+
+    state = store.get_cached(chat_key)
+    if state is None or state.status != SleepStatus.AWAKE:
+        return
+
+    try:
+        tz = ZoneInfo(settings.schedule.timezone)
+    except Exception:
+        return
+
+    bedtime = next_sleep_at(now_utc, tz, settings.schedule.sleep_time)
+    lead = (bedtime - now_utc).total_seconds()
+    if lead <= 0 or lead > lead_minutes * 60:
+        return
+
+    bedtime_date = bedtime.astimezone(tz).date().isoformat()
+    if state.bedtime_notice_date == bedtime_date:
+        return
+    if state.skip_sleep_date == bedtime_date:
+        return
+
+    quiet_hours = max(1, min(720, cfg.BEDTIME_NOTICE_QUIET_HOURS))
+    last_seen = state.last_seen_at
+    if last_seen is None or (now_utc - last_seen) > timedelta(hours=quiet_hours):
+        logger.debug("Skipping bedtime notice for %s (quiet channel)", chat_key)
+        return
+
+    async def _mark(s: ChatSleepState) -> ChatSleepState:
+        return s.model_copy(update={"bedtime_notice_date": bedtime_date})
+
+    await store.with_state(chat_key, _mark)
+
+    try:
+        ctx = await AgentCtx.create_by_chat_key(chat_key)
+        persona_name = await _get_persona_name(ctx)
+        text = cfg.BEDTIME_NOTICE_TEMPLATE.format(persona=persona_name)
+    except Exception as exc:
+        logger.warning("Cannot build bedtime notice for %s: %s", chat_key, exc)
+        return
+
+    try:
+        token = current_source.set(SourceType.INTERNAL_WAKE_NOTICE)
+        try:
+            await ctx.send_text(text, record=cfg.HISTORY_MODE != "strict")
+        finally:
+            current_source.reset(token)
+        logger.info("%s 睡前预告：%s", chat_key, text)
+    except Exception as exc:
+        logger.error("Failed to send bedtime notice for %s: %s", chat_key, exc)
 
 
 async def _check_sleep_transition(
@@ -1341,6 +1563,23 @@ async def _check_sleep_transition(
     )
     if sleep_date is None:
         return
+
+    # A weekend night runs on different hours, and those hours decide which
+    # night `now` even belongs to — so the candidate date from the weekday
+    # schedule is re-checked against the weekend one. Exactly one re-pass: the
+    # weekend variant never reclassifies a date back to weekday.
+    weekend = _schedule_for_night(schedule, settings.config, sleep_date)
+    if weekend is not schedule:
+        schedule = weekend
+        sleep_date = find_sleep_date_for_now(
+            now_utc,
+            tz,
+            schedule.sleep_time,
+            schedule.wake_time_start,
+            schedule.wake_time_end,
+        )
+        if sleep_date is None:
+            return
 
     sleep_date_iso = sleep_date.isoformat()
     cached = store.get_cached(chat_key)
@@ -1480,6 +1719,15 @@ async def _settle_wake(
 
         await store.with_state(chat_key, _mark_sent)
         logger.info("%s 已起床并播报：%s", chat_key, notice_action.text)
+
+        if cfg.DREAM_LINE:
+            # Costs one extra LLM round per waking channel, which is why it is
+            # off by default.
+            try:
+                await ctx.push_system(cfg.DREAM_PROMPT, trigger_agent=True)
+                logger.info("%s 已请求梦话", chat_key)
+            except Exception as exc:
+                logger.warning("Cannot request the dream line for %s: %s", chat_key, exc)
     except Exception as exc:
         logger.error("Failed to send wake notice for %s: %s", chat_key, exc)
 

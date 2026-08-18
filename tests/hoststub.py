@@ -159,6 +159,7 @@ class AgentCtx:
         self.from_chat_key = chat_key
         self._db_chat_channel = db_chat_channel
         self.sent: list[tuple[str, bool]] = []
+        self.system_pushes: list[tuple[str, bool]] = []
 
     @property
     def chat_key(self) -> str:
@@ -170,6 +171,9 @@ class AgentCtx:
 
     async def send_text(self, content: str, *, record: bool = True) -> None:
         self.sent.append((content, record))
+
+    async def push_system(self, message: str, trigger_agent: bool = False) -> None:
+        self.system_pushes.append((message, trigger_agent))
 
     @classmethod
     async def create_by_chat_key(cls, chat_key: str) -> "AgentCtx":

@@ -214,6 +214,32 @@ def resolve_schedule(
     return ResolvedSchedule(**values, sources=sources)
 
 
+def parse_weekday_list(raw: str | list[int]) -> set[int]:
+    """Parse "4,5" into {4, 5}. Monday is 0, Sunday is 6."""
+    if isinstance(raw, str):
+        parts = [p.strip() for p in raw.replace("\n", ",").split(",") if p.strip()]
+    else:
+        parts = [str(p) for p in raw]
+    days: set[int] = set()
+    for part in parts:
+        try:
+            value = int(part)
+        except ValueError:
+            continue
+        if 0 <= value <= 6:
+            days.add(value)
+    return days
+
+
+def is_weekend_night(sleep_date: date, weekend_days: set[int]) -> bool:
+    """Whether the night starting on `sleep_date` uses the weekend hours.
+
+    Keyed on the evening, not the morning: Friday night is the one people stay
+    up for, so the default set is {4, 5} — Friday and Saturday.
+    """
+    return sleep_date.weekday() in weekend_days
+
+
 def parse_keyword_list(raw: str | list[str]) -> list[str]:
     """Split a comma/newline separated keyword field into a clean list."""
     if isinstance(raw, str):

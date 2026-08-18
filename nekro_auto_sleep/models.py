@@ -211,6 +211,8 @@ class ChatSleepState(BaseModel):
     snooze_until: datetime | None = None
     # Local sleep_date the operator asked the bot to stay up through.
     skip_sleep_date: str | None = None
+    # Local date of the bedtime the "getting sleepy" heads-up was sent for.
+    bedtime_notice_date: str | None = None
     idle_sleep_deadline: datetime | None = None
     cycle: SleepCycle | None = None
     # Wake provenance, used to render the sleep-status prompt injection for the
