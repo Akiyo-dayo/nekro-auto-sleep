@@ -548,6 +548,15 @@ _installed_wraps: list[tuple[Any, str]] = []
 _SETTINGS_CACHE_TTL_SECONDS = 300.0
 _settings_cache: dict[str, tuple[float, "ChatSettings"]] = {}
 
+# Accounts belonging to this deployment's own bots. Two instances sharing a
+# group see each other's messages as ordinary inbound traffic, and the wake-up
+# prompt contains the persona name — which is a wake keyword. Left unguarded,
+# one bot's 【X已经睡了 要叫醒X吗？】 is a valid call to the other, and they
+# answer each other until the nightly cap runs out. Observed live on the test
+# box the first night v2 ran.
+_OWN_ACCOUNTS_TTL_SECONDS = 300.0
+_own_accounts_cache: tuple[float, frozenset[str]] | None = None
+
 
 @dataclass(frozen=True)
 class ChatSettings:
@@ -621,6 +630,43 @@ def _global_schedule() -> ResolvedSchedule:
         wake_time_start=config.WAKE_TIME_START,
         wake_time_end=config.WAKE_TIME_END,
     )
+
+
+async def _own_account_ids() -> frozenset[str]:
+    """Platform account ids of every adapter instance in this deployment."""
+    global _own_accounts_cache
+
+    cached = _own_accounts_cache
+    if cached is not None and (time.monotonic() - cached[0]) < _OWN_ACCOUNTS_TTL_SECONDS:
+        return cached[1]
+
+    accounts: set[str] = set()
+    try:
+        from nekro_agent.models.db_adapter_instance import DBAdapterInstance
+
+        rows = await DBAdapterInstance.all().values("provider_account_id")
+        accounts = {
+            str(row["provider_account_id"]) for row in rows if row.get("provider_account_id")
+        }
+    except Exception as exc:
+        logger.debug("Cannot enumerate own bot accounts: %s", exc)
+
+    result = frozenset(accounts)
+    _own_accounts_cache = (time.monotonic(), result)
+    return result
+
+
+def invalidate_own_accounts_cache() -> None:
+    global _own_accounts_cache
+    _own_accounts_cache = None
+
+
+async def _is_own_bot(message: ChatMessage) -> bool:
+    """Whether this message came from one of our own bot accounts."""
+    sender = _get_user_id(message)
+    if not sender or sender == "unknown":
+        return False
+    return sender in await _own_account_ids()
 
 
 async def _channel_and_preset(chat_key: str) -> tuple[object, object]:
@@ -892,10 +938,25 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage) -> MsgSignal | No
     persona_name = await _get_persona_name(ctx)
     user_id = _get_user_id(message)
     history_mode = (await _settings_for(chat_key)).config.HISTORY_MODE
+    from_own_bot = await _is_own_bot(message)
 
     async def _process(state: ChatSleepState) -> ChatSleepState:
         nonlocal _result_signal, _result_action
         state.last_seen_at = now_utc
+
+        if from_own_bot:
+            # Another instance of ours talking in a shared group. Record it,
+            # but never let it call, answer, or keep the bot awake.
+            logger.debug("Ignoring own-bot message in %s", chat_key)
+            if state.status == SleepStatus.AWAKE:
+                _result_signal = MsgSignal.CONTINUE
+            else:
+                _result_signal = (
+                    MsgSignal.BLOCK_ALL
+                    if history_mode == "strict"
+                    else MsgSignal.BLOCK_TRIGGER
+                )
+            return state
 
         if state.status == SleepStatus.AWAKE:
             _result_signal = MsgSignal.CONTINUE
@@ -1566,6 +1627,7 @@ async def init() -> None:
     _store = SleepStateStore(plugin.store)
     _overrides = ScheduleOverrideStore(plugin.store)
     invalidate_schedule_cache()
+    invalidate_own_accounts_cache()
 
     if not _install_wraps():
         logger.error("Some runtime wraps failed to install; plugin may not fully function")

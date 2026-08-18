@@ -299,6 +299,27 @@ class NekroPlugin:
         return decorator
 
 
+# --- nekro_agent.models.db_adapter_instance -------------------------------------
+
+_OWN_ACCOUNTS: list[str] = []
+
+
+def set_own_bot_accounts(accounts) -> None:
+    """Test helper: declare which platform accounts are our own bots."""
+    _OWN_ACCOUNTS[:] = [str(a) for a in accounts]
+
+
+class _AdapterInstanceQuery:
+    async def values(self, *fields: str):
+        return [{"provider_account_id": a} for a in _OWN_ACCOUNTS]
+
+
+class DBAdapterInstance:
+    @classmethod
+    def all(cls) -> "_AdapterInstanceQuery":
+        return _AdapterInstanceQuery()
+
+
 # --- nekro_agent.services.plugin.scope (fork only) ------------------------------
 
 _INSTANCE_OVERRIDES: dict[tuple[str, str], dict[str, Any]] = {}
@@ -445,6 +466,7 @@ def install_host_stub() -> None:
     models = _module("nekro_agent.models")
     models.__path__ = []  # type: ignore[attr-defined]
     _module("nekro_agent.models.db_chat_channel", DBChatChannel=FakeChatChannel)
+    _module("nekro_agent.models.db_adapter_instance", DBAdapterInstance=DBAdapterInstance)
 
     services = _module("nekro_agent.services")
     services.__path__ = []  # type: ignore[attr-defined]

@@ -151,8 +151,16 @@ class SleepStateStore:
         return state
 
     async def save(self, state: ChatSleepState) -> None:
-        """Persist state to DB. Must be called within the chat_key's lock."""
+        """Persist state to DB. Must be called within the chat_key's lock.
+
+        Stamps the current schema version on the way out. Pydantic keeps
+        whatever version was in the payload it validated, so a row migrated
+        from v1 kept advertising v1 forever — the guard that refuses to load a
+        *newer* schema was reading a number that no longer described the row.
+        """
         chat_key = state.chat_key
+        if state.schema_version != SCHEMA_VERSION:
+            state = state.model_copy(update={"schema_version": SCHEMA_VERSION})
         raw = state.model_dump_json(by_alias=True)
         await self._backend.set(chat_key=chat_key, store_key=DATA_KEY, value=raw)
         self._cache[chat_key] = state

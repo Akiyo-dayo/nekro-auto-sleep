@@ -28,6 +28,7 @@ from nekro_auto_sleep.quality import compute_quality
 from tests.hoststub import (
     AgentCtx,
     clear_instance_config_overrides,
+    set_own_bot_accounts,
     ChatMessage,
     FakeChatChannel,
     MsgSignal,
@@ -96,6 +97,8 @@ def wired(monkeypatch, clock):
 
     reset_ctx_factory()
     clear_instance_config_overrides()
+    set_own_bot_accounts([])
+    m.invalidate_own_accounts_cache()
     m.invalidate_settings_cache()
     for k, v in saved.items():
         setattr(m.config, k, v)
@@ -1194,3 +1197,115 @@ class TestSharedGroupIsolation:
         assert cycle.config_snapshot.sleep_time == "01:30"
         # Not just the schedule: the whole snapshot has to be the instance's.
         assert cycle.config_snapshot.quality_min == 35
+
+
+# ---------------------------------------------------------------------------
+# Two of our own bots in one group
+# ---------------------------------------------------------------------------
+
+
+class TestOwnBotMessages:
+    """Observed live: both instances in a shared group are asleep, one sends
+    【X已经睡了 要叫醒X吗？】, and that text contains the persona name — which is
+    a wake keyword. Unguarded, each bot reads the other's prompt as somebody
+    calling it and they answer each other until the nightly cap runs out."""
+
+    OWN = "1284126956"
+    HUMAN = "430185439"
+
+    def _msg(self, sender: str, text: str):
+        return ChatMessage(content=text, chat_key=CHAT_KEY, platform_userid=sender)
+
+    async def test_a_sibling_bot_prompt_does_not_start_the_protocol(self, wired):
+        from tests.hoststub import set_own_bot_accounts
+
+        plugin_mod, store, ctx = wired
+        set_own_bot_accounts([self.OWN])
+        plugin_mod.invalidate_own_accounts_cache()
+        await _put_asleep(store)
+
+        signal = await plugin_mod.plugin.on_user_message(
+            ctx, self._msg(self.OWN, f"【{PERSONA}已经睡了 要叫醒{PERSONA}吗？】")
+        )
+
+        assert signal == MsgSignal.BLOCK_TRIGGER
+        assert ctx.sent == [], "answering a sibling bot is how the loop starts"
+        state = store.get_cached(CHAT_KEY)
+        assert state.pending_offer is None
+        assert state.offers_sent_tonight == 0
+        assert state.cycle.wake_attempts == []
+
+    async def test_a_sibling_bot_cannot_answer_a_live_question(self, wired):
+        from tests.hoststub import set_own_bot_accounts
+
+        plugin_mod, store, ctx = wired
+        set_own_bot_accounts([self.OWN])
+        plugin_mod.invalidate_own_accounts_cache()
+        await _put_asleep(store)
+
+        await plugin_mod.plugin.on_user_message(ctx, self._msg(self.HUMAN, "醒醒"))
+        ctx.sent.clear()
+
+        signal = await plugin_mod.plugin.on_user_message(ctx, self._msg(self.OWN, "要"))
+
+        assert signal == MsgSignal.BLOCK_TRIGGER
+        assert store.get_cached(CHAT_KEY).status == SleepStatus.ASLEEP
+
+    async def test_a_sibling_bot_does_not_keep_it_awake(self, wired):
+        from tests.hoststub import set_own_bot_accounts
+
+        plugin_mod, store, ctx = wired
+        set_own_bot_accounts([self.OWN])
+        plugin_mod.invalidate_own_accounts_cache()
+        await _put_asleep(store)
+        await plugin_mod.plugin.on_user_message(ctx, self._msg(self.HUMAN, "醒醒"))
+        await plugin_mod.plugin.on_user_message(ctx, self._msg(self.HUMAN, "要"))
+        deadline = store.get_cached(CHAT_KEY).idle_sleep_deadline
+
+        await plugin_mod.plugin.on_user_message(ctx, self._msg(self.OWN, "在群里刷屏"))
+
+        assert store.get_cached(CHAT_KEY).idle_sleep_deadline == deadline
+
+    async def test_humans_are_unaffected(self, wired):
+        from tests.hoststub import set_own_bot_accounts
+
+        plugin_mod, store, ctx = wired
+        set_own_bot_accounts([self.OWN])
+        plugin_mod.invalidate_own_accounts_cache()
+        await _put_asleep(store)
+
+        signal = await plugin_mod.plugin.on_user_message(ctx, self._msg(self.HUMAN, "醒醒"))
+
+        assert signal == MsgSignal.BLOCK_TRIGGER
+        assert len(ctx.sent) == 1
+        assert store.get_cached(CHAT_KEY).offers_sent_tonight == 1
+
+    async def test_daytime_traffic_passes_through_untouched(self, wired):
+        from tests.hoststub import set_own_bot_accounts
+
+        plugin_mod, store, ctx = wired
+        set_own_bot_accounts([self.OWN])
+        plugin_mod.invalidate_own_accounts_cache()
+        await store.save(ChatSleepState(chat_key=CHAT_KEY))
+
+        signal = await plugin_mod.plugin.on_user_message(ctx, self._msg(self.OWN, "白天说话"))
+        assert signal == MsgSignal.CONTINUE
+
+
+class TestSchemaVersionStamp:
+    async def test_a_migrated_row_is_written_back_at_the_current_version(self, wired):
+        """Pydantic keeps the version it validated, so a v1 row that had been
+        migrated kept advertising v1 forever and the newer-schema guard was
+        reading a number that no longer described the row."""
+        from nekro_auto_sleep.models import SCHEMA_VERSION
+
+        plugin_mod, store, _ctx = wired
+        legacy = ChatSleepState(chat_key=CHAT_KEY)
+        legacy = legacy.model_copy(update={"schema_version": 1})
+        assert legacy.schema_version == 1
+
+        await store.save(legacy)
+        store.invalidate_cache(CHAT_KEY)
+        reloaded = await store.load(CHAT_KEY)
+
+        assert reloaded.schema_version == SCHEMA_VERSION
