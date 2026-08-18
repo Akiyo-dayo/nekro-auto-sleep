@@ -679,6 +679,13 @@ _settings_cache: dict[str, tuple[float, "ChatSettings"]] = {}
 _OWN_ACCOUNTS_TTL_SECONDS = 300.0
 _own_accounts_cache: tuple[float, frozenset[str]] | None = None
 
+# 【persona已睡下】 is triggered by a tool call *inside* an agent round, but the
+# model's own reply is only sent when that round finishes — so sending it
+# straight from the tool put the bracket line above the goodnight it belongs
+# under. These wait for the round to end first.
+_ROUND_WAIT_SECONDS = 120.0
+_deferred_sends: set[asyncio.Task] = set()
+
 
 @dataclass(frozen=True)
 class ChatSettings:
@@ -1392,14 +1399,15 @@ async def resume_sleep(_ctx: AgentCtx) -> str:
         declined = state.wake_decision_pending
         state, action = handle_resume_sleep(state, now_utc, persona_name)
         if isinstance(action, ActionSendResumeSleep):
-            try:
-                # Recorded like the wake offer: the transcript should show the
-                # bot going back to bed, not jump straight to silence.
-                await _ctx.send_text(
-                    action.text, record=config.HISTORY_MODE != "strict"
-                )
-            except Exception as exc:
-                logger.error("Failed to send resume sleep message: %s", exc)
+            # Deferred, not sent here: this runs mid-round, and the model's own
+            # "我先去睡啦" only goes out when the round ends. Sending inline put
+            # 【persona已睡下】 above the line it is supposed to follow.
+            # Recorded like the wake offer, so the transcript stays coherent.
+            _defer_send(
+                chat_key,
+                action.text,
+                record=(await _settings_for(chat_key)).config.HISTORY_MODE != "strict",
+            )
         result_text = (
             "已确认对方并不需要你，继续睡；本轮不要再输出任何内容。"
             if declined
@@ -1502,6 +1510,52 @@ async def _maintain_chat(
                 new_state = await store.with_state(chat_key, _idle_back)
                 if new_state.status == SleepStatus.ASLEEP:
                     logger.info("%s 没人再找，静默睡回去", chat_key)
+
+
+async def _wait_for_current_round(chat_key: str) -> None:
+    """Block until the agent round running for this chat has finished."""
+    try:
+        from nekro_agent.services.message_service import message_service as ms
+
+        task = getattr(ms, "running_tasks", {}).get(chat_key)
+    except Exception as exc:
+        logger.debug("Cannot look up the running round for %s: %s", chat_key, exc)
+        task = None
+
+    if task is None or task.done():
+        # No handle on the round (or it is already over): a short pause still
+        # keeps the ordering right in practice.
+        await asyncio.sleep(0.5)
+        return
+
+    try:
+        await asyncio.wait({task}, timeout=_ROUND_WAIT_SECONDS)
+    except Exception as exc:
+        logger.debug("Waiting for the round of %s failed: %s", chat_key, exc)
+
+
+async def _send_after_current_round(chat_key: str, text: str, record: bool) -> None:
+    """Say something once the model has finished speaking."""
+    try:
+        await _wait_for_current_round(chat_key)
+        ctx = await AgentCtx.create_by_chat_key(chat_key)
+        token = current_source.set(SourceType.INTERNAL_WAKE_NOTICE)
+        try:
+            await ctx.send_text(text, record=record)
+        finally:
+            current_source.reset(token)
+        logger.info("%s 已睡下（跟在本轮回复之后）", chat_key)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error("Failed to send the sleep notice for %s: %s", chat_key, exc)
+
+
+def _defer_send(chat_key: str, text: str, record: bool) -> asyncio.Task:
+    task = asyncio.create_task(_send_after_current_round(chat_key, text, record))
+    _deferred_sends.add(task)
+    task.add_done_callback(_deferred_sends.discard)
+    return task
 
 
 async def _last_message_at(chat_key: str) -> datetime | None:
@@ -1982,6 +2036,10 @@ async def cleanup() -> None:
         except asyncio.CancelledError:
             pass
         _maintenance_task = None
+
+    for task in list(_deferred_sends):
+        task.cancel()
+    _deferred_sends.clear()
 
     _uninstall_wraps()
 

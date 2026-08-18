@@ -462,6 +462,9 @@ class FakeMessageService:
 
     def __init__(self) -> None:
         self.scheduled: list[str] = []
+        # The host keeps the in-flight agent round per chat here; the plugin
+        # waits on it so 【已睡下】 lands after the model has spoken.
+        self.running_tasks: dict[str, Any] = {}
 
     async def schedule_agent_task(self, chat_key: str = "", **kwargs: Any) -> str:
         self.scheduled.append(chat_key)

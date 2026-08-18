@@ -113,6 +113,14 @@ async def _put_asleep(store: SleepStateStore, now=BEDTIME) -> ChatSleepState:
     return state
 
 
+async def _drain_deferred(plugin_mod) -> None:
+    """Wait for the plugin's deferred sends (the 【已睡下】 that follows a round)."""
+    import asyncio
+
+    pending = list(plugin_mod._deferred_sends)
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
 def _parse_notice(text: str) -> tuple[int, float]:
     """Pull (quality percent, duration in hours) out of a wake-up report."""
     quality = int(re.search(r"睡眠质量 (\d+)%", text).group(1))
@@ -506,6 +514,7 @@ class TestWakeProtocolWiring:
         ctx.sent.clear()
 
         await plugin_mod.resume_sleep(ctx)
+        await _drain_deferred(plugin_mod)
 
         assert len(ctx.sent) == 1
         assert "已睡下" in ctx.sent[0][0]
@@ -1798,3 +1807,95 @@ class TestToolNameReachesTheModel:
         doc = (m.resume_sleep.__doc__ or "").strip()
         assert doc
         assert "唯一" in doc, "the docstring must say that saying it is not doing it"
+
+
+class TestSleepNoticeOrdering:
+    """【persona已睡下】 must land *under* the goodnight, not above it.
+
+    `resume_sleep` is a tool call made in the middle of an agent round, but the
+    model's own reply is only sent once that round finishes. Sending the bracket
+    line straight from the tool put it first — seen in the live chat as
+    【千咲已睡下】 followed by "我先接着去睡啦".
+    """
+
+    async def _awake_and_chatting(self, plugin_mod, store, ctx):
+        await _put_asleep(store)
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="醒醒", chat_key=CHAT_KEY)
+        )
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="要", chat_key=CHAT_KEY)
+        )
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="帮我查个东西", chat_key=CHAT_KEY)
+        )
+        ctx.sent.clear()
+
+    async def test_it_waits_for_the_round_to_finish(self, wired):
+        import asyncio
+
+        from nekro_agent.services.message_service import message_service as ms
+
+        plugin_mod, store, ctx = wired
+        await self._awake_and_chatting(plugin_mod, store, ctx)
+
+        finished = asyncio.Event()
+        round_task = asyncio.create_task(finished.wait())
+        ms.running_tasks[CHAT_KEY] = round_task
+        try:
+            await plugin_mod.resume_sleep(ctx)
+
+            # The round is still going: nothing may have been said yet.
+            await asyncio.sleep(0)
+            assert ctx.sent == [], "the notice jumped ahead of the reply"
+
+            # The model finishes and its reply goes out.
+            finished.set()
+            await round_task
+            ctx.sent.append(("我先接着去睡啦", True))
+
+            await _drain_deferred(plugin_mod)
+        finally:
+            ms.running_tasks.pop(CHAT_KEY, None)
+
+        assert [text for text, _ in ctx.sent] == ["我先接着去睡啦", f"【{PERSONA}已睡下】"]
+
+    async def test_the_declined_path_still_says_nothing_at_all(self, wired):
+        plugin_mod, store, ctx = wired
+        await _put_asleep(store)
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="醒醒", chat_key=CHAT_KEY)
+        )
+        await plugin_mod.plugin.on_user_message(
+            ctx, ChatMessage(content="算了你睡吧", chat_key=CHAT_KEY)
+        )
+        ctx.sent.clear()
+
+        await plugin_mod.resume_sleep(ctx)
+        await _drain_deferred(plugin_mod)
+
+        assert ctx.sent == []
+
+    async def test_cleanup_cancels_anything_still_pending(self, wired):
+        import asyncio
+
+        from nekro_agent.services.message_service import message_service as ms
+
+        plugin_mod, store, ctx = wired
+        await self._awake_and_chatting(plugin_mod, store, ctx)
+
+        never = asyncio.Event()
+        round_task = asyncio.create_task(never.wait())
+        ms.running_tasks[CHAT_KEY] = round_task
+        try:
+            await plugin_mod.resume_sleep(ctx)
+            assert plugin_mod._deferred_sends
+
+            for task in list(plugin_mod._deferred_sends):
+                task.cancel()
+            plugin_mod._deferred_sends.clear()
+        finally:
+            round_task.cancel()
+            ms.running_tasks.pop(CHAT_KEY, None)
+
+        assert ctx.sent == []

@@ -312,3 +312,25 @@ def test_the_prompt_names_sandbox_methods_by_function_name():
 
     dumped = ast.dump(node)
     assert "__name__" in dumped, "sandbox methods are no longer rendered by function name"
+
+
+def test_the_host_tracks_the_running_round_per_chat():
+    """`_send_after_current_round` waits on this to order 【已睡下】.
+
+    Losing it is not fatal — the plugin falls back to a short pause — but the
+    ordering guarantee weakens, so the test says so out loud.
+    """
+    cls = _class(_parse("nekro_agent/services/message_service.py"), "MessageService")
+    assigned = {
+        target.attr
+        for node in ast.walk(cls)
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+        if isinstance(target, ast.Attribute)
+    }
+    subscripted = {
+        node.value.attr
+        for node in ast.walk(cls)
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute)
+    }
+    assert "running_tasks" in (assigned | subscripted)
