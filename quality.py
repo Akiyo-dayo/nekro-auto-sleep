@@ -190,7 +190,7 @@ def compute_quality(
     user_burden = compute_user_burden(cycle, target_sleep)
     timer_burden = compute_timer_burden(cycle, target_sleep)
     jitter = compute_stable_jitter(
-        cycle.sleep_date,
+        cycle.cycle_id,
         cycle.sleep_date,
         cycle.quality_seed,
         snap.quality_jitter_points,

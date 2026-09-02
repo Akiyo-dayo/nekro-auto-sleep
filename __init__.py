@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Literal
 
 from zoneinfo import ZoneInfo
@@ -58,7 +58,7 @@ from .models import (
     SleepStatus,
     SourceType,
 )
-from .persistence import SleepStateStore
+from .persistence import DATA_KEY, SleepStateStore
 from .quality import compute_quality
 from .runtime import (
     ChatKeyLocks,
@@ -68,6 +68,7 @@ from .runtime import (
     lease_ledger,
     make_run_agent_task_wrapper,
     make_schedule_agent_task_wrapper,
+    make_timer_task_wrapper,
     unwrap_callable,
     wrap_callable,
 )
@@ -76,7 +77,6 @@ from .schedule import (
     create_config_snapshot,
     current_local_date,
     find_sleep_date_for_now,
-    next_sleep_at,
 )
 
 logger = logging.getLogger("nekro_auto_sleep")
@@ -89,7 +89,7 @@ plugin = NekroPlugin(
     name="自动睡眠",
     module_name="nekro_auto_sleep",
     description="为每个会话提供独立的拟人化睡眠周期，支持叫醒协议和睡眠质量统计",
-    version="1.0.0",
+    version="1.0.1",
     author="Akiyo_dayo",
     url="https://github.com/Akiyo-dayo/NekroAgent_ByAkiyo",
     allow_sleep=True,
@@ -364,7 +364,7 @@ def _is_valid_call(message: ChatMessage, persona_name: str) -> bool:
         return True
     if hasattr(message, "is_tome") and message.is_tome:
         return True
-    text = message.content if hasattr(message, "content") else str(message)
+    text = message.content_text if hasattr(message, "content_text") else str(message)
     if persona_name and persona_name in text:
         return True
     keywords = _parse_keywords()
@@ -376,9 +376,9 @@ def _is_valid_call(message: ChatMessage, persona_name: str) -> bool:
 
 def _is_reply_to_bot(message: ChatMessage) -> bool:
     """Conservative reply-to-bot detection (spec §6.1)."""
-    if not hasattr(message, "extra_data") or not message.extra_data:
+    if not hasattr(message, "ext_data") or not message.ext_data:
         return False
-    ed = message.extra_data
+    ed = message.ext_data
     if isinstance(ed, dict):
         reply = ed.get("reply_to_bot") or ed.get("is_reply_to_self")
         if isinstance(reply, bool):
@@ -433,6 +433,37 @@ def _make_config_snapshot() -> Any:
     )
 
 
+def _compensate_sleep_if_due(
+    state: ChatSleepState,
+    now_utc: datetime,
+    tz: ZoneInfo,
+) -> ChatSleepState:
+    """Enter the currently active sleep cycle even after a delayed check/reload."""
+    if state.status != SleepStatus.AWAKE:
+        return state
+
+    snapshot = _make_config_snapshot()
+    sleep_date = find_sleep_date_for_now(
+        now_utc,
+        tz,
+        snapshot.sleep_time,
+        snapshot.wake_time_start,
+        snapshot.wake_time_end,
+    )
+    if sleep_date is None:
+        return state
+
+    candidate = transition_to_sleep(
+        state,
+        now_utc,
+        snapshot,
+        sleep_date_local=sleep_date.isoformat(),
+    )
+    if candidate.cycle is None or now_utc >= candidate.cycle.planned_wake_at:
+        return state
+    return candidate
+
+
 # ---------------------------------------------------------------------------
 # Message hooks
 # ---------------------------------------------------------------------------
@@ -454,8 +485,14 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage) -> MsgSignal | No
         state.last_seen_at = now_utc
 
         if state.status == SleepStatus.AWAKE:
-            _result_signal = MsgSignal.CONTINUE
-            return state
+            state = _compensate_sleep_if_due(
+                state,
+                now_utc,
+                ZoneInfo(config.TIMEZONE),
+            )
+            if state.status == SleepStatus.AWAKE:
+                _result_signal = MsgSignal.CONTINUE
+                return state
 
         if state.status == SleepStatus.AWAKE_EARLY:
             state = refresh_idle_deadline(state, now_utc)
@@ -562,6 +599,7 @@ async def inject_sleep_status(ctx: AgentCtx) -> str:
     "主动重新进入睡眠（仅在被提前叫醒后、计划起床前可用）",
 )
 async def resume_sleep_tool(_ctx: AgentCtx) -> str:
+    """Transition this chat from AWAKE_EARLY back to ASLEEP before planned wake."""
     chat_key = _ctx.chat_key
     store = _get_store()
     now_utc = datetime.now(ZoneInfo("UTC"))
@@ -657,17 +695,12 @@ async def _check_sleep_transition(
     now_utc: datetime,
     tz: ZoneInfo,
 ) -> None:
-    """Check if it's time to transition AWAKE -> ASLEEP."""
-    sleep_at = next_sleep_at(now_utc - timedelta(seconds=30), tz, config.SLEEP_TIME)
-    if now_utc >= sleep_at:
-        snap = _make_config_snapshot()
+    """Compensate AWAKE -> ASLEEP for the active scheduled sleep cycle."""
 
-        async def _sleep(s: ChatSleepState) -> ChatSleepState:
-            if s.status != SleepStatus.AWAKE:
-                return s
-            return transition_to_sleep(s, now_utc, snap)
+    async def _sleep(s: ChatSleepState) -> ChatSleepState:
+        return _compensate_sleep_if_due(s, now_utc, tz)
 
-        await store.with_state(chat_key, _sleep)
+    await store.with_state(chat_key, _sleep)
 
 
 async def _settle_wake(
@@ -676,34 +709,32 @@ async def _settle_wake(
     now_utc: datetime,
 ) -> None:
     """Settle natural wake-up."""
-    state = store.get_cached(chat_key)
-    if state is None or state.cycle is None:
-        return
-
-    persona_name = state.cycle.config_snapshot.fallback_persona_name
-    actual_sleep = compute_actual_sleep_seconds(state.cycle)
-    quality = compute_quality(state.cycle, actual_sleep)
-
-    notice_action: ActionSendWakeNotice | None = None
+    should_notify = False
+    settled_quality: int = 0
+    settled_duration: float = 0.0
 
     async def _wake(s: ChatSleepState) -> ChatSleepState:
-        nonlocal notice_action
-        new_state, action = settle_natural_wake(s, now_utc, persona_name, quality)
+        nonlocal should_notify, settled_quality, settled_duration
+        if s.cycle is None:
+            return transition_to_awake(s, now_utc)
+        persona_name = s.cycle.config_snapshot.fallback_persona_name
+        settled_duration = compute_actual_sleep_seconds(s.cycle)
+        settled_quality = compute_quality(s.cycle, settled_duration)
+        new_state, action = settle_natural_wake(s, now_utc, persona_name, settled_quality)
         if isinstance(action, ActionSendWakeNotice):
-            notice_action = action
+            should_notify = True
         return new_state
 
     await store.with_state(chat_key, _wake)
 
-    if notice_action is not None:
+    if should_notify:
         try:
             ctx = await AgentCtx.create_by_chat_key(chat_key)
             persona_name = await _get_persona_name(ctx)
 
-            actual_sleep = compute_actual_sleep_seconds(state.cycle)
             from .engine import format_sleep_duration
-            duration_str = format_sleep_duration(actual_sleep)
-            text = f"【{persona_name}已起床：昨日睡眠质量 {quality}%，睡眠时长 {duration_str}】"
+            duration_str = format_sleep_duration(settled_duration)
+            text = f"【{persona_name}已起床：昨日睡眠质量 {settled_quality}%，睡眠时长 {duration_str}】"
 
             token = current_source.set(SourceType.INTERNAL_WAKE_NOTICE)
             try:
@@ -774,14 +805,18 @@ def _install_wraps() -> bool:
     try:
         from nekro_agent.services.timer.timer_service import timer_service as ts
         if ts and hasattr(ts, "_execute_task") and callable(ts._execute_task):
-            _installed_wraps.append((ts, "_execute_task"))
+            wrapper = make_timer_task_wrapper(SourceType.TIMER_ONESHOT)
+            if wrap_callable(ts, "_execute_task", wrapper):
+                _installed_wraps.append((ts, "_execute_task"))
     except ImportError:
         logger.info("TimerService not available, timer wrapping skipped")
 
     try:
         from nekro_agent.services.timer.recurring_timer_service import recurring_timer_service as rts
         if rts and hasattr(rts, "_fire_job") and callable(rts._fire_job):
-            _installed_wraps.append((rts, "_fire_job"))
+            wrapper = make_timer_task_wrapper(SourceType.TIMER_RECURRING)
+            if wrap_callable(rts, "_fire_job", wrapper):
+                _installed_wraps.append((rts, "_fire_job"))
     except ImportError:
         logger.info("RecurringTimerService not available, recurring timer wrapping skipped")
 
@@ -800,38 +835,78 @@ def _uninstall_wraps() -> None:
 # ---------------------------------------------------------------------------
 
 
-@plugin.mount_init_method()
-async def init() -> None:
+async def _discover_legacy_chat_keys() -> set[str]:
+    """Enumerate pre-index ``state.v1`` rows through the host's shared ORM model."""
+    from nekro_agent.models.db_plugin_data import DBPluginData
+
+    rows = await DBPluginData.filter(
+        plugin_key=plugin.key,
+        data_key=DATA_KEY,
+        target_user_id="",
+    ).values_list("target_chat_key", flat=True)
+    return {str(chat_key) for chat_key in rows if chat_key}
+
+
+async def _start_runtime() -> None:
+    """Start plugin runtime components idempotently."""
     global _store, _maintenance_task
 
-    _store = SleepStateStore(plugin.store)
+    if _store is None:
+        _store = SleepStateStore(plugin.store)
+        await _store.initialize(_discover_legacy_chat_keys)
 
     if not _install_wraps():
         logger.error("Some runtime wraps failed to install; plugin may not fully function")
 
-    _maintenance_task = asyncio.create_task(_maintenance_loop())
-    logger.info("Auto-sleep plugin initialized")
+    if _maintenance_task is None or _maintenance_task.done():
+        _maintenance_task = asyncio.create_task(_maintenance_loop())
+
+    logger.info("Auto-sleep plugin runtime started")
 
 
-@plugin.mount_cleanup_method()
-async def cleanup() -> None:
+async def _stop_runtime() -> None:
+    """Stop plugin runtime components idempotently without deleting persisted state."""
     global _store, _maintenance_task
 
-    if _maintenance_task is not None:
-        _maintenance_task.cancel()
+    task = _maintenance_task
+    _maintenance_task = None
+    if task is not None:
+        if not task.done():
+            task.cancel()
         try:
-            await _maintenance_task
+            await task
         except asyncio.CancelledError:
             pass
-        _maintenance_task = None
+        except Exception as exc:
+            logger.warning("Maintenance task stopped with an error: %s", exc)
 
     _uninstall_wraps()
     lease_ledger.clear()
     chat_key_locks.clear()
     _wake_inject_cache.clear()
 
-    if _store:
+    if _store is not None:
         _store.clear_all()
         _store = None
 
-    logger.info("Auto-sleep plugin cleaned up")
+    logger.info("Auto-sleep plugin runtime stopped")
+
+
+@plugin.mount_init_method()
+async def init() -> None:
+    await _start_runtime()
+
+
+@plugin.on_enabled()
+async def handle_enabled() -> None:
+    await _start_runtime()
+
+
+@plugin.on_disabled()
+async def handle_disabled() -> None:
+    await _stop_runtime()
+
+
+@plugin.mount_cleanup_method()
+async def cleanup() -> None:
+    await _stop_runtime()

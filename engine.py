@@ -161,12 +161,16 @@ def transition_to_sleep(
     state: ChatSleepState,
     now_utc: datetime,
     config_snapshot: ConfigSnapshot,
+    sleep_date_local: str | None = None,
 ) -> ChatSleepState:
-    """AWAKE -> ASLEEP: create cycle and open segment."""
-    from datetime import date as date_type
+    """AWAKE -> ASLEEP: create a cycle and open a segment at ``now_utc``.
 
-    tz = ZoneInfo(config_snapshot.timezone)
-    sleep_date_local = now_utc.astimezone(tz).date().isoformat()
+    ``sleep_date_local`` lets delayed compensation retain the date that owns a
+    cross-midnight sleep window instead of incorrectly creating tonight's cycle.
+    """
+    if sleep_date_local is None:
+        tz = ZoneInfo(config_snapshot.timezone)
+        sleep_date_local = now_utc.astimezone(tz).date().isoformat()
 
     cycle = create_sleep_cycle(state.chat_key, sleep_date_local, config_snapshot)
     state = state.model_copy(

@@ -211,6 +211,29 @@ def unwrap_callable(target_obj: Any, attr_name: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _extract_chat_key(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str | None:
+    """Resolve a chat key without assuming a specific host call shape."""
+    keyword_chat_key = kwargs.get("chat_key")
+    if isinstance(keyword_chat_key, str) and keyword_chat_key:
+        return keyword_chat_key
+
+    if args and isinstance(args[0], str) and args[0]:
+        return args[0]
+
+    message = kwargs.get("message")
+    message_chat_key = getattr(message, "chat_key", None)
+    if isinstance(message_chat_key, str) and message_chat_key:
+        return message_chat_key
+
+    ctx = kwargs.get("ctx")
+    for attr_name in ("chat_key", "from_chat_key"):
+        ctx_chat_key = getattr(ctx, attr_name, None)
+        if isinstance(ctx_chat_key, str) and ctx_chat_key:
+            return ctx_chat_key
+
+    return None
+
+
 def make_schedule_agent_task_wrapper(
     is_sleeping_fn: Callable[[str], bool],
     has_permission_fn: Callable[[str], bool],
@@ -220,19 +243,45 @@ def make_schedule_agent_task_wrapper(
     When sleeping and no trusted permission exists, silently blocks the call.
     """
 
-    async def wrapper(original: Callable[..., Any], chat_key: str, *args: Any, **kwargs: Any) -> Any:
+    async def wrapper(original: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        chat_key = _extract_chat_key(args, kwargs)
+        if chat_key is None:
+            logger.warning(
+                "Cannot resolve chat_key for schedule_agent_task; failing open"
+            )
+            return await original(*args, **kwargs)
+
         src = current_source.get()
 
-        if src in (SourceType.USER_WAKE_CONFIRM, SourceType.USER_DIRECT,
-                   SourceType.TIMER_ONESHOT, SourceType.TIMER_RECURRING,
-                   SourceType.INTERNAL_WAKE_NOTICE):
-            return await original(chat_key, *args, **kwargs)
+        if src in (
+            SourceType.USER_WAKE_CONFIRM,
+            SourceType.USER_DIRECT,
+            SourceType.TIMER_ONESHOT,
+            SourceType.TIMER_RECURRING,
+            SourceType.INTERNAL_WAKE_NOTICE,
+        ):
+            return await original(*args, **kwargs)
 
         if is_sleeping_fn(chat_key) and not has_permission_fn(chat_key):
-            logger.debug("Blocked schedule_agent_task for sleeping chat_key=%s", chat_key)
+            logger.debug(
+                "Blocked schedule_agent_task for sleeping chat_key=%s", chat_key
+            )
             return None
 
-        return await original(chat_key, *args, **kwargs)
+        return await original(*args, **kwargs)
+
+    return wrapper
+
+
+def make_timer_task_wrapper(source_type: SourceType) -> Callable[..., Any]:
+    """Create a wrapper for timer service entry points that sets the source contextvar."""
+
+    async def wrapper(original: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        token = current_source.set(source_type)
+        try:
+            return await original(*args, **kwargs)
+        finally:
+            current_source.reset(token)
 
     return wrapper
 
@@ -244,22 +293,35 @@ def make_run_agent_task_wrapper(
 ) -> Callable[..., Any]:
     """Create a wrapper for message_service._run_chat_agent_task.
 
-    Re-checks sleep state before execution (spec §7.2 layer 3).
+    Re-checks sleep state before execution (spec ?7.2 layer 3).
     """
 
-    async def wrapper(original: Callable[..., Any], chat_key: str, *args: Any, **kwargs: Any) -> Any:
+    async def wrapper(original: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        chat_key = _extract_chat_key(args, kwargs)
+        if chat_key is None:
+            logger.warning(
+                "Cannot resolve chat_key for _run_chat_agent_task; failing open"
+            )
+            return await original(*args, **kwargs)
+
         src = current_source.get()
 
-        if src not in (SourceType.USER_WAKE_CONFIRM, SourceType.USER_DIRECT,
-                       SourceType.TIMER_ONESHOT, SourceType.TIMER_RECURRING,
-                       SourceType.INTERNAL_WAKE_NOTICE):
+        if src not in (
+            SourceType.USER_WAKE_CONFIRM,
+            SourceType.USER_DIRECT,
+            SourceType.TIMER_ONESHOT,
+            SourceType.TIMER_RECURRING,
+            SourceType.INTERNAL_WAKE_NOTICE,
+        ):
             if is_sleeping_fn(chat_key):
-                logger.debug("Blocked _run_chat_agent_task for sleeping chat_key=%s", chat_key)
+                logger.debug(
+                    "Blocked _run_chat_agent_task for sleeping chat_key=%s", chat_key
+                )
                 return None
 
         await on_agent_start_fn(chat_key)
         try:
-            result = await original(chat_key, *args, **kwargs)
+            result = await original(*args, **kwargs)
             return result
         finally:
             await on_agent_end_fn(chat_key)
