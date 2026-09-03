@@ -95,7 +95,7 @@ plugin = NekroPlugin(
     name="自动睡眠",
     module_name="nekro_auto_sleep",
     description="为每个会话提供独立的拟人化睡眠周期：叫醒协议、睡眠质量评分、梦境播报与连续打卡",
-    version="1.1.0",
+    version="1.1.1",
     author="Akiyo_dayo",
     url="https://github.com/Akiyo-dayo/NekroAgent_ByAkiyo",
     allow_sleep=True,
@@ -599,7 +599,10 @@ def _compensate_sleep_if_due(
 
 
 @plugin.mount_on_user_message()
-async def on_user_message(ctx: AgentCtx, message: ChatMessage) -> MsgSignal | None:
+async def on_user_message(ctx: AgentCtx, message: ChatMessage, *_args: Any, **_kwargs: Any) -> MsgSignal | None:
+    # *_args/**_kwargs: upstream 2.4+ may extend hook signatures; extra
+    # parameters are accepted and ignored so a signature change can never
+    # TypeError through the framework's un-guarded dispatch loop.
     if not config.ENABLED:
         return MsgSignal.CONTINUE
 
@@ -678,7 +681,7 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage) -> MsgSignal | No
 
 
 @plugin.mount_on_system_message()
-async def on_system_message(ctx: AgentCtx, message: str) -> MsgSignal | None:
+async def on_system_message(ctx: AgentCtx, message: str, *_args: Any, **_kwargs: Any) -> MsgSignal | None:
     if not config.ENABLED:
         return MsgSignal.CONTINUE
 
@@ -712,7 +715,7 @@ async def on_system_message(ctx: AgentCtx, message: str) -> MsgSignal | None:
     "sleep_status",
     "注入当前睡眠状态信息（仅在叫醒时瞬时注入）",
 )
-async def inject_sleep_status(ctx: AgentCtx) -> str:
+async def inject_sleep_status(ctx: AgentCtx, *_args: Any, **_kwargs: Any) -> str:
     chat_key = ctx.chat_key
 
     inject = _wake_inject_cache.pop(chat_key, None)
@@ -736,8 +739,13 @@ async def inject_sleep_status(ctx: AgentCtx) -> str:
     "resume_sleep",
     "主动重新进入睡眠（仅在被提前叫醒后、计划起床前可用）",
 )
-async def resume_sleep_tool(_ctx: AgentCtx) -> str:
-    """Transition this chat from AWAKE_EARLY back to ASLEEP before planned wake."""
+async def resume_sleep_tool(*call_args: Any, **call_kwargs: Any) -> str:
+    """Transition this chat from AWAKE_EARLY back to ASLEEP before planned wake.
+
+    The host normally passes ctx positionally; pulling it from either args or
+    kwargs keeps the tool resilient to sandbox call-shape changes.
+    """
+    _ctx: AgentCtx = call_args[0] if call_args else call_kwargs.get("ctx")
     chat_key = _ctx.chat_key
     store = _get_store()
     now_utc = datetime.now(ZoneInfo("UTC"))
@@ -774,8 +782,9 @@ async def resume_sleep_tool(_ctx: AgentCtx) -> str:
     "get_sleep_report",
     "查询本会话当前的睡眠状态与最近的睡眠质量记录（近7天）",
 )
-async def get_sleep_report_tool(_ctx: AgentCtx) -> str:
+async def get_sleep_report_tool(*call_args: Any, **call_kwargs: Any) -> str:
     """Report the chat's current sleep status and recent quality history."""
+    _ctx: AgentCtx = call_args[0] if call_args else call_kwargs.get("ctx")
     chat_key = _ctx.chat_key
     store = _get_store()
     now_utc = datetime.now(ZoneInfo("UTC"))
@@ -1129,20 +1138,20 @@ async def _stop_runtime() -> None:
 
 
 @plugin.mount_init_method()
-async def init() -> None:
+async def init(*_args: Any, **_kwargs: Any) -> None:
     await _start_runtime()
 
 
 @plugin.on_enabled()
-async def handle_enabled() -> None:
+async def handle_enabled(*_args: Any, **_kwargs: Any) -> None:
     await _start_runtime()
 
 
 @plugin.on_disabled()
-async def handle_disabled() -> None:
+async def handle_disabled(*_args: Any, **_kwargs: Any) -> None:
     await _stop_runtime()
 
 
 @plugin.mount_cleanup_method()
-async def cleanup() -> None:
+async def cleanup(*_args: Any, **_kwargs: Any) -> None:
     await _stop_runtime()

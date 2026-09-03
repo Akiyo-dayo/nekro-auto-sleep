@@ -129,10 +129,56 @@ AWAKE ──(到达入睡点)──→ ASLEEP
            ASLEEP
 ```
 
+## Hook 适配说明（重要）
+
+本插件是"睡眠门卫"型插件：它必须在消息进出 Agent 的必经之路上做拦截与放行，
+因此**深度依赖钩子机制**。涉及两层：
+
+### 第一层：NekroAgent 插件框架的标准挂载点（被动回调）
+
+| 钩子 | 挂载方式 | 签名（本插件实现） | 为什么需要 |
+|------|----------|--------------------|------------|
+| 用户消息钩子 | `mount_on_user_message` | `(ctx, message, *args, **kwargs)` | 睡眠中拦截普通消息（`BLOCK_ALL`）、放行有效呼叫、触发叫醒协议（`FORCE_TRIGGER`） |
+| 系统消息钩子 | `mount_on_system_message` | `(ctx, message, *args, **kwargs)` | 睡眠中拦截普通系统消息，同时放行定时任务产生的系统消息 |
+| 提示注入钩子 | `mount_prompt_inject_method` | `(ctx, *args, **kwargs)` | 被叫醒瞬间给 LLM 注入起床状态（含起床气分级），不写入历史 |
+| 沙盒工具 | `mount_sandbox_method` | `(*args, **kwargs)`（ctx 从首位或 kwargs 取） | `resume_sleep` 主动睡回、`get_sleep_report` 查询睡眠报告 |
+| 生命周期 | `mount_init_method` / `mount_cleanup_method` / `on_enabled` / `on_disabled` | `(*args, **kwargs)` | 启停维护循环与运行时包装 |
+
+**签名兼容设计**：框架的事件分发（如 `collector.handle_on_user_message`）没有
+try/except 保护，插件 handler 的 TypeError 会直接炸掉整条消息处理链。自 v1.1.1
+起，本插件所有钩子 handler 均以 `*args/**kwargs` 收尾——即使上游（如 2.4.x 及
+之后版本）扩展了 hook 传参个数，多余参数会被安全吞掉，绝不会再因签名不匹配
+导致框架崩溃。沙盒工具则兼容 ctx 位于位置参数或关键字参数两种传法。
+
+### 第二层：运行时方法包装（可逆 monkey-patch，主动 hook）
+
+插件用 `wrap_callable()` 在运行时包装 4 个宿主单例方法（全部 `*args/**kwargs`
+透传，不假设参数个数）：
+
+| 被包装方法 | 作用 |
+|------------|------|
+| `message_service.schedule_agent_task` | **派发层**（必需）：睡眠中且无许可时静默丢弃 Agent 任务 |
+| `message_service._run_chat_agent_task` | **执行层**（可选）：执行前复查睡眠状态，第三道门 |
+| `timer_service._execute_task` | 定时任务来源标记 + 记录 timer 间隔/租约（计入睡眠质量） |
+| `recurring_timer_service._fire_job` | 同上（循环定时任务） |
+
+安全机制：私有标记 `__nekro_auto_sleep_wrapped__` 防重复安装；`__nekro_auto_sleep_original__`
+保存原函数，cleanup 时 `unwrap_callable` 完全还原；除 `schedule_agent_task` 外
+其余目标均为 `hasattr` 能力探测的可选项，缺失时自动降级。
+
+### 对上游 v2.4.x 的核查结论（2026-09-03）
+
+对官方 `KroMiose/nekro-agent` 的 `v2.4.0`、`v2.4.1` 标签与 `main` 分支逐一核对了
+全部插件回调调用点（`collector.py` 的消息/系统消息/注入/生命周期分发，以及
+`message_service` 中被包装方法的签名）：**钩子签名与 2.3.x 完全一致，未发现
+传参个数变化**。`NekroPlugin.__init__` 的既有参数（`name`/`module_name`/
+`allow_sleep` 等）在 2.4 中全部保留。本插件在 2.3.1/2.3.3 宿主实测通过，并已
+通过弹性签名适配 2.4 及未来版本的参数扩展。
+
 ## 兼容性
 
-- Akiyo 版 NekroAgent (`Akiyo-dayo/NekroAgent_ByAkiyo`)
-- 原版上游 NekroAgent (`KroMiose/nekro-agent`)
+- Akiyo 版 NekroAgent (`Akiyo-dayo/NekroAgent_ByAkiyo`) v2.3.3
+- 原版上游 NekroAgent (`KroMiose/nekro-agent`) v2.3.1 / v2.4.x
 
 通过运行时 `getattr` 能力探测实现兼容，不按版本号分支。
 
