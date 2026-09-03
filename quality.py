@@ -80,6 +80,12 @@ def compute_user_burden(
 
     attempt_times = [wa.attempted_at.timestamp() for wa in cycle.wake_attempts]
 
+    timer_intervals: list[tuple[float, float]] = []
+    for ti in cycle.timer_intervals:
+        start = ti.start_at.timestamp()
+        end = ti.end_at.timestamp() if ti.end_at else wake_at_ts
+        timer_intervals.append((start, end))
+
     early_awake_intervals: list[tuple[float, float]] = []
     segments = cycle.sleep_segments
     for i, seg in enumerate(segments):
@@ -90,6 +96,12 @@ def compute_user_burden(
             next_open_ts = segments[i + 1].open_at.timestamp()
             early_awake_intervals.append((close_ts, next_open_ts))
 
+    def _in_timer(t: float) -> bool:
+        for s, e in timer_intervals:
+            if s <= t < e:
+                return True
+        return False
+
     weighted_integral = 0.0
     t = sleep_at_ts
     while t < wake_at_ts:
@@ -99,8 +111,10 @@ def compute_user_burden(
         for at in attempt_times:
             kernel_sum += _exp_kernel(t, at)
 
+        # Timer-caused gaps are accounted by compute_timer_burden; counting them
+        # here as well would double-charge the same disturbance.
         for start, end in early_awake_intervals:
-            if start <= t < end:
+            if start <= t < end and not _in_timer(t):
                 kernel_sum += 1.0
 
         saturated = 1.0 - math.exp(-kernel_sum) if kernel_sum > 0 else 0.0
@@ -206,3 +220,141 @@ def compute_quality(
     )
 
     return round(_clamp(raw, snap.quality_min, snap.quality_max))
+
+
+# ---------------------------------------------------------------------------
+# §11.4 Fun layer: tier comments, deterministic dreams, streak notes
+#
+# All pickers are deterministic in (chat_key, sleep_date) so restarts and
+# repeated settlements never change the story of a given night.
+# ---------------------------------------------------------------------------
+
+def stable_pick(seed: str, options: tuple[str, ...]) -> str:
+    """Deterministic pick from ``options`` seeded by ``seed``."""
+    h = hashlib.sha256(seed.encode()).digest()
+    return options[struct.unpack(">I", h[:4])[0] % len(options)]
+
+
+NICE_DREAMS: tuple[str, ...] = (
+    "梦见自己变成一只猫，在洒满阳光的屋顶上睡了一整天",
+    "梦见考试发现自己全都会，还提前交了卷",
+    "梦见一顿火锅咕嘟咕嘟地冒着热气，就是够不着",
+    "梦见在云端上散步，一脚踩进棉花糖里",
+    "梦见钱包突然胖了一圈，数钱数到手抽筋",
+    "梦见坐上了开往春天的慢火车，窗外全是花田",
+    "梦见自己在海面上打水漂，一块钱漂出了十八个涟漪",
+    "梦见回到小时候的夏天，蝉鸣和西瓜都很甜",
+)
+ODD_DREAMS: tuple[str, ...] = (
+    "梦见自己永远排在一支看不见头的队伍里，前面的人还在原地转圈",
+    "梦见手机永远充到 99%，怎么也充不满",
+    "梦见自己在给一条鱼讲微积分，它听得直吐泡泡",
+    "梦见客厅的沙发开口说话，还嫌我睡相不好",
+    "梦见自己在一场重要会议里，但怎么也想不起来自己是谁",
+    "梦见在洗澡突然想不起来刚才到底洗过没有",
+)
+BAD_DREAMS: tuple[str, ...] = (
+    "梦见闹钟响了一遍又一遍，怎么按都按不掉（吓醒了发现没有闹钟）",
+    "梦见被一只巨大的 Deadline 追着跑，跑鞋还丢了",
+    "梦见手机屏幕裂成了蜘蛛网，弹出一条条红色的提醒",
+    "梦见站在全班面前，突然发现自己一个字都念不出来",
+    "梦见自己变成了一块正在被格式化的硬盘",
+)
+
+QUALITY_TIERS: tuple[tuple[int, str, str, tuple[str, ...]], ...] = (
+    (
+        110,
+        "神清气爽",
+        "✨",
+        ("感觉像充了格电，随时能起飞！", "今天的世界格外清晰，元气满格！"),
+    ),
+    (
+        95,
+        "睡得不错",
+        "😴",
+        ("睡了个好觉，皮肤都在发光。", "一觉到天亮，神清气爽。"),
+    ),
+    (
+        80,
+        "睡得一般",
+        "🌤",
+        ("睡得还行，就是有点意犹未尽。", "马马虎虎，再睡五分钟就完美了。"),
+    ),
+    (
+        70,
+        "睡得迷糊",
+        "🌀",
+        ("脑袋还像浆糊，谁跟我说话都要缓冲一下。", "睡是睡了，但总感觉被谁偷走了半个梦。"),
+    ),
+    (
+        0,
+        "睡眼惺忪",
+        "🥱",
+        ("这觉跟没睡一样……让我先缓缓。", "浑身不得劲，今天谁也别惹我。"),
+    ),
+)
+
+
+def quality_tier(percent: int) -> tuple[str, str, str]:
+    """Return (tier_name, emoji, comment) for a quality percent."""
+    for threshold, name, emoji, comments in QUALITY_TIERS:
+        if percent >= threshold:
+            return name, emoji, comments[percent % len(comments)]
+    name, emoji, comments = QUALITY_TIERS[-1]
+    return name, emoji, comments[percent % len(comments)]
+
+
+def pick_dream(seed: str, percent: int) -> str | None:
+    """Deterministic dream line for the night; None on exceptionally good sleep.
+
+    Higher quality tends to nice dreams, poor quality to nightmares. A perfect
+    night (>= 115) skips the dream line entirely — sleeping like a log means
+    remembering nothing.
+    """
+    if percent >= 115:
+        return None
+    if percent >= 95:
+        return stable_pick(seed, NICE_DREAMS)
+    if percent >= 70:
+        return stable_pick(seed, ODD_DREAMS)
+    return stable_pick(seed, BAD_DREAMS)
+
+
+def compute_streak_note(history: dict[str, int], sleep_date: str, good_threshold: int = 95) -> str | None:
+    """One-line streak/trend note based on settled quality history.
+
+    ``history`` maps sleep_date (YYYY-MM-DD) -> quality percent for the current
+    night and all previous nights kept by the retention policy.
+    """
+    if sleep_date not in history:
+        return None
+
+    dates = sorted(d for d in history if d < sleep_date)
+    if not dates:
+        return "第一天记录睡眠打卡，开个好头～"
+
+    yesterday = dates[-1]
+    diff = history[sleep_date] - history[yesterday]
+
+    streak = 0
+    d = yesterday
+    while d in history and history[d] >= good_threshold:
+        streak += 1
+        prev = (datetime.fromisoformat(d).date() - timedelta(days=1)).isoformat()
+        if prev in history and history[prev] >= good_threshold:
+            d = prev
+        else:
+            break
+
+    notes: list[str] = []
+    if streak >= 2:
+        notes.append(f"已经连续 {streak + 1} 天睡得不错")
+    elif history[sleep_date] >= good_threshold:
+        notes.append("今晚算是个好开头")
+    if diff >= 10:
+        notes.append(f"比昨晚多睡了 {diff} 分的含金量")
+    elif diff <= -10:
+        notes.append(f"比昨晚掉了 {-diff} 分，今晚早点睡")
+    if not notes:
+        return None
+    return "，".join(notes)

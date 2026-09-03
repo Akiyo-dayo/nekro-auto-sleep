@@ -59,7 +59,13 @@ from .models import (
     SourceType,
 )
 from .persistence import DATA_KEY, SleepStateStore
-from .quality import compute_quality
+from .quality import (
+    compute_quality,
+    compute_streak_note,
+    pick_dream,
+    quality_tier,
+    stable_pick,
+)
 from .runtime import (
     ChatKeyLocks,
     LeaseLedger,
@@ -88,8 +94,8 @@ logger = logging.getLogger("nekro_auto_sleep")
 plugin = NekroPlugin(
     name="自动睡眠",
     module_name="nekro_auto_sleep",
-    description="为每个会话提供独立的拟人化睡眠周期，支持叫醒协议和睡眠质量统计",
-    version="1.0.1",
+    description="为每个会话提供独立的拟人化睡眠周期：叫醒协议、睡眠质量评分、梦境播报与连续打卡",
+    version="1.1.0",
     author="Akiyo_dayo",
     url="https://github.com/Akiyo-dayo/NekroAgent_ByAkiyo",
     allow_sleep=True,
@@ -98,8 +104,8 @@ plugin = NekroPlugin(
         en_US="Auto Sleep",
     ),
     i18n_description=i18n.i18n_text(
-        zh_CN="为每个会话提供独立的拟人化睡眠周期，支持叫醒协议和睡眠质量统计",
-        en_US="Per-chat humanized sleep cycles with wake protocol and sleep quality tracking",
+        zh_CN="为每个会话提供独立的拟人化睡眠周期：叫醒协议、睡眠质量评分、梦境播报与连续打卡",
+        en_US="Per-chat humanized sleep cycles with wake protocol, quality scoring, dream reports and streaks",
     ),
 )
 
@@ -317,6 +323,50 @@ class SleepConfig(ConfigBase):
             ),
         ).model_dump(),
     )
+    DREAM_ENABLED: bool = Field(
+        default=True,
+        title="晨间梦境播报",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(zh_CN="晨间梦境播报", en_US="Dream Report"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="自然醒报告中附带一条当夜梦境（睡得越差越容易做噩梦）",
+                en_US="Include a dream line in the morning report; worse sleep tends to nightmares",
+            ),
+        ).model_dump(),
+    )
+    BEDTIME_CHANCE: float = Field(
+        default=0.35,
+        title="晚安消息概率",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(zh_CN="晚安消息概率", en_US="Bedtime Greeting Chance"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="入睡时主动说晚安的概率，0-1；每晚以固定随机种子判定，重启不会重复发送",
+                en_US="Chance of saying goodnight when falling asleep, 0-1; decided per night with a fixed seed so restarts never duplicate",
+            ),
+        ).model_dump(),
+    )
+    WAKE_NOTICE_ALWAYS: bool = Field(
+        default=True,
+        title="无打扰也发晨间报告",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(zh_CN="无打扰也发晨间报告", en_US="Morning Report Always"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="开启后即使夜里没人叫醒也发送晨间睡眠报告；关闭则仅在被叫醒过的夜晚发送",
+                en_US="Send the morning report even when nobody tried to wake the bot; disable to report only after wake attempts",
+            ),
+        ).model_dump(),
+    )
+    QUALITY_HISTORY_DAYS: int = Field(
+        default=14,
+        title="质量历史保留天数",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(zh_CN="质量历史保留天数", en_US="Quality History Days"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="每个会话保留的每日睡眠质量记录条数，用于连续打卡与趋势，1-90",
+                en_US="Per-chat days of settled quality kept for streaks and trends, 1-90",
+            ),
+        ).model_dump(),
+    )
 
 
 config = plugin.get_config(SleepConfig)
@@ -433,6 +483,85 @@ def _make_config_snapshot() -> Any:
     )
 
 
+# ---------------------------------------------------------------------------
+# Fun layer: bedtime greetings
+# ---------------------------------------------------------------------------
+
+BEDTIME_GREETS: tuple[str, ...] = (
+    "夜深了，我先去睡啦，晚安～",
+    "今天的营业时间到此结束，我去睡了，晚安！",
+    "zzZ… 不聊了不聊了，我先睡为敬，晚安～",
+    "眼睛已经开始打架了，我去睡了，晚安各位。",
+    "晚安！梦里见（如果你们也来梦里的话）。",
+)
+
+
+def _deterministic_hit(seed: str, chance: float) -> bool:
+    """Stable per-seed probability so a given night never flips on restart."""
+    import hashlib
+
+    if chance <= 0:
+        return False
+    h = hashlib.sha256(seed.encode()).digest()
+    return (h[0] / 255.0) < max(0.0, min(1.0, chance))
+
+
+async def _send_quiet_text(chat_key: str, text: str) -> None:
+    """Send a message without recording it into chat history."""
+    try:
+        ctx = await AgentCtx.create_by_chat_key(chat_key)
+    except Exception as exc:
+        logger.warning("Cannot create ctx for %s: %s", chat_key, exc)
+        return
+    token = current_source.set(SourceType.INTERNAL_WAKE_NOTICE)
+    try:
+        await ctx.send_text(text, record=False)
+    finally:
+        current_source.reset(token)
+
+
+async def _maybe_send_bedtime(chat_key: str, sleep_date: str) -> None:
+    """Say goodnight with a stable per-night chance when falling asleep."""
+    if not _deterministic_hit(f"bedtime:{chat_key}:{sleep_date}", config.BEDTIME_CHANCE):
+        return
+    text = stable_pick(f"bedtime-text:{chat_key}:{sleep_date}", BEDTIME_GREETS)
+    try:
+        await _send_quiet_text(chat_key, text)
+    except Exception as exc:
+        logger.warning("Failed to send bedtime greeting for %s: %s", chat_key, exc)
+
+
+# ---------------------------------------------------------------------------
+# Timer task hooks: record intervals + leases while a timer runs during sleep
+# ---------------------------------------------------------------------------
+
+
+async def _on_timer_task_start(chat_key: str, task_id: str) -> None:
+    store = _get_store()
+    now_utc = datetime.now(ZoneInfo("UTC"))
+
+    async def _open(s: ChatSleepState) -> ChatSleepState:
+        return open_timer_interval(s, task_id, now_utc)
+
+    try:
+        await store.with_state(chat_key, _open)
+    except Exception as exc:  # noqa: BLE001 - timer flow must never break
+        logger.warning("Failed to open timer interval for %s: %s", chat_key, exc)
+
+
+async def _on_timer_task_end(chat_key: str, task_id: str) -> None:
+    store = _get_store()
+    now_utc = datetime.now(ZoneInfo("UTC"))
+
+    async def _close(s: ChatSleepState) -> ChatSleepState:
+        return close_timer_interval(s, task_id, now_utc)
+
+    try:
+        await store.with_state(chat_key, _close)
+    except Exception as exc:  # noqa: BLE001 - timer flow must never break
+        logger.warning("Failed to close timer interval for %s: %s", chat_key, exc)
+
+
 def _compensate_sleep_if_due(
     state: ChatSleepState,
     now_utc: datetime,
@@ -481,7 +610,7 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage) -> MsgSignal | No
     user_id = _get_user_id(message)
 
     async def _process(state: ChatSleepState) -> ChatSleepState:
-        nonlocal _result_signal, _result_action
+        nonlocal _result_signal, _result_action, _went_to_sleep, _sleep_date
         state.last_seen_at = now_utc
 
         if state.status == SleepStatus.AWAKE:
@@ -493,6 +622,10 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage) -> MsgSignal | No
             if state.status == SleepStatus.AWAKE:
                 _result_signal = MsgSignal.CONTINUE
                 return state
+            # compensate just put this chat to sleep
+            _went_to_sleep = True
+            if state.cycle is not None:
+                _sleep_date = state.cycle.sleep_date
 
         if state.status == SleepStatus.AWAKE_EARLY:
             state = refresh_idle_deadline(state, now_utc)
@@ -527,6 +660,8 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage) -> MsgSignal | No
 
     _result_signal: MsgSignal = MsgSignal.CONTINUE
     _result_action: Any = ActionNone()
+    _went_to_sleep: bool = False
+    _sleep_date: str = ""
 
     await store.with_state(chat_key, _process)
 
@@ -535,6 +670,9 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage) -> MsgSignal | No
             await ctx.send_text(_result_action.text, record=False)
         except Exception as exc:
             logger.error("Failed to send wake offer: %s", exc)
+
+    if _went_to_sleep and _sleep_date:
+        await _maybe_send_bedtime(chat_key, _sleep_date)
 
     return _result_signal
 
@@ -627,6 +765,49 @@ async def resume_sleep_tool(_ctx: AgentCtx) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Sandbox method: get_sleep_report
+# ---------------------------------------------------------------------------
+
+
+@plugin.mount_sandbox_method(
+    SandboxMethodType.TOOL,
+    "get_sleep_report",
+    "查询本会话当前的睡眠状态与最近的睡眠质量记录（近7天）",
+)
+async def get_sleep_report_tool(_ctx: AgentCtx) -> str:
+    """Report the chat's current sleep status and recent quality history."""
+    chat_key = _ctx.chat_key
+    store = _get_store()
+    now_utc = datetime.now(ZoneInfo("UTC"))
+
+    state = store.get_cached(chat_key)
+    if state is None:
+        async with store._get_lock(chat_key):  # noqa: SLF001 - read-through load
+            state = await store.load_or_create(chat_key)
+
+    if state.status == SleepStatus.ASLEEP and state.cycle is not None:
+        status_line = (
+            f"当前状态：睡眠中（计划 {state.cycle.planned_wake_at.astimezone(ZoneInfo(state.cycle.timezone)).strftime('%H:%M')} 左右自然醒）"
+        )
+    elif state.status == SleepStatus.ASLEEP:
+        status_line = "当前状态：睡眠中"
+    elif state.status == SleepStatus.AWAKE_EARLY:
+        status_line = "当前状态：被提前叫醒、还没睡回（空闲后会自动睡回）"
+    else:
+        status_line = "当前状态：清醒"
+
+    if not state.quality_history:
+        return f"{status_line}。最近还没有睡眠质量记录。"
+
+    lines = [status_line, "最近 7 天睡眠质量："]
+    for date_str in sorted(state.quality_history, reverse=True)[:7]:
+        q = state.quality_history[date_str]
+        tier_name, _, _ = quality_tier(q)
+        lines.append(f"- {date_str}：{q}%（{tier_name}）")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Maintenance loop
 # ---------------------------------------------------------------------------
 
@@ -674,7 +855,7 @@ async def _maintain_chat(
 
     elif state.status == SleepStatus.ASLEEP:
         if state.cycle and now_utc >= state.cycle.planned_wake_at:
-            if not has_active_timer_lease(state):
+            if not has_active_timer_lease(state) and not lease_ledger.has_active_for_chat(chat_key):
                 await _settle_wake(store, chat_key, now_utc)
 
     elif state.status == SleepStatus.AWAKE_EARLY:
@@ -696,11 +877,22 @@ async def _check_sleep_transition(
     tz: ZoneInfo,
 ) -> None:
     """Compensate AWAKE -> ASLEEP for the active scheduled sleep cycle."""
+    before = store.get_cached(chat_key)
+    was_awake = before is not None and before.status == SleepStatus.AWAKE
 
     async def _sleep(s: ChatSleepState) -> ChatSleepState:
         return _compensate_sleep_if_due(s, now_utc, tz)
 
     await store.with_state(chat_key, _sleep)
+
+    after = store.get_cached(chat_key)
+    if (
+        was_awake
+        and after is not None
+        and after.status == SleepStatus.ASLEEP
+        and after.cycle is not None
+    ):
+        await _maybe_send_bedtime(chat_key, after.cycle.sleep_date)
 
 
 async def _settle_wake(
@@ -708,49 +900,79 @@ async def _settle_wake(
     chat_key: str,
     now_utc: datetime,
 ) -> None:
-    """Settle natural wake-up."""
+    """Settle natural wake-up, record quality history and send the morning report."""
     should_notify = False
     settled_quality: int = 0
     settled_duration: float = 0.0
+    sleep_date: str = ""
+    quality_history: dict[str, int] = {}
 
     async def _wake(s: ChatSleepState) -> ChatSleepState:
-        nonlocal should_notify, settled_quality, settled_duration
+        nonlocal should_notify, settled_quality, settled_duration, sleep_date, quality_history
         if s.cycle is None:
             return transition_to_awake(s, now_utc)
         persona_name = s.cycle.config_snapshot.fallback_persona_name
         settled_duration = compute_actual_sleep_seconds(s.cycle)
         settled_quality = compute_quality(s.cycle, settled_duration)
-        new_state, action = settle_natural_wake(s, now_utc, persona_name, settled_quality)
+        sleep_date = s.cycle.sleep_date
+        new_state, action = settle_natural_wake(
+            s, now_utc, persona_name, settled_quality,
+            always_notice=config.WAKE_NOTICE_ALWAYS,
+        )
         if isinstance(action, ActionSendWakeNotice):
             should_notify = True
-        return new_state
+
+        history = dict(s.quality_history)
+        if sleep_date:
+            history[sleep_date] = settled_quality
+            keep = max(1, min(90, config.QUALITY_HISTORY_DAYS))
+            if len(history) > keep:
+                for old in sorted(history)[:-keep]:
+                    history.pop(old, None)
+        quality_history = history
+        return new_state.model_copy(update={"quality_history": history})
 
     await store.with_state(chat_key, _wake)
 
-    if should_notify:
+    if not should_notify:
+        return
+
+    try:
+        ctx = await AgentCtx.create_by_chat_key(chat_key)
+        persona_name = await _get_persona_name(ctx)
+
+        from .engine import format_sleep_duration
+        duration_str = format_sleep_duration(settled_duration)
+
+        tier_name, emoji, comment = quality_tier(settled_quality)
+        lines = [
+            f"【{persona_name}已起床：昨日睡眠质量 {settled_quality}%（{tier_name}），睡眠时长 {duration_str}】",
+            f"{emoji} {comment}",
+        ]
+        if config.DREAM_ENABLED and sleep_date:
+            dream = pick_dream(f"dream:{chat_key}:{sleep_date}", settled_quality)
+            if dream:
+                lines.append(f"🌙 {dream}")
+        note = compute_streak_note(quality_history, sleep_date) if sleep_date else None
+        if note:
+            lines.append(f"📈 {note}")
+        text = "\n".join(lines)
+
+        token = current_source.set(SourceType.INTERNAL_WAKE_NOTICE)
         try:
-            ctx = await AgentCtx.create_by_chat_key(chat_key)
-            persona_name = await _get_persona_name(ctx)
+            await ctx.send_text(text, record=False)
+        finally:
+            current_source.reset(token)
 
-            from .engine import format_sleep_duration
-            duration_str = format_sleep_duration(settled_duration)
-            text = f"【{persona_name}已起床：昨日睡眠质量 {settled_quality}%，睡眠时长 {duration_str}】"
+        async def _mark_sent(s: ChatSleepState) -> ChatSleepState:
+            return mark_notice_sent(s)
+        await store.with_state(chat_key, _mark_sent)
 
-            token = current_source.set(SourceType.INTERNAL_WAKE_NOTICE)
-            try:
-                await ctx.send_text(text, record=False)
-            finally:
-                current_source.reset(token)
-
-            async def _mark_sent(s: ChatSleepState) -> ChatSleepState:
-                return mark_notice_sent(s)
-            await store.with_state(chat_key, _mark_sent)
-
-        except Exception as exc:
-            logger.error("Failed to send wake notice for %s: %s", chat_key, exc)
-            async def _mark_failed(s: ChatSleepState) -> ChatSleepState:
-                return mark_notice_failed(s)
-            await store.with_state(chat_key, _mark_failed)
+    except Exception as exc:
+        logger.error("Failed to send wake notice for %s: %s", chat_key, exc)
+        async def _mark_failed(s: ChatSleepState) -> ChatSleepState:
+            return mark_notice_failed(s)
+        await store.with_state(chat_key, _mark_failed)
 
 
 # ---------------------------------------------------------------------------
@@ -805,7 +1027,14 @@ def _install_wraps() -> bool:
     try:
         from nekro_agent.services.timer.timer_service import timer_service as ts
         if ts and hasattr(ts, "_execute_task") and callable(ts._execute_task):
-            wrapper = make_timer_task_wrapper(SourceType.TIMER_ONESHOT)
+            wrapper = make_timer_task_wrapper(
+                SourceType.TIMER_ONESHOT,
+                on_task_start=_on_timer_task_start,
+                on_task_end=_on_timer_task_end,
+                lease_ttl_seconds=float(
+                    max(60, config.TIMER_AGENT_WAIT_TIMEOUT_SECONDS)
+                ),
+            )
             if wrap_callable(ts, "_execute_task", wrapper):
                 _installed_wraps.append((ts, "_execute_task"))
     except ImportError:
@@ -814,7 +1043,14 @@ def _install_wraps() -> bool:
     try:
         from nekro_agent.services.timer.recurring_timer_service import recurring_timer_service as rts
         if rts and hasattr(rts, "_fire_job") and callable(rts._fire_job):
-            wrapper = make_timer_task_wrapper(SourceType.TIMER_RECURRING)
+            wrapper = make_timer_task_wrapper(
+                SourceType.TIMER_RECURRING,
+                on_task_start=_on_timer_task_start,
+                on_task_end=_on_timer_task_end,
+                lease_ttl_seconds=float(
+                    max(60, config.TIMER_AGENT_WAIT_TIMEOUT_SECONDS)
+                ),
+            )
             if wrap_callable(rts, "_fire_job", wrapper):
                 _installed_wraps.append((rts, "_fire_job"))
     except ImportError:

@@ -244,6 +244,35 @@ def transition_resume_sleep(
 # ---------------------------------------------------------------------------
 
 
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def build_wake_inject_text(state: ChatSleepState, now_utc: datetime) -> str:
+    """Wake injection hint scaled by how deep into sleep the bot was woken.
+
+    Deterministic in (cycle, now) so retries never flip the mood.
+    """
+    cycle = state.cycle
+    if cycle is None:
+        return "你刚刚被用户提前叫醒了。"
+    total = (cycle.planned_wake_at - cycle.sleep_at).total_seconds()
+    if total <= 0:
+        progress = 1.0
+    else:
+        progress = _clamp(
+            (now_utc - cycle.sleep_at).total_seconds() / total, 0.0, 1.0
+        )
+    if progress >= 1.0 - max(0.0, cycle.config_snapshot.near_wake_ratio):
+        return "你被用户在临近自然醒时叫醒了，迷迷糊糊，但差不多也该起来了。"
+    if progress <= 0.25:
+        return (
+            "你被用户从深夜的睡梦中叫醒，睡意正浓，反应可以慢半拍，"
+            "语气里带一点明显的起床气。"
+        )
+    return "你刚被用户提前叫醒，还有点困，声音里带着没睡醒的慵懒。"
+
+
 def handle_valid_call_while_asleep(
     state: ChatSleepState,
     now_utc: datetime,
@@ -280,8 +309,7 @@ def handle_valid_call_while_asleep(
             state, now_utc, user_id, snap.early_wake_idle_minutes
         )
 
-        inject = "你刚刚被用户提前叫醒了。"
-        return state, ActionForceWake(inject_text=inject)
+        return state, ActionForceWake(inject_text=build_wake_inject_text(state, now_utc))
 
     # First call or expired previous offer -> send fixed prompt
     pending[user_id] = PendingWakeOffer(
@@ -321,12 +349,17 @@ def handle_valid_call_while_asleep(
 # ---------------------------------------------------------------------------
 
 
-def should_send_wake_notice(cycle: SleepCycle) -> bool:
-    """Check if natural wake notice should be sent (spec §10.2)."""
+def should_send_wake_notice(cycle: SleepCycle, always: bool = False) -> bool:
+    """Check if natural wake notice should be sent (spec §10.2).
+
+    ``always`` sends the morning report even on undisturbed nights; with the
+    default False only nights with (unconfirmed) wake attempts get a notice.
+    """
     if cycle.ended_while_early_awake:
         return False
-    has_real_attempt = any(True for wa in cycle.wake_attempts)
-    return has_real_attempt
+    if always:
+        return True
+    return bool(cycle.wake_attempts)
 
 
 def format_sleep_duration(total_seconds: float) -> str:
@@ -361,6 +394,7 @@ def settle_natural_wake(
     now_utc: datetime,
     persona_name: str,
     quality_percent: int,
+    always_notice: bool = False,
 ) -> tuple[ChatSleepState, SleepAction | None]:
     """Handle natural wake-up at planned_wake_at (spec §10.1, §10.2)."""
     if state.cycle is None:
@@ -374,7 +408,7 @@ def settle_natural_wake(
     if was_early_awake:
         return state, None
 
-    if not should_send_wake_notice(state.cycle):
+    if not should_send_wake_notice(state.cycle, always=always_notice):
         return state, None
 
     sleep_secs = compute_actual_sleep_seconds(state.cycle)
@@ -510,7 +544,7 @@ def open_timer_interval(
     source_type: str = "TIMER_ONESHOT",
 ) -> ChatSleepState:
     """Record start of a timer task execution during sleep."""
-    if state.cycle is None:
+    if state.status != SleepStatus.ASLEEP or state.cycle is None:
         return state
     from .models import SourceType
 
@@ -532,14 +566,27 @@ def close_timer_interval(
     task_id: str,
     now_utc: datetime,
 ) -> ChatSleepState:
-    """Record end of a timer task execution."""
+    """Record end of a timer task execution.
+
+    Re-opens the sleep segment afterwards so the remaining night keeps
+    counting towards coverage; otherwise everything after a timer task
+    would silently vanish from the quality score.
+    """
     if state.cycle is None:
         return state
     intervals = list(state.cycle.timer_intervals)
+    closed_any = False
     for i, ti in enumerate(intervals):
         if ti.task_id == task_id and ti.end_at is None:
             intervals[i] = ti.model_copy(update={"end_at": now_utc})
+            closed_any = True
     state.cycle = state.cycle.model_copy(update={"timer_intervals": intervals})
+    if (
+        closed_any
+        and state.status == SleepStatus.ASLEEP
+        and not any(ti.end_at is None for ti in intervals)
+    ):
+        state = open_sleep_segment(state, now_utc)
     return state
 
 

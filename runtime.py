@@ -273,15 +273,91 @@ def make_schedule_agent_task_wrapper(
     return wrapper
 
 
-def make_timer_task_wrapper(source_type: SourceType) -> Callable[..., Any]:
-    """Create a wrapper for timer service entry points that sets the source contextvar."""
+def _extract_timer_task_info(
+    args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> tuple[str | None, str | None]:
+    """Resolve (chat_key, task_id) from timer-service call shapes.
+
+    Supports both ``_execute_task(task)`` (TimerTask with .chat_key/.task_id)
+    and ``_fire_job(job, fired_at, is_misfire)`` (DBRecurringTimerJob with
+    .chat_key/.job_id), plus plain string chat_key in args/kwargs.
+    """
+    chat_key = kwargs.get("chat_key")
+    if not isinstance(chat_key, str) or not chat_key:
+        chat_key = None
+    task_id = kwargs.get("task_id") or kwargs.get("job_id")
+
+    task_obj = None
+    for a in args:
+        if isinstance(a, str) and a:
+            if chat_key is None:
+                chat_key = a
+        elif a is not None and not isinstance(a, (int, float, bool)):
+            task_obj = a
+
+    if task_obj is not None:
+        ck = getattr(task_obj, "chat_key", None)
+        if isinstance(ck, str) and ck:
+            chat_key = ck
+        if task_id is None:
+            tid = (
+                getattr(task_obj, "task_id", None)
+                or getattr(task_obj, "job_id", None)
+                or getattr(task_obj, "id", None)
+            )
+            if tid is not None:
+                task_id = str(tid)
+
+    return chat_key, (str(task_id) if task_id is not None else None)
+
+
+def make_timer_task_wrapper(
+    source_type: SourceType,
+    on_task_start: Callable[[str, str], Any] | None = None,
+    on_task_end: Callable[[str, str], Any] | None = None,
+    lease_ttl_seconds: float = 900.0,
+) -> Callable[..., Any]:
+    """Create a wrapper for timer service entry points.
+
+    Sets the source contextvar for the duration of the task and, when the
+    host call shape resolves to a chat_key, books a persistent timer interval
+    (via ``on_task_start``/``on_task_end``) plus an in-memory lease so the
+    maintenance loop cannot settle a natural wake mid-execution.
+    """
+    import time as _time
+
+    def _fallback_task_id() -> str:
+        return f"t{_time.time_ns()}"
 
     async def wrapper(original: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        chat_key, task_id = _extract_timer_task_info(args, kwargs)
+        resolved_task_id = task_id or _fallback_task_id()
+
+        lease_id: str | None = None
+        if chat_key:
+            if on_task_start is not None:
+                await on_task_start(chat_key, resolved_task_id)
+            lease_id = f"timer:{resolved_task_id}:{_time.time_ns()}"
+            lease_ledger.create(
+                lease_id,
+                source_type,
+                chat_key,
+                resolved_task_id,
+                ttl=max(60.0, lease_ttl_seconds),
+            )
         token = current_source.set(source_type)
         try:
             return await original(*args, **kwargs)
         finally:
             current_source.reset(token)
+            if chat_key:
+                if lease_id is not None:
+                    lease_ledger.remove(lease_id)
+                if on_task_end is not None:
+                    try:
+                        await on_task_end(chat_key, resolved_task_id)
+                    except Exception as exc:  # noqa: BLE001 - never break host flow
+                        logger.warning("on_task_end failed for %s: %s", chat_key, exc)
 
     return wrapper
 

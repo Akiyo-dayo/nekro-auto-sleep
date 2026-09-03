@@ -34,7 +34,7 @@ from nekro_auto_sleep.models import (
     WakeAttempt,
 )
 
-from .conftest import CHAT_KEY, TZ, UTC
+from conftest import CHAT_KEY, TZ, UTC
 
 
 class TestTransitionToSleep:

@@ -156,6 +156,10 @@ class ChatSleepState(BaseModel):
     pending_wake_offers: dict[str, PendingWakeOffer] = Field(default_factory=dict)
     idle_sleep_deadline: datetime | None = None
     cycle: SleepCycle | None = None
+    quality_history: dict[str, int] = Field(
+        default_factory=dict,
+        description="sleep_date (YYYY-MM-DD) -> settled quality percent, for streaks and reports",
+    )
 
     @field_validator("last_seen_at", "idle_sleep_deadline", mode="before")
     @classmethod
