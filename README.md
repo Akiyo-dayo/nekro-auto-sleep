@@ -40,6 +40,12 @@ data/plugins/workdir/nekro_auto_sleep/
 └── tests/
 ```
 
+> ⚠️ **目录名必须与 `module_name="nekro_auto_sleep"` 完全一致（下划线）**。
+> 不要使用 git 仓库名 `nekro-auto-sleep`（连字符，且不是合法 Python 模块名）。
+> 框架按 `module_name` 执行卸载与热重载：目录名与模块名不一致时，`sys.modules`
+> 和已加载模块注册表不会被清理，表现为插件"卸载不掉"或热重载不生效。插件
+> 启动时会自检目录名并在不一致时输出 ERROR 日志。
+
 重启 NekroAgent 后在插件管理页面启用「自动睡眠」插件。
 
 ## 配置

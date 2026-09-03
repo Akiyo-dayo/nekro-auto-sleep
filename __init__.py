@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Literal
 
 from zoneinfo import ZoneInfo
@@ -95,7 +96,7 @@ plugin = NekroPlugin(
     name="自动睡眠",
     module_name="nekro_auto_sleep",
     description="为每个会话提供独立的拟人化睡眠周期：叫醒协议、睡眠质量评分、梦境播报与连续打卡",
-    version="1.1.1",
+    version="1.1.2",
     author="Akiyo_dayo",
     url="https://github.com/Akiyo-dayo/NekroAgent_ByAkiyo",
     allow_sleep=True,
@@ -384,6 +385,30 @@ _installed_wraps: list[tuple[Any, str]] = []
 def _get_store() -> SleepStateStore:
     assert _store is not None, "Plugin not initialized"
     return _store
+
+
+def _check_install_dir_name() -> None:
+    """Fail loudly when the install directory name diverges from ``module_name``.
+
+    The framework's unload/reload path keys everything off the declared
+    ``module_name`` (``loaded_module_names`` cleanup, ``sys.modules`` reuse,
+    ``reload_plugin_by_module_name`` path building). With a mismatched
+    directory name the module registry and sys.modules entry are left behind,
+    which surfaces as a plugin that cannot be unloaded or hot-reloaded.
+    """
+    try:
+        dir_name = Path(__file__).resolve().parent.name
+        if dir_name != plugin.module_name:
+            logger.error(
+                "自动睡眠插件安装目录名 `%s` 与 module_name `%s` 不一致！"
+                "框架按 module_name 卸载/重载，不一致会导致插件无法正常卸载或热重载。"
+                "请把目录改名为 `%s` 后重启 NekroAgent。",
+                dir_name,
+                plugin.module_name,
+                plugin.module_name,
+            )
+    except Exception as exc:  # noqa: BLE001 - self-check must never break init
+        logger.warning("Install directory self-check failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1095,6 +1120,8 @@ async def _discover_legacy_chat_keys() -> set[str]:
 async def _start_runtime() -> None:
     """Start plugin runtime components idempotently."""
     global _store, _maintenance_task
+
+    _check_install_dir_name()
 
     if _store is None:
         _store = SleepStateStore(plugin.store)
