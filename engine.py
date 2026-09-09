@@ -273,6 +273,23 @@ def build_wake_inject_text(state: ChatSleepState, now_utc: datetime) -> str:
     return "你刚被用户提前叫醒，还有点困，声音里带着没睡醒的慵懒。"
 
 
+def clean_expired_offers(
+    state: ChatSleepState,
+    now_utc: datetime,
+) -> ChatSleepState:
+    """Purge expired pending wake offers from state."""
+    if not state.pending_wake_offers:
+        return state
+    valid = {
+        uid: offer
+        for uid, offer in state.pending_wake_offers.items()
+        if now_utc <= offer.expires_at
+    }
+    if len(valid) != len(state.pending_wake_offers):
+        return state.model_copy(update={"pending_wake_offers": valid})
+    return state
+
+
 def handle_valid_call_while_asleep(
     state: ChatSleepState,
     now_utc: datetime,

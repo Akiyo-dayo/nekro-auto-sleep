@@ -40,7 +40,8 @@ def compute_fragmentation(segments: list[SleepSegment], actual_sleep: float) -> 
         dur = (seg.close_at - seg.open_at).total_seconds()
         if dur > 0:
             sum_sq += dur * dur
-    return 1.0 - sum_sq / (actual_sleep * actual_sleep)
+    val = 1.0 - sum_sq / (actual_sleep * actual_sleep)
+    return _clamp(val, 0.0, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +201,11 @@ def compute_quality(
     target_sleep = (cycle.planned_wake_at - cycle.sleep_at).total_seconds()
 
     coverage = compute_coverage(actual_sleep_seconds, target_sleep)
-    fragmentation = compute_fragmentation(cycle.sleep_segments, actual_sleep_seconds)
+    fragmentation = _clamp(
+        compute_fragmentation(cycle.sleep_segments, actual_sleep_seconds),
+        0.0,
+        1.0,
+    )
     user_burden = compute_user_burden(cycle, target_sleep)
     timer_burden = compute_timer_burden(cycle, target_sleep)
     jitter = compute_stable_jitter(
@@ -336,21 +341,23 @@ def compute_streak_note(history: dict[str, int], sleep_date: str, good_threshold
     yesterday = dates[-1]
     diff = history[sleep_date] - history[yesterday]
 
-    streak = 0
-    d = yesterday
-    while d in history and history[d] >= good_threshold:
-        streak += 1
-        prev = (datetime.fromisoformat(d).date() - timedelta(days=1)).isoformat()
-        if prev in history and history[prev] >= good_threshold:
-            d = prev
-        else:
-            break
-
     notes: list[str] = []
-    if streak >= 2:
-        notes.append(f"已经连续 {streak + 1} 天睡得不错")
-    elif history[sleep_date] >= good_threshold:
-        notes.append("今晚算是个好开头")
+    if history[sleep_date] >= good_threshold:
+        streak = 1
+        curr_d = datetime.fromisoformat(sleep_date).date()
+        while True:
+            prev_d = (curr_d - timedelta(days=1)).isoformat()
+            if prev_d in history and history[prev_d] >= good_threshold:
+                streak += 1
+                curr_d = curr_d - timedelta(days=1)
+            else:
+                break
+
+        if streak >= 2:
+            notes.append(f"已经连续 {streak} 天睡得不错")
+        else:
+            notes.append("今晚算是个好开头")
+
     if diff >= 10:
         notes.append(f"比昨晚多睡了 {diff} 分的含金量")
     elif diff <= -10:

@@ -215,3 +215,27 @@ class TestSleepDuration:
         )
         secs = compute_actual_sleep_seconds(cycle)
         assert secs == 9.5 * 3600
+
+    def test_clean_expired_offers(self):
+        from nekro_auto_sleep.engine import clean_expired_offers
+        from nekro_auto_sleep.models import PendingWakeOffer
+
+        now = datetime(2026, 8, 13, 16, 0, tzinfo=UTC)
+        state = ChatSleepState(
+            chat_key=CHAT_KEY,
+            pending_wake_offers={
+                "u1": PendingWakeOffer(
+                    user_id="u1",
+                    offered_at=now - timedelta(minutes=5),
+                    expires_at=now - timedelta(minutes=2),
+                ),
+                "u2": PendingWakeOffer(
+                    user_id="u2",
+                    offered_at=now - timedelta(seconds=30),
+                    expires_at=now + timedelta(seconds=90),
+                ),
+            },
+        )
+        cleaned = clean_expired_offers(state, now)
+        assert "u1" not in cleaned.pending_wake_offers
+        assert "u2" in cleaned.pending_wake_offers

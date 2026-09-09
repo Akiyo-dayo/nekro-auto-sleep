@@ -14,6 +14,7 @@ import contextvars
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from typing import Any
 from collections.abc import Callable
 
@@ -91,20 +92,18 @@ class LeaseLedger:
         return lease
 
     def get_active_for_chat(self, chat_key: str) -> list[Lease]:
-        ids = self._by_chat_key.get(chat_key, set())
+        ids = list(self._by_chat_key.get(chat_key, set()))
         active = []
         expired = []
+        now = time.monotonic()
         for lid in ids:
             lease = self._leases.get(lid)
-            if lease is None:
+            if lease is None or (now - lease.created_at > lease.ttl):
                 expired.append(lid)
-                continue
-            if time.monotonic() - lease.created_at > lease.ttl:
-                expired.append(lid)
-                continue
-            active.append(lease)
+            else:
+                active.append(lease)
         for lid in expired:
-            self.remove(lid)
+            self.remove(lid, chat_key=chat_key)
         return active
 
     def has_active_for_chat(self, chat_key: str) -> bool:
@@ -116,14 +115,19 @@ class LeaseLedger:
             lease.claimed = True
         return lease
 
-    def remove(self, lease_id: str) -> Lease | None:
+    def remove(self, lease_id: str, chat_key: str | None = None) -> Lease | None:
         lease = self._leases.pop(lease_id, None)
-        if lease is not None:
-            chat_ids = self._by_chat_key.get(lease.chat_key)
-            if chat_ids is not None:
-                chat_ids.discard(lease_id)
-                if not chat_ids:
-                    del self._by_chat_key[lease.chat_key]
+        ck = chat_key or (lease.chat_key if lease else None)
+        if ck and ck in self._by_chat_key:
+            self._by_chat_key[ck].discard(lease_id)
+            if not self._by_chat_key[ck]:
+                del self._by_chat_key[ck]
+        elif lease is None:
+            for k, lids in list(self._by_chat_key.items()):
+                if lease_id in lids:
+                    lids.discard(lease_id)
+                    if not lids:
+                        del self._by_chat_key[k]
         return lease
 
     def clear(self) -> None:
@@ -292,7 +296,14 @@ def _extract_timer_task_info(
         if isinstance(a, str) and a:
             if chat_key is None:
                 chat_key = a
-        elif a is not None and not isinstance(a, (int, float, bool)):
+        elif hasattr(a, "chat_key") or hasattr(a, "task_id") or hasattr(a, "job_id"):
+            task_obj = a
+            break
+        elif (
+            a is not None
+            and not isinstance(a, (int, float, bool, bytes, datetime, date))
+            and task_obj is None
+        ):
             task_obj = a
 
     if task_obj is not None:

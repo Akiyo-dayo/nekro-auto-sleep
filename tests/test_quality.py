@@ -19,6 +19,7 @@ from nekro_auto_sleep.quality import (
     compute_fragmentation,
     compute_quality,
     compute_stable_jitter,
+    compute_streak_note,
 )
 from nekro_auto_sleep.schedule import create_config_snapshot
 
@@ -165,3 +166,34 @@ class TestQualityScore:
         )
         quality = compute_quality(cycle, 0)
         assert quality >= 60
+
+    def test_fragmentation_float_precision(self):
+        # Even when actual sleep matches segment duration exactly or has tiny float drift
+        seg = SleepSegment(
+            open_at=datetime(2026, 8, 13, 15, 0, tzinfo=UTC),
+            close_at=datetime(2026, 8, 14, 0, 30, tzinfo=UTC),
+        )
+        frag = compute_fragmentation([seg], (seg.close_at - seg.open_at).total_seconds())
+        assert frag == 0.0
+
+    def test_streak_note_broken_today(self):
+        # If today is bad, streak should not claim consecutive good sleep
+        history = {
+            "2026-08-11": 98,
+            "2026-08-12": 99,
+            "2026-08-13": 60,
+        }
+        note = compute_streak_note(history, "2026-08-13", good_threshold=95)
+        assert note is not None
+        assert "连续" not in note
+        assert "掉了 39 分" in note
+
+    def test_streak_note_consecutive_success(self):
+        history = {
+            "2026-08-11": 96,
+            "2026-08-12": 98,
+            "2026-08-13": 99,
+        }
+        note = compute_streak_note(history, "2026-08-13", good_threshold=95)
+        assert note is not None
+        assert "已经连续 3 天睡得不错" in note

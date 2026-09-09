@@ -204,7 +204,8 @@ class SleepStateStore:
         async with lock:
             state = await self.load_or_create(chat_key)
             new_state = await fn(state)
-            await self.save(new_state)
+            if new_state != state:
+                await self.save(new_state)
             return new_state
 
     def get_cached(self, chat_key: str) -> ChatSleepState | None:

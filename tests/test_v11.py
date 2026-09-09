@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import sys
 from datetime import datetime, timedelta
+from types import ModuleType
+from unittest.mock import AsyncMock, MagicMock
+from pydantic import BaseModel
+import importlib.util
+import pathlib
 
 from zoneinfo import ZoneInfo
 
@@ -270,3 +276,369 @@ class TestHistoryPersistence:
 
         restored = CS.model_validate_json(raw)
         assert restored.quality_history == {"2026-09-01": 96, "2026-08-31": 88}
+
+
+class TestRuntimeFixes:
+    def test_extract_timer_task_info_with_datetime(self):
+        from nekro_auto_sleep.runtime import _extract_timer_task_info
+
+        class FakeJob:
+            chat_key = "test_chat"
+            job_id = "job_123"
+
+        job = FakeJob()
+        fired_at = datetime.now()
+        # Shape of _fire_job(job, fired_at, is_misfire)
+        ck, tid = _extract_timer_task_info((job, fired_at, False), {})
+        assert ck == "test_chat"
+        assert tid == "job_123"
+
+    def test_lease_ledger_ghost_cleanup(self):
+        from nekro_auto_sleep.runtime import LeaseLedger
+        from nekro_auto_sleep.models import SourceType
+
+        ledger = LeaseLedger()
+        ledger.create("l1", SourceType.TIMER_ONESHOT, "chat1", "task1", ttl=100.0)
+        # Directly simulate _leases missing or expired
+        del ledger._leases["l1"]
+        # get_active_for_chat should clean up ghost from _by_chat_key
+        active = ledger.get_active_for_chat("chat1")
+        assert len(active) == 0
+        assert "chat1" not in ledger._by_chat_key
+
+
+def _setup_mock_nekro_agent() -> None:
+    if "nekro_agent" in sys.modules:
+        return
+
+    nekro_agent = ModuleType("nekro_agent")
+    sys.modules["nekro_agent"] = nekro_agent
+
+    api = ModuleType("nekro_agent.api")
+    sys.modules["nekro_agent.api"] = api
+    nekro_agent.api = api
+
+    i18n = MagicMock()
+    i18n.t = lambda key, **kwargs: key
+    i18n.i18n_text = lambda **kwargs: kwargs
+    api.i18n = i18n
+
+    plugin = ModuleType("nekro_agent.api.plugin")
+    class ConfigBase(BaseModel):
+        model_config = {"extra": "allow"}
+
+    class ExtraField(BaseModel):
+        model_config = {"extra": "allow"}
+
+    class SandboxMethodType:
+        TOOL = "tool"
+
+    class NekroPlugin:
+        def __init__(self, *args, **kwargs):
+            self.module_name = kwargs.get("module_name", "nekro_auto_sleep")
+            self.key = kwargs.get("key", "Akiyo_dayo.nekro_auto_sleep")
+        def mount(self, *a, **kw): pass
+        def mount_config(self, *a, **kw): return lambda cls: cls
+        def get_config(self, config_cls): return config_cls()
+        def hook_user_message(self, *a, **kw): return lambda f: f
+        def hook_system_message(self, *a, **kw): return lambda f: f
+        def hook_agent_prompt(self, *a, **kw): return lambda f: f
+        def hook_agent_tool(self, *a, **kw): return lambda f: f
+        def register_sandbox_method(self, *a, **kw): return lambda f: f
+        def register_background_task(self, *a, **kw): return lambda f: f
+        def mount_on_user_message(self, *a, **kw): return lambda f: f
+        def mount_on_system_message(self, *a, **kw): return lambda f: f
+        def mount_prompt_inject_method(self, *a, **kw): return lambda f: f
+        def mount_sandbox_method(self, *a, **kw): return lambda f: f
+        def mount_init_method(self, *a, **kw): return lambda f: f
+        def on_enabled(self, *a, **kw): return lambda f: f
+        def on_disabled(self, *a, **kw): return lambda f: f
+        def mount_cleanup_method(self, *a, **kw): return lambda f: f
+    plugin.ConfigBase = ConfigBase
+    plugin.ExtraField = ExtraField
+    plugin.SandboxMethodType = SandboxMethodType
+    plugin.NekroPlugin = NekroPlugin
+    sys.modules["nekro_agent.api.plugin"] = plugin
+    api.plugin = plugin
+
+    schemas = ModuleType("nekro_agent.api.schemas")
+    class AgentCtx:
+        @classmethod
+        async def create_by_chat_key(cls, ck):
+            pass
+    schemas.AgentCtx = AgentCtx
+    sys.modules["nekro_agent.api.schemas"] = schemas
+    api.schemas = schemas
+
+    signal = ModuleType("nekro_agent.api.signal")
+    class MsgSignal:
+        pass
+    signal.MsgSignal = MsgSignal
+    sys.modules["nekro_agent.api.signal"] = signal
+    api.signal = signal
+
+    chat_msg_mod = ModuleType("nekro_agent.schemas.chat_message")
+    class ChatMessage:
+        pass
+    chat_msg_mod.ChatMessage = ChatMessage
+    sys.modules["nekro_agent.schemas"] = ModuleType("nekro_agent.schemas")
+    sys.modules["nekro_agent.schemas.chat_message"] = chat_msg_mod
+
+    models_mod = ModuleType("nekro_agent.models")
+    db_mod = ModuleType("nekro_agent.models.db_plugin_data")
+    class DBPluginData:
+        pass
+    db_mod.DBPluginData = DBPluginData
+    sys.modules["nekro_agent.models"] = models_mod
+    sys.modules["nekro_agent.models.db_plugin_data"] = db_mod
+
+
+class TestPersistenceAndToolEnhancements:
+    import pytest
+
+    @pytest.mark.asyncio
+    async def test_with_state_skips_save_when_unchanged(self):
+        from nekro_auto_sleep.persistence import SleepStateStore
+
+        saved_count = 0
+
+        class MockBackend:
+            def __init__(self):
+                self.data = {}
+
+            async def get(self, chat_key=None, store_key=""):
+                return self.data.get(store_key)
+
+            async def set(self, chat_key=None, store_key="", value=""):
+                nonlocal saved_count
+                saved_count += 1
+                self.data[store_key] = value
+
+        backend = MockBackend()
+        store = SleepStateStore(backend)
+
+        from nekro_auto_sleep.models import SleepStatus
+
+        # First run: state is modified, so save SHOULD be called
+        async def _modify(s):
+            return s.model_copy(update={"status": SleepStatus.ASLEEP})
+
+        await store.with_state("chat_test", _modify)
+        assert saved_count >= 1  # save was called
+
+        count_before = saved_count
+        # Second run: state is unchanged, save should NOT be called
+        async def _noop(s):
+            return s
+
+        await store.with_state("chat_test", _noop)
+        assert saved_count == count_before  # no new save!
+
+    def test_clean_expired_offers(self):
+        from nekro_auto_sleep.models import ChatSleepState, PendingWakeOffer
+        from nekro_auto_sleep.engine import clean_expired_offers
+        from datetime import timezone
+
+        t0 = datetime(2025, 1, 1, 12, 0, tzinfo=timezone.utc)
+        state = ChatSleepState(
+            chat_key="c1",
+            pending_wake_offers={
+                "u1": PendingWakeOffer(
+                    user_id="u1",
+                    offered_at=t0 - timedelta(seconds=20),
+                    expires_at=t0 + timedelta(seconds=10),
+                ),
+                "u2": PendingWakeOffer(
+                    user_id="u2",
+                    offered_at=t0 - timedelta(seconds=20),
+                    expires_at=t0 - timedelta(seconds=10),
+                ),
+            },
+        )
+        cleaned = clean_expired_offers(state, t0)
+        assert "u1" in cleaned.pending_wake_offers
+        assert "u2" not in cleaned.pending_wake_offers
+
+    @pytest.mark.asyncio
+    async def test_dynamic_bedtime_llm_dispatch(self, monkeypatch):
+        _setup_mock_nekro_agent()
+        pkg_root = pathlib.Path(__file__).resolve().parent.parent
+        init_file = pkg_root / "__init__.py"
+        spec = importlib.util.spec_from_file_location(
+            "nekro_auto_sleep",
+            init_file,
+            submodule_search_locations=[str(pkg_root)],
+        )
+        nas_mod = sys.modules["nekro_auto_sleep"]
+        spec.loader.exec_module(nas_mod)
+
+        pushed_prompts = []
+
+        class MockCtx:
+            async def push_system(self, prompt, trigger_agent=False):
+                pushed_prompts.append((prompt, trigger_agent))
+
+        mock_ctx = MockCtx()
+        monkeypatch.setattr(
+            nas_mod.AgentCtx,
+            "create_by_chat_key",
+            AsyncMock(return_value=mock_ctx),
+        )
+        monkeypatch.setattr(nas_mod, "_deterministic_hit", lambda *_: True)
+        monkeypatch.setattr(nas_mod.config, "LLM_GREETINGS_ENABLED", True)
+
+        await nas_mod._maybe_send_bedtime("chat1", "2025-01-01")
+        assert len(pushed_prompts) == 1
+        prompt, trigger = pushed_prompts[0]
+        assert trigger is True
+        assert "就寝时间" in prompt
+        assert "符合你人设口吻" in prompt
+
+    @pytest.mark.asyncio
+    async def test_dynamic_bedtime_fallback_on_error(self, monkeypatch):
+        _setup_mock_nekro_agent()
+        nas_mod = sys.modules["nekro_auto_sleep"]
+
+        fallback_sent = []
+
+        class FailingCtx:
+            async def push_system(self, prompt, trigger_agent=False):
+                raise RuntimeError("LLM Service Error")
+
+        monkeypatch.setattr(
+            nas_mod.AgentCtx,
+            "create_by_chat_key",
+            AsyncMock(return_value=FailingCtx()),
+        )
+        monkeypatch.setattr(nas_mod, "_deterministic_hit", lambda *_: True)
+        monkeypatch.setattr(nas_mod.config, "LLM_GREETINGS_ENABLED", True)
+        monkeypatch.setattr(
+            nas_mod,
+            "_send_quiet_text",
+            AsyncMock(side_effect=lambda ck, text: fallback_sent.append((ck, text))),
+        )
+
+        await nas_mod._maybe_send_bedtime("chat1", "2025-01-01")
+        assert len(fallback_sent) == 1
+        assert fallback_sent[0][0] == "chat1"
+
+    @pytest.mark.asyncio
+    async def test_dynamic_wake_llm_dispatch(self, monkeypatch):
+        _setup_mock_nekro_agent()
+        nas_mod = sys.modules["nekro_auto_sleep"]
+        from nekro_auto_sleep.persistence import SleepStateStore
+
+        class MockBackend:
+            def __init__(self):
+                self.data = {}
+            async def get(self, chat_key=None, store_key=""):
+                return self.data.get(store_key)
+            async def set(self, chat_key=None, store_key="", value=""):
+                self.data[store_key] = value
+
+        store = SleepStateStore(MockBackend())
+        now = datetime(2026, 9, 2, 0, 30, tzinfo=UTC)
+        init_state = _make_state().model_copy(
+            update={"chat_key": "chat_wake"}
+        )
+        await store.save(init_state)
+
+        pushed_prompts = []
+
+        class MockCtx:
+            chat_key = "chat_wake"
+            async def push_system(self, prompt, trigger_agent=False):
+                pushed_prompts.append((prompt, trigger_agent))
+            async def send_text(self, text, record=False):
+                pass
+
+        monkeypatch.setattr(
+            nas_mod.AgentCtx,
+            "create_by_chat_key",
+            AsyncMock(return_value=MockCtx()),
+        )
+        monkeypatch.setattr(nas_mod.config, "LLM_GREETINGS_ENABLED", True)
+        monkeypatch.setattr(nas_mod.config, "WAKE_NOTICE_ALWAYS", True)
+        monkeypatch.setattr(nas_mod.config, "WAKE_NOTICE_GRACE_MINUTES", 120)
+
+        await nas_mod._settle_wake(store, "chat_wake", now)
+        assert len(pushed_prompts) == 1
+        prompt, trigger = pushed_prompts[0]
+        assert trigger is True
+        assert "自然睡醒" in prompt
+        assert "睡眠质量" in prompt
+
+    @pytest.mark.asyncio
+    async def test_settle_wake_grace_suppression(self, monkeypatch):
+        _setup_mock_nekro_agent()
+        nas_mod = sys.modules["nekro_auto_sleep"]
+        from nekro_auto_sleep.persistence import SleepStateStore
+
+        class MockBackend:
+            def __init__(self):
+                self.data = {}
+            async def get(self, chat_key=None, store_key=""):
+                return self.data.get(store_key)
+            async def set(self, chat_key=None, store_key="", value=""):
+                self.data[store_key] = value
+
+        store = SleepStateStore(MockBackend())
+        planned_wake = datetime(2026, 9, 2, 0, 30, tzinfo=UTC)
+        # Now is 3 hours after planned wake (180 min delay > 120 min grace)
+        now = planned_wake + timedelta(hours=3)
+        init_state = _make_state().model_copy(
+            update={"chat_key": "chat_wake_delayed"}
+        )
+        await store.save(init_state)
+
+        pushed_prompts = []
+
+        class MockCtx:
+            chat_key = "chat_wake_delayed"
+            async def push_system(self, prompt, trigger_agent=False):
+                pushed_prompts.append((prompt, trigger_agent))
+            async def send_text(self, text, record=False):
+                pass
+
+        monkeypatch.setattr(
+            nas_mod.AgentCtx,
+            "create_by_chat_key",
+            AsyncMock(return_value=MockCtx()),
+        )
+        monkeypatch.setattr(nas_mod.config, "LLM_GREETINGS_ENABLED", True)
+        monkeypatch.setattr(nas_mod.config, "WAKE_NOTICE_ALWAYS", True)
+        monkeypatch.setattr(nas_mod.config, "WAKE_NOTICE_GRACE_MINUTES", 120)
+
+        await nas_mod._settle_wake(store, "chat_wake_delayed", now)
+        # Delayed beyond grace limit, so notice should be suppressed!
+        assert len(pushed_prompts) == 0
+
+    @pytest.mark.asyncio
+    async def test_resume_sleep_tool_error_handling(self, monkeypatch):
+        _setup_mock_nekro_agent()
+        nas_mod = sys.modules["nekro_auto_sleep"]
+        from nekro_auto_sleep.persistence import SleepStateStore
+
+        class MockBackend:
+            def __init__(self):
+                self.data = {}
+            async def get(self, chat_key=None, store_key=""):
+                return self.data.get(store_key)
+            async def set(self, chat_key=None, store_key="", value=""):
+                self.data[store_key] = value
+
+        store = SleepStateStore(MockBackend())
+        init_state = ChatSleepState(
+            chat_key="c_awake",
+            status=SleepStatus.AWAKE,
+        )
+        await store.save(init_state)
+        monkeypatch.setattr(nas_mod, "_store", store)
+
+        class MockCtx:
+            chat_key = "c_awake"
+            async def send_text(self, text, record=False): pass
+
+        # Calling resume_sleep when state is AWAKE (not AWAKE_EARLY) triggers ValueError
+        res = await nas_mod.resume_sleep_tool(MockCtx())
+        assert "无法重新入睡" in res
