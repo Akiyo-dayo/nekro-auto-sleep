@@ -375,12 +375,13 @@ def make_timer_task_wrapper(
 
 def make_run_agent_task_wrapper(
     is_sleeping_fn: Callable[[str], bool],
+    has_permission_fn: Callable[[str], bool],
     on_agent_start_fn: Callable[[str], Any],
     on_agent_end_fn: Callable[[str], Any],
 ) -> Callable[..., Any]:
     """Create a wrapper for message_service._run_chat_agent_task.
 
-    Re-checks sleep state before execution (spec ?7.2 layer 3).
+    Re-checks sleep state before execution (spec §7.2 layer 3).
     """
 
     async def wrapper(original: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -400,7 +401,7 @@ def make_run_agent_task_wrapper(
             SourceType.TIMER_RECURRING,
             SourceType.INTERNAL_WAKE_NOTICE,
         ):
-            if is_sleeping_fn(chat_key):
+            if is_sleeping_fn(chat_key) and not has_permission_fn(chat_key):
                 logger.debug(
                     "Blocked _run_chat_agent_task for sleeping chat_key=%s", chat_key
                 )

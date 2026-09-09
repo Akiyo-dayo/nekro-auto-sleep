@@ -203,8 +203,9 @@ class SleepStateStore:
         lock = self._get_lock(chat_key)
         async with lock:
             state = await self.load_or_create(chat_key)
+            old_state = state.model_copy(deep=True)
             new_state = await fn(state)
-            if new_state != state:
+            if new_state != old_state:
                 await self.save(new_state)
             return new_state
 

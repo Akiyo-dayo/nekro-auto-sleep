@@ -392,6 +392,18 @@ _store: SleepStateStore | None = None
 _maintenance_task: asyncio.Task[None] | None = None
 _wake_inject_cache: dict[str, str] = {}
 _installed_wraps: list[tuple[Any, str]] = []
+_is_runtime_active: bool = False
+
+
+def _is_plugin_active() -> bool:
+    """Check whether the plugin runtime is currently active and enabled by host."""
+    if not _is_runtime_active:
+        return False
+    if hasattr(plugin, "enabled") and not plugin.enabled:
+        return False
+    if hasattr(plugin, "is_enabled") and callable(plugin.is_enabled) and not plugin.is_enabled():
+        return False
+    return True
 
 
 def _get_store() -> SleepStateStore:
@@ -484,8 +496,11 @@ def _get_user_id(message: ChatMessage) -> str:
 
 def _is_sleeping(chat_key: str) -> bool:
     """Quick check if a chat_key is in sleep state (for runtime wrappers)."""
-    store = _get_store()
-    state = store.get_cached(chat_key)
+    if not _is_plugin_active():
+        return False
+    if _store is None:
+        return False
+    state = _store.get_cached(chat_key)
     if state is None:
         return False
     return state.status == SleepStatus.ASLEEP
@@ -592,6 +607,7 @@ async def _maybe_send_bedtime(chat_key: str, sleep_date: str) -> None:
             await ctx.push_system(prompt, trigger_agent=True)
             return
         except Exception as exc:
+            lease_ledger.remove(lease_id, chat_key=chat_key)
             logger.warning(
                 "Failed to dispatch dynamic bedtime LLM greeting for %s, falling back: %s",
                 chat_key,
@@ -679,7 +695,7 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage, *_args: Any, **_k
     # *_args/**_kwargs: upstream 2.4+ may extend hook signatures; extra
     # parameters are accepted and ignored so a signature change can never
     # TypeError through the framework's un-guarded dispatch loop.
-    if not config.ENABLED:
+    if not _is_plugin_active() or not config.ENABLED:
         return MsgSignal.CONTINUE
 
     chat_key = ctx.chat_key
@@ -1117,6 +1133,7 @@ async def _settle_wake(
                     )
 
             if not sent_via_llm:
+                lease_ledger.remove(lease_id, chat_key=chat_key)
                 await ctx.send_text(fallback_text, record=False)
         finally:
             current_source.reset(token)
@@ -1170,7 +1187,7 @@ def _install_wraps() -> bool:
                         await store.with_state(chat_key, _refresh)
 
             wrapper = make_run_agent_task_wrapper(
-                _is_sleeping, _on_agent_start, _on_agent_end
+                _is_sleeping, _has_permission, _on_agent_start, _on_agent_end
             )
             if wrap_callable(ms, "_run_chat_agent_task", wrapper):
                 _installed_wraps.append((ms, "_run_chat_agent_task"))
@@ -1242,7 +1259,7 @@ async def _discover_legacy_chat_keys() -> set[str]:
 
 async def _start_runtime() -> None:
     """Start plugin runtime components idempotently."""
-    global _store, _maintenance_task
+    global _store, _maintenance_task, _is_runtime_active
 
     _check_install_dir_name()
 
@@ -1256,12 +1273,15 @@ async def _start_runtime() -> None:
     if _maintenance_task is None or _maintenance_task.done():
         _maintenance_task = asyncio.create_task(_maintenance_loop())
 
+    _is_runtime_active = True
     logger.info("Auto-sleep plugin runtime started")
 
 
 async def _stop_runtime() -> None:
     """Stop plugin runtime components idempotently without deleting persisted state."""
-    global _store, _maintenance_task
+    global _store, _maintenance_task, _is_runtime_active
+
+    _is_runtime_active = False
 
     task = _maintenance_task
     _maintenance_task = None

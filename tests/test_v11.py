@@ -642,3 +642,84 @@ class TestPersistenceAndToolEnhancements:
         # Calling resume_sleep when state is AWAKE (not AWAKE_EARLY) triggers ValueError
         res = await nas_mod.resume_sleep_tool(MockCtx())
         assert "无法重新入睡" in res
+
+    @pytest.mark.asyncio
+    async def test_persistence_with_state_saves_in_place_mutation(self):
+        from nekro_auto_sleep.persistence import SleepStateStore
+
+        class MockBackend:
+            def __init__(self):
+                self.data = {}
+            async def get(self, chat_key=None, store_key=""):
+                return self.data.get(store_key)
+            async def set(self, chat_key=None, store_key="", value=""):
+                self.data[store_key] = value
+
+        backend = MockBackend()
+        store = SleepStateStore(backend)
+        init_state = ChatSleepState(chat_key="test_save", status=SleepStatus.AWAKE)
+        await store.save(init_state)
+
+        t_now = datetime(2026, 9, 2, 10, 0, tzinfo=UTC)
+
+        async def _mutate(s: ChatSleepState) -> ChatSleepState:
+            s.last_seen_at = t_now
+            return s
+
+        await store.with_state("test_save", _mutate)
+        # Verify it was saved to backend
+        reloaded = await store.load_or_create("test_save")
+        assert reloaded.last_seen_at == t_now
+
+    @pytest.mark.asyncio
+    async def test_layer3_run_agent_task_wrapper_allows_permission_lease(self):
+        from nekro_auto_sleep.runtime import (
+            make_run_agent_task_wrapper,
+            lease_ledger,
+            SourceType,
+        )
+
+        lease_ledger.clear()
+        chat_key = "test_l3_chat"
+        # Bot is sleeping
+        is_sleeping_fn = lambda ck: True
+        has_permission_fn = lambda ck: lease_ledger.has_active_for_chat(ck)
+
+        called = []
+        async def original_agent_task(*args, **kwargs):
+            called.append(True)
+            return "agent_result"
+
+        wrapper = make_run_agent_task_wrapper(
+            is_sleeping_fn,
+            has_permission_fn,
+            on_agent_start_fn=AsyncMock(),
+            on_agent_end_fn=AsyncMock(),
+        )
+
+        # 1. No lease/permission -> blocked
+        res = await wrapper(original_agent_task, chat_key=chat_key)
+        assert res is None
+        assert len(called) == 0
+
+        # 2. Active lease exists -> allowed
+        lease_ledger.create("lease_wake", SourceType.INTERNAL_WAKE_NOTICE, chat_key, "wake", ttl=10.0)
+        res = await wrapper(original_agent_task, chat_key=chat_key)
+        assert res == "agent_result"
+        assert len(called) == 1
+        lease_ledger.clear()
+
+    def test_plugin_active_fail_open_when_disabled(self, monkeypatch):
+        _setup_mock_nekro_agent()
+        nas_mod = sys.modules["nekro_auto_sleep"]
+
+        # 1. When runtime is not active, _is_plugin_active returns False
+        monkeypatch.setattr(nas_mod, "_is_runtime_active", False)
+        assert nas_mod._is_plugin_active() is False
+        assert nas_mod._is_sleeping("any_chat") is False
+
+        # 2. When runtime is active but host plugin.enabled is False, returns False
+        monkeypatch.setattr(nas_mod, "_is_runtime_active", True)
+        monkeypatch.setattr(nas_mod.plugin, "enabled", False, raising=False)
+        assert nas_mod._is_plugin_active() is False
+        assert nas_mod._is_sleeping("any_chat") is False

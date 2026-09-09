@@ -356,7 +356,7 @@ def compute_streak_note(history: dict[str, int], sleep_date: str, good_threshold
         if streak >= 2:
             notes.append(f"已经连续 {streak} 天睡得不错")
         else:
-            notes.append("今晚算是个好开头")
+            notes.append("今天算是个好开头")
 
     if diff >= 10:
         notes.append(f"比昨晚多睡了 {diff} 分的含金量")
