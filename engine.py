@@ -47,6 +47,10 @@ class ActionNone(SleepAction):
     """No external action needed."""
 
 
+class ActionStayAsleep(SleepAction):
+    """Keep sleeping — message is not directed at the bot and no offer is pending."""
+
+
 class ActionSendFixed(SleepAction):
     """Send a fixed message (not through LLM), record=False."""
 
@@ -290,13 +294,25 @@ def clean_expired_offers(
     return state
 
 
-def handle_valid_call_while_asleep(
+def handle_message_while_asleep(
     state: ChatSleepState,
     now_utc: datetime,
     user_id: str,
     persona_name: str,
+    valid_call: bool,
 ) -> tuple[ChatSleepState, SleepAction]:
-    """Handle a valid user call during ASLEEP state.
+    """Handle a user message during ASLEEP under the two-step wake protocol.
+
+    Step 1 — a valid call (message directed at the bot) sends the fixed
+    question and opens the confirm window.
+
+    Step 2 — while the question is pending and unexpired, ANY user message
+    confirms the wake directly: no matter who answers or what they say, the
+    chat enters AWAKE_EARLY and the confirming message is force-triggered
+    into the LLM. No keyword or sender matching is applied to the answer.
+
+    Any other message (no pending question, not directed at the bot) keeps
+    the chat asleep.
 
     Returns (new_state, action) where action tells the caller what to do.
     """
@@ -306,27 +322,32 @@ def handle_valid_call_while_asleep(
     snap = state.cycle.config_snapshot
     confirm_window = timedelta(seconds=snap.wake_confirm_window_seconds)
 
-    pending = dict(state.pending_wake_offers)
-    existing = pending.get(user_id)
+    pending = {
+        uid: offer
+        for uid, offer in state.pending_wake_offers.items()
+        if now_utc <= offer.expires_at
+    }
 
-    if existing is not None and now_utc <= existing.expires_at:
-        # Second call within window -> confirm wake
+    if pending:
+        # Second message within the window -> confirm wake, whoever sent it.
+        offer_owners = set(pending)
         wake_attempts = list(state.cycle.wake_attempts)
         for i, wa in enumerate(wake_attempts):
-            if wa.user_id == user_id and not wa.is_confirmed:
+            if wa.user_id in offer_owners and not wa.is_confirmed:
                 wake_attempts[i] = wa.model_copy(
                     update={"is_confirmed": True, "confirmed_at": now_utc}
                 )
 
         state.cycle = state.cycle.model_copy(update={"wake_attempts": wake_attempts})
-        pending.pop(user_id, None)
-        state = state.model_copy(update={"pending_wake_offers": pending})
 
         state = transition_to_awake_early(
             state, now_utc, user_id, snap.early_wake_idle_minutes
         )
 
         return state, ActionForceWake(inject_text=build_wake_inject_text(state, now_utc))
+
+    if not valid_call:
+        return state, ActionStayAsleep()
 
     # First call or expired previous offer -> send fixed prompt
     pending[user_id] = PendingWakeOffer(

@@ -35,13 +35,14 @@ from .engine import (
     ActionSendFixed,
     ActionSendResumeSleep,
     ActionSendWakeNotice,
+    ActionStayAsleep,
     clean_expired_offers,
     close_sleep_segment,
     close_timer_interval,
     compute_actual_sleep_seconds,
     handle_idle_sleep_back,
+    handle_message_while_asleep,
     handle_resume_sleep,
-    handle_valid_call_while_asleep,
     has_active_timer_lease,
     is_idle_expired,
     mark_notice_failed,
@@ -728,12 +729,12 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage, *_args: Any, **_k
             return state
 
         if state.status == SleepStatus.ASLEEP:
-            if not _is_valid_call(message, persona_name):
-                _result_signal = MsgSignal.BLOCK_ALL
-                return state
-
-            state, action = handle_valid_call_while_asleep(
-                state, now_utc, user_id, persona_name
+            # Two-step wake protocol: a valid call asks the question; while it
+            # is pending, ANY user message within the confirm window confirms
+            # the wake directly (no keyword/sender matching on the answer).
+            valid_call = _is_valid_call(message, persona_name)
+            state, action = handle_message_while_asleep(
+                state, now_utc, user_id, persona_name, valid_call
             )
             _result_action = action
 
@@ -745,6 +746,8 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage, *_args: Any, **_k
                     _result_signal = MsgSignal.BLOCK_ALL
                 else:
                     _result_signal = MsgSignal.BLOCK_TRIGGER
+            elif isinstance(action, ActionStayAsleep):
+                _result_signal = MsgSignal.BLOCK_ALL
             else:
                 _result_signal = MsgSignal.CONTINUE
 
