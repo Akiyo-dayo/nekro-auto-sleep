@@ -99,6 +99,9 @@ class ConfigSnapshot(BaseModel):
     wake_confirm_window_seconds: int
     history_mode: Literal["preserve", "strict"]
     call_keywords: list[str]
+    confirm_keywords: list[str] = Field(
+        default_factory=lambda: ["要", "叫醒", "醒来", "起床", "是", "是的", "确认"]
+    )
     fallback_persona_name: str
     early_wake_idle_minutes: int
     quality_min: int

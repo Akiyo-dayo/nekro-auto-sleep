@@ -190,12 +190,20 @@ def create_config_snapshot(
     quality_min: int,
     quality_max: int,
     quality_jitter_points: float,
+    confirm_keywords: str | list[str] = ("要", "叫醒", "醒来", "起床", "是", "是的", "确认"),
 ) -> ConfigSnapshot:
     """Create a ConfigSnapshot from current config values."""
     if isinstance(call_keywords, str):
         kw_list = [k.strip() for k in call_keywords.replace("\n", ",").split(",") if k.strip()]
     else:
         kw_list = list(call_keywords)
+
+    if isinstance(confirm_keywords, str):
+        confirm_kw_list = [
+            k.strip() for k in confirm_keywords.replace("\n", ",").split(",") if k.strip()
+        ]
+    else:
+        confirm_kw_list = list(confirm_keywords)
 
     return ConfigSnapshot(
         timezone=timezone,
@@ -207,6 +215,7 @@ def create_config_snapshot(
         wake_confirm_window_seconds=wake_confirm_window_seconds,
         history_mode=history_mode,  # type: ignore[arg-type]
         call_keywords=kw_list,
+        confirm_keywords=confirm_kw_list,
         fallback_persona_name=fallback_persona_name,
         early_wake_idle_minutes=early_wake_idle_minutes,
         quality_min=quality_min,

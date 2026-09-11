@@ -35,13 +35,14 @@ from .engine import (
     ActionSendFixed,
     ActionSendResumeSleep,
     ActionSendWakeNotice,
+    ActionStayAsleep,
     clean_expired_offers,
     close_sleep_segment,
     close_timer_interval,
     compute_actual_sleep_seconds,
     handle_idle_sleep_back,
+    handle_message_while_asleep,
     handle_resume_sleep,
-    handle_valid_call_while_asleep,
     has_active_timer_lease,
     is_idle_expired,
     mark_notice_failed,
@@ -97,7 +98,7 @@ plugin = NekroPlugin(
     name="自动睡眠",
     module_name="nekro_auto_sleep",
     description="为每个会话提供独立的拟人化睡眠周期：叫醒协议、睡眠质量评分、梦境播报与连续打卡",
-    version="1.1.2",
+    version="1.2.0",
     author="Akiyo_dayo",
     url="https://github.com/Akiyo-dayo/NekroAgent_ByAkiyo",
     allow_sleep=True,
@@ -233,6 +234,18 @@ class SleepConfig(ConfigBase):
             i18n_description=i18n.i18n_text(
                 zh_CN="触发叫醒的关键词，逗号或换行分隔",
                 en_US="Keywords that trigger wake-up, separated by comma or newline",
+            ),
+        ).model_dump(),
+    )
+    WAKE_CONFIRM_KEYWORDS: str = Field(
+        default="要,叫醒,醒来,起床,是,是的,确认",
+        title="唤醒确认关键词",
+        json_schema_extra=ExtraField(
+            is_textarea=True,
+            i18n_title=i18n.i18n_text(zh_CN="唤醒确认关键词", en_US="Wake Confirm Keywords"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="提问后确认唤醒的关键词，逗号或换行分隔（例如：要,叫醒）",
+                en_US="Keywords confirming wake-up after prompt, separated by comma or newline (e.g. 要,叫醒)",
             ),
         ).model_dump(),
     )
@@ -457,8 +470,13 @@ def _parse_keywords() -> list[str]:
     return [k.strip() for k in raw.replace("\n", ",").split(",") if k.strip()]
 
 
-def _is_valid_call(message: ChatMessage, persona_name: str) -> bool:
-    """Check if a message constitutes a valid wake-up call (spec §6.1)."""
+def _parse_confirm_keywords() -> list[str]:
+    raw = getattr(config, "WAKE_CONFIRM_KEYWORDS", "要,叫醒,醒来,起床,是,是的,确认")
+    return [k.strip() for k in raw.replace("\n", ",").split(",") if k.strip()]
+
+
+def _is_mention_bot(message: ChatMessage, persona_name: str) -> bool:
+    """Check if a message directly mentions or targets the bot."""
     if hasattr(message, "channel_type") and message.channel_type == "private":
         return True
     if hasattr(message, "is_tome") and message.is_tome:
@@ -466,11 +484,61 @@ def _is_valid_call(message: ChatMessage, persona_name: str) -> bool:
     text = message.content_text if hasattr(message, "content_text") else str(message)
     if persona_name and persona_name in text:
         return True
+    return bool(_is_reply_to_bot(message))
+
+
+def _is_valid_call(message: ChatMessage, persona_name: str) -> bool:
+    """Check if a message constitutes a valid wake-up call (spec §6.1)."""
+    if _is_mention_bot(message, persona_name):
+        return True
+    text = message.content_text if hasattr(message, "content_text") else str(message)
     keywords = _parse_keywords()
     for kw in keywords:
         if kw in text:
             return True
-    return bool(_is_reply_to_bot(message))
+    return False
+
+
+def _check_wake_intent(
+    message: ChatMessage,
+    persona_name: str,
+    confirm_keywords: list[str] | None = None,
+) -> tuple[bool, bool]:
+    """Check wake confirmation intent during the pending offer window.
+
+    Returns (is_confirm, is_cancel).
+    - is_cancel: True if user expresses negative intent ('不要', '不用', '算了', etc.)
+    - is_confirm: True if user mentions bot OR triggers confirm keywords (e.g. '要') without negative prefix.
+    """
+    text = message.content_text if hasattr(message, "content_text") else str(message)
+    text_clean = text.strip() if text else ""
+
+    # Negative words detection
+    negative_words = ("不要", "不用", "算了", "别叫", "不叫", "睡吧", "否", "取消", "别醒", "不唤醒", "不要叫")
+    for neg in negative_words:
+        if neg in text_clean:
+            return False, True
+
+    # 1. 提及 bot（私聊、@Bot、包含名字、回复Bot）
+    is_mention = _is_mention_bot(message, persona_name)
+
+    # 2. 触发配置里的确认词（例如“要”、“叫醒”等）
+    if confirm_keywords is None:
+        confirm_keywords = _parse_confirm_keywords()
+
+    has_confirm_kw = False
+    for kw in confirm_keywords:
+        if not kw:
+            continue
+        if kw in text_clean:
+            # 针对单字词（如“要”、“是”），若在长句中且未提及bot，避免日常水群误触（如“我要出门了”）
+            if len(kw) == 1 and len(text_clean) > 10 and not is_mention:
+                continue
+            has_confirm_kw = True
+            break
+
+    is_confirm = is_mention or has_confirm_kw
+    return is_confirm, False
 
 
 def _is_reply_to_bot(message: ChatMessage) -> bool:
@@ -532,6 +600,7 @@ def _make_config_snapshot() -> Any:
         quality_min=config.QUALITY_MIN,
         quality_max=config.QUALITY_MAX,
         quality_jitter_points=config.QUALITY_JITTER_POINTS,
+        confirm_keywords=getattr(config, "WAKE_CONFIRM_KEYWORDS", "要,叫醒,醒来,起床,是,是的,确认"),
     )
 
 
@@ -728,12 +797,25 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage, *_args: Any, **_k
             return state
 
         if state.status == SleepStatus.ASLEEP:
-            if not _is_valid_call(message, persona_name):
-                _result_signal = MsgSignal.BLOCK_ALL
-                return state
-
-            state, action = handle_valid_call_while_asleep(
-                state, now_utc, user_id, persona_name
+            # Two-step wake protocol:
+            # Step 1: a valid call asks the question and opens the confirm window.
+            # Step 2: while pending, user must mention bot OR trigger confirm keywords
+            #         (e.g. '要') to confirm wake. Otherwise stays asleep (e.g. water chats).
+            valid_call = _is_valid_call(message, persona_name)
+            confirm_kws = (
+                state.cycle.config_snapshot.confirm_keywords
+                if state.cycle and hasattr(state.cycle.config_snapshot, "confirm_keywords")
+                else None
+            )
+            is_confirm, is_cancel = _check_wake_intent(message, persona_name, confirm_kws)
+            state, action = handle_message_while_asleep(
+                state,
+                now_utc,
+                user_id,
+                persona_name,
+                valid_call,
+                is_confirm=is_confirm,
+                is_cancel=is_cancel,
             )
             _result_action = action
 
@@ -745,6 +827,8 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage, *_args: Any, **_k
                     _result_signal = MsgSignal.BLOCK_ALL
                 else:
                     _result_signal = MsgSignal.BLOCK_TRIGGER
+            elif isinstance(action, ActionStayAsleep):
+                _result_signal = MsgSignal.BLOCK_ALL
             else:
                 _result_signal = MsgSignal.CONTINUE
 
