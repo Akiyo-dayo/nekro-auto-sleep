@@ -300,19 +300,23 @@ def handle_message_while_asleep(
     user_id: str,
     persona_name: str,
     valid_call: bool,
+    is_confirm: bool | None = None,
+    is_cancel: bool = False,
 ) -> tuple[ChatSleepState, SleepAction]:
     """Handle a user message during ASLEEP under the two-step wake protocol.
 
-    Step 1 — a valid call (message directed at the bot) sends the fixed
-    question and opens the confirm window.
+    Step 1 — a valid call (message directed at the bot or containing call keywords)
+    sends the fixed question and opens the confirm window.
 
-    Step 2 — while the question is pending and unexpired, ANY user message
-    confirms the wake directly: no matter who answers or what they say, the
-    chat enters AWAKE_EARLY and the confirming message is force-triggered
-    into the LLM. No keyword or sender matching is applied to the answer.
+    Step 2 — while the question is pending and unexpired:
+      - If user cancels (is_cancel=True, e.g. "不要", "算了"), the offer is cleared
+        and the bot stays asleep.
+      - If user confirms (is_confirm=True, e.g. mentions bot or triggers confirm keywords like "要"),
+        the chat enters AWAKE_EARLY and the confirming message is force-triggered into LLM.
+      - If neither (e.g. unrelated chat without mentioning bot or saying "要"),
+        the message is ignored and the bot stays asleep.
 
-    Any other message (no pending question, not directed at the bot) keeps
-    the chat asleep.
+    Any other message keeps the chat asleep.
 
     Returns (new_state, action) where action tells the caller what to do.
     """
@@ -329,7 +333,19 @@ def handle_message_while_asleep(
     }
 
     if pending:
-        # Second message within the window -> confirm wake, whoever sent it.
+        if is_cancel:
+            pending.pop(user_id, None)
+            state = state.model_copy(update={"pending_wake_offers": pending})
+            return state, ActionStayAsleep()
+
+        confirm = is_confirm if is_confirm is not None else valid_call
+        if not confirm:
+            # Neither mentioned bot nor triggered confirm keywords: keep sleeping
+            if len(pending) != len(state.pending_wake_offers):
+                state = state.model_copy(update={"pending_wake_offers": pending})
+            return state, ActionStayAsleep()
+
+        # Confirmed wake
         offer_owners = set(pending)
         wake_attempts = list(state.cycle.wake_attempts)
         for i, wa in enumerate(wake_attempts):

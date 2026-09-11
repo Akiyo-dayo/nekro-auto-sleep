@@ -723,3 +723,53 @@ class TestPersistenceAndToolEnhancements:
         monkeypatch.setattr(nas_mod.plugin, "enabled", False, raising=False)
         assert nas_mod._is_plugin_active() is False
         assert nas_mod._is_sleeping("any_chat") is False
+
+    def test_wake_intent_detection(self):
+        _setup_mock_nekro_agent()
+        nas_mod = sys.modules["nekro_auto_sleep"]
+
+        class FakeMsg:
+            def __init__(self, text: str, sender: str = "u1", is_tome: bool = False, reply_id: str | None = None):
+                self.content_text = text
+                self.sender = sender
+                self.is_tome = is_tome
+                self.reply_message_id = reply_id
+
+        # 1. Direct positive keywords
+        is_conf, is_canc = nas_mod._check_wake_intent(FakeMsg("要"), persona_name="bot")
+        assert is_conf is True
+        assert is_canc is False
+
+        is_conf, is_canc = nas_mod._check_wake_intent(FakeMsg("醒来"), persona_name="bot")
+        assert is_conf is True
+        assert is_canc is False
+
+        # 2. Negative cancellation takes priority
+        is_conf, is_canc = nas_mod._check_wake_intent(FakeMsg("不要"), persona_name="bot")
+        assert is_canc is True
+        assert is_conf is False
+
+        is_conf, is_canc = nas_mod._check_wake_intent(FakeMsg("算了吧，你继续睡"), persona_name="bot")
+        assert is_canc is True
+        assert is_conf is False
+
+        # 3. Mentioning bot in confirmation window
+        is_conf, is_canc = nas_mod._check_wake_intent(FakeMsg("bot 起来一下", is_tome=False), persona_name="bot")
+        assert is_conf is True
+        assert is_canc is False
+
+        is_conf, is_canc = nas_mod._check_wake_intent(FakeMsg("帮我查个东西", is_tome=True), persona_name="bot")
+        assert is_conf is True
+        assert is_canc is False
+
+        # 4. Unrelated group chatter without mention or confirm keyword
+        is_conf, is_canc = nas_mod._check_wake_intent(FakeMsg("今天去吃什么"), persona_name="bot")
+        assert is_conf is False
+        assert is_canc is False
+
+        # 5. Long sentence containing single character keyword '要' without mentioning bot
+        # e.g. "我要出门了待会儿再回来" -> should NOT be treated as confirmation
+        is_conf, is_canc = nas_mod._check_wake_intent(FakeMsg("我要出门了待会儿再回来"), persona_name="bot")
+        assert is_conf is False
+        assert is_canc is False
+

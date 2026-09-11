@@ -99,8 +99,8 @@ class TestWakeProtocol:
         assert isinstance(action, ActionForceWake)
         assert state.status == SleepStatus.AWAKE_EARLY
 
-    def test_any_user_message_within_window_confirms(self, default_snapshot):
-        # Any sender, any content — the answer is never keyword-matched.
+    def test_unrelated_message_within_window_stays_asleep(self, default_snapshot):
+        # Plain message without mentioning bot or confirm keywords stays asleep
         state = self._make_sleeping_state(default_snapshot)
         now1 = datetime(2026, 8, 13, 16, 0, tzinfo=UTC)
         state, _ = handle_message_while_asleep(
@@ -109,13 +109,14 @@ class TestWakeProtocol:
 
         now2 = now1 + timedelta(seconds=60)
         state, action = handle_message_while_asleep(
-            state, now2, "user2", "Bot", valid_call=False
+            state, now2, "user2", "Bot", valid_call=False, is_confirm=False
         )
-        assert isinstance(action, ActionForceWake)
-        assert state.status == SleepStatus.AWAKE_EARLY
-        assert not state.pending_wake_offers
+        assert isinstance(action, ActionStayAsleep)
+        assert state.status == SleepStatus.ASLEEP
+        assert "user1" in state.pending_wake_offers
 
-    def test_confirm_marks_offer_owner_attempt_confirmed(self, default_snapshot):
+    def test_confirm_wake_by_mention_or_keyword(self, default_snapshot):
+        # Must mention bot or trigger confirm keywords to enter wake confirmation
         state = self._make_sleeping_state(default_snapshot)
         now1 = datetime(2026, 8, 13, 16, 0, tzinfo=UTC)
         state, _ = handle_message_while_asleep(
@@ -123,11 +124,29 @@ class TestWakeProtocol:
         )
 
         now2 = now1 + timedelta(seconds=60)
-        state, _ = handle_message_while_asleep(
-            state, now2, "user2", "Bot", valid_call=False
+        state, action = handle_message_while_asleep(
+            state, now2, "user2", "Bot", valid_call=False, is_confirm=True
         )
+        assert isinstance(action, ActionForceWake)
+        assert state.status == SleepStatus.AWAKE_EARLY
+        assert not state.pending_wake_offers
         attempts = state.cycle.wake_attempts
         assert any(wa.user_id == "user1" and wa.is_confirmed for wa in attempts)
+
+    def test_cancel_wake_clears_offer_and_stays_asleep(self, default_snapshot):
+        state = self._make_sleeping_state(default_snapshot)
+        now1 = datetime(2026, 8, 13, 16, 0, tzinfo=UTC)
+        state, _ = handle_message_while_asleep(
+            state, now1, "user1", "Bot", valid_call=True
+        )
+
+        now2 = now1 + timedelta(seconds=60)
+        state, action = handle_message_while_asleep(
+            state, now2, "user1", "Bot", valid_call=False, is_confirm=False, is_cancel=True
+        )
+        assert isinstance(action, ActionStayAsleep)
+        assert state.status == SleepStatus.ASLEEP
+        assert "user1" not in state.pending_wake_offers
 
     def test_expired_offer_ignores_plain_message(self, default_snapshot):
         state = self._make_sleeping_state(default_snapshot)
