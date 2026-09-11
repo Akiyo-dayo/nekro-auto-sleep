@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -65,6 +66,8 @@ from .persistence import DATA_KEY, SleepStateStore
 from .quality import (
     compute_quality,
     compute_streak_note,
+    dream_seed_hint,
+    dream_tone_hint,
     pick_dream,
     quality_tier,
     stable_pick,
@@ -98,7 +101,7 @@ plugin = NekroPlugin(
     name="自动睡眠",
     module_name="nekro_auto_sleep",
     description="为每个会话提供独立的拟人化睡眠周期：叫醒协议、睡眠质量评分、梦境播报与连续打卡",
-    version="1.2.0",
+    version="1.2.2",
     author="Akiyo_dayo",
     url="https://github.com/Akiyo-dayo/NekroAgent_ByAkiyo",
     allow_sleep=True,
@@ -127,8 +130,8 @@ class SleepConfig(ConfigBase):
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="启用自动睡眠", en_US="Enable Auto Sleep"),
             i18n_description=i18n.i18n_text(
-                zh_CN="总开关，关闭后所有会话停止新的睡眠行为",
-                en_US="Master switch; disabling stops new sleep behavior for all chats",
+                zh_CN="总开关，关闭后立即停止全部拦截（含已在睡眠中的会话，消息正常触发回复）；已有睡眠状态保留，重新开启后恢复",
+                en_US="Master switch; turning it off immediately stops all interception (including chats already asleep, messages trigger normally); existing sleep states are kept and resume on re-enable",
             ),
         ).model_dump(),
     )
@@ -208,8 +211,8 @@ class SleepConfig(ConfigBase):
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="叫醒确认窗口（秒）", en_US="Wake Confirm Window (s)"),
             i18n_description=i18n.i18n_text(
-                zh_CN="首次呼叫后，同一用户需在此秒数内再次呼叫才能叫醒，10-1800",
-                en_US="After the first call, the same user must call again within this many seconds to wake up, 10-1800",
+                zh_CN="首次呼叫提问后的等待确认窗口，需在窗口内提及 Bot 或回复确认词（如：要、叫醒）才能唤醒；回复否定词（如：不要、算了）则取消，10-1800",
+                en_US="Confirmation window after the first wake offer; mention the bot or reply a confirm keyword (e.g. 要) within it to wake; negative words cancel, 10-1800",
             ),
         ).model_dump(),
     )
@@ -407,14 +410,49 @@ _wake_inject_cache: dict[str, str] = {}
 _installed_wraps: list[tuple[Any, str]] = []
 _is_runtime_active: bool = False
 
+# Persona lookups hit the DB on every user message; a short TTL cache keeps
+# mention detection cheap in busy chats without going stale for long.
+_PERSONA_CACHE_TTL_SECONDS = 60.0
+_persona_cache: dict[str, tuple[float, str]] = {}
+
+
+def _plugin_host_enabled() -> bool:
+    """Best-effort probe of the host-side enable state of this plugin.
+
+    Verified host shapes (checked against framework sources):
+    - KroMiose upstream (v2.3.x / v2.4.x): ``NekroPlugin.is_enabled`` is a
+      @property returning bool; there is no ``enabled`` attribute. The
+      collector marks plugins that load while disabled by writing
+      ``plugin._is_enabled = False`` directly WITHOUT firing ``on_disabled``
+      callbacks, so runtime state alone cannot detect that restart path.
+    - Akiyo fork (v2.3.x): same property shape (the flag is the union of the
+      global switch and any per-scope overrides).
+    - Unknown / future hosts: also accept a plain ``enabled`` attribute or a
+      callable ``is_enabled()`` method.
+
+    Returns True unless the host positively reports the plugin as disabled:
+    an unrecognized host shape must never silently kill the sleep gate, while
+    a confirmed host disable always fails open.
+    """
+    try:
+        enabled_attr = getattr(plugin, "enabled", None)
+        if isinstance(enabled_attr, bool) and not enabled_attr:
+            return False
+        is_enabled = getattr(plugin, "is_enabled", None)
+        if callable(is_enabled):
+            return bool(is_enabled())
+        if isinstance(is_enabled, bool):
+            return is_enabled
+    except Exception:  # noqa: BLE001 - probing must never raise
+        return True
+    return True
+
 
 def _is_plugin_active() -> bool:
     """Check whether the plugin runtime is currently active and enabled by host."""
     if not _is_runtime_active:
         return False
-    if hasattr(plugin, "enabled") and not plugin.enabled:
-        return False
-    if hasattr(plugin, "is_enabled") and callable(plugin.is_enabled) and not plugin.is_enabled():
+    if not _plugin_host_enabled():
         return False
     return True
 
@@ -454,11 +492,17 @@ def _check_install_dir_name() -> None:
 
 
 async def _get_persona_name(ctx: AgentCtx) -> str:
-    """Get persona name, falling back to config default."""
+    """Get persona name, falling back to config default (short TTL cache)."""
+    chat_key = ctx.chat_key
+    now = time.monotonic()
+    cached = _persona_cache.get(chat_key)
+    if cached is not None and now - cached[0] < _PERSONA_CACHE_TTL_SECONDS:
+        return cached[1]
     try:
         db_channel = await ctx.db_chat_channel
         preset = await db_channel.get_preset()
         if preset and hasattr(preset, "name") and preset.name:
+            _persona_cache[chat_key] = (now, preset.name)
             return preset.name
     except Exception:
         pass
@@ -563,8 +607,14 @@ def _get_user_id(message: ChatMessage) -> str:
 
 
 def _is_sleeping(chat_key: str) -> bool:
-    """Quick check if a chat_key is in sleep state (for runtime wrappers)."""
-    if not _is_plugin_active():
+    """Quick check if a chat_key is in sleep state (for runtime wrappers).
+
+    Fail-open whenever the plugin is inactive, host-disabled, or the master
+    switch (config.ENABLED) is off: a disabled plugin must never swallow
+    agent tasks, and chats put to sleep before the master switch was turned
+    off must not stay stuck behind the dispatch-layer gate.
+    """
+    if not _is_plugin_active() or not config.ENABLED:
         return False
     if _store is None:
         return False
@@ -660,11 +710,11 @@ async def _maybe_send_bedtime(chat_key: str, sleep_date: str) -> None:
     if config.LLM_GREETINGS_ENABLED and hasattr(ctx, "push_system"):
         prompt = (
             "【系统提示：时间已到你的就寝时间，你准备入睡休息。】\n"
-            "请结合你的人设性格和当前的群聊/频道聊天上下文，用符合你人设口吻的第一人称，"
-            "向频道大家道一声晚安并告知你准备睡了。\n"
+            "请用符合你口吻的第一人称，向频道大家道一声晚安并告知你准备睡了。\n"
             "要求：\n"
-            "1. 严格契合你的身份性格设定与口吻（如傲娇/软萌/稳重/俏皮等）；\n"
-            "2. 自然承接上下文氛围，若刚才有话题可简短收尾，切忌生硬；\n"
+            "1. 说话的语气、口癖、情绪风格要契合你的身份性格设定；\n"
+            "2. 内容与表达方式完全由你自由创作——可以呼应刚才的聊天话题收尾，也可以只是随性道别，"
+            "不要套用任何固定句式或模板；\n"
             "3. 简短自然，直接输出你要说的话，不要携带任何系统标记或多余解释。"
         )
         token = current_source.set(SourceType.INTERNAL_WAKE_NOTICE)
@@ -858,7 +908,11 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage, *_args: Any, **_k
 
 @plugin.mount_on_system_message()
 async def on_system_message(ctx: AgentCtx, message: str, *_args: Any, **_kwargs: Any) -> MsgSignal | None:
-    if not config.ENABLED:
+    # Guard order matters: the host marks plugins that load while disabled by
+    # writing ``plugin._is_enabled = False`` without firing ``on_disabled``,
+    # so this hook can still be dispatched while ``_store`` is being torn down
+    # or already gone. Bail out before ``_get_store()`` can assert.
+    if not _is_plugin_active() or not config.ENABLED:
         return MsgSignal.CONTINUE
 
     chat_key = ctx.chat_key
@@ -921,6 +975,8 @@ async def resume_sleep_tool(*call_args: Any, **call_kwargs: Any) -> str:
     The host normally passes ctx positionally; pulling it from either args or
     kwargs keeps the tool resilient to sandbox call-shape changes.
     """
+    if not _is_plugin_active() or not config.ENABLED:
+        raise RuntimeError("自动睡眠插件当前未启用，无法执行重新入睡操作")
     _ctx: AgentCtx = call_args[0] if call_args else call_kwargs.get("ctx")
     chat_key = _ctx.chat_key
     store = _get_store()
@@ -964,6 +1020,8 @@ async def resume_sleep_tool(*call_args: Any, **call_kwargs: Any) -> str:
 )
 async def get_sleep_report_tool(*call_args: Any, **call_kwargs: Any) -> str:
     """Report the chat's current sleep status and recent quality history."""
+    if not _is_plugin_active() or not config.ENABLED:
+        raise RuntimeError("自动睡眠插件当前未启用，无法查询睡眠报告")
     _ctx: AgentCtx = call_args[0] if call_args else call_kwargs.get("ctx")
     chat_key = _ctx.chat_key
     store = _get_store()
@@ -971,8 +1029,7 @@ async def get_sleep_report_tool(*call_args: Any, **call_kwargs: Any) -> str:
 
     state = store.get_cached(chat_key)
     if state is None:
-        async with store._get_lock(chat_key):  # noqa: SLF001 - read-through load
-            state = await store.load_or_create(chat_key)
+        state = await store.ensure_loaded(chat_key)
 
     if state.status == SleepStatus.ASLEEP and state.cycle is not None:
         status_line = (
@@ -1009,7 +1066,7 @@ async def _maintenance_loop() -> None:
             interval = max(2, min(300, config.MAINTENANCE_INTERVAL_SECONDS))
             await asyncio.sleep(interval)
 
-            if not config.ENABLED:
+            if not _is_plugin_active() or not config.ENABLED:
                 continue
 
             now_utc = datetime.now(ZoneInfo("UTC"))
@@ -1186,25 +1243,35 @@ async def _settle_wake(
         try:
             sent_via_llm = False
             if config.LLM_GREETINGS_ENABLED and hasattr(ctx, "push_system"):
+                # Only objective data + directional hints go into the prompt.
+                # Canned sentences (tier comment / picked dream) stay fallback-only;
+                # feeding them in makes the model paraphrase the hardcoded version.
                 ref_lines = [
                     f"- 睡眠时长：{duration_str}",
-                    f"- 睡眠质量：{settled_quality}%（状态评定：{tier_name}，{comment}）",
+                    f"- 睡眠质量：{settled_quality}%（状态评定：{tier_name}）",
                 ]
-                if dream_text:
-                    ref_lines.append(f"- 昨晚梦境：{dream_text}")
+                if config.DREAM_ENABLED and sleep_date:
+                    dream_tone = dream_tone_hint(settled_quality)
+                    if dream_tone:
+                        ref_lines.append(f"- 昨晚做梦基调：{dream_tone}")
+                        dream_seed = dream_seed_hint(f"dream-seed:{chat_key}:{sleep_date}")
+                        ref_lines.append(f"- 梦境灵感骰子（随机种子，保证每次梦境独一无二）：{dream_seed}")
                 if note_text:
-                    ref_lines.append(f"- 作息打卡趋势：{note_text}")
+                    ref_lines.append(f"- 作息打卡数据：{note_text}")
                 ref_info = "\n".join(ref_lines)
 
                 prompt = (
                     "【系统提示：新的一天开始了，你刚刚自然睡醒。】\n"
-                    "请结合你的人设性格、昨晚的睡眠数据参考以及当前的聊天氛围，"
-                    "用符合你口吻的第一人称向频道打个招呼，告诉大家你睡醒了。\n"
+                    "请用符合你口吻的第一人称向频道打个招呼，告诉大家你睡醒了。\n"
                     f"【昨晚睡眠信息参考】：\n{ref_info}\n\n"
                     "要求：\n"
-                    "1. 严格契合你的身份设定与口吻习惯（如傲娇/慵懒/元气/严谨等）；\n"
-                    "2. 自然地将昨晚的睡眠感受（如睡得香、做了什么梦、或是没睡够）融入打招呼中，切忌生硬复述数据列表；\n"
-                    "3. 简短生动，直接输出你要说的话，不要输出任何系统指令标记。"
+                    "1. 说话的语气、口癖、情绪风格要契合你的身份性格设定；\n"
+                    "2. 若提及梦境，请先让灵感骰子带你随机落到某个题材——现实的、幻想的、"
+                    "日常的、荒诞的、与群聊上下文有关的皆可，不必与你的职业相关，"
+                    "也不必每次是同类题材——再由你自由虚构具体梦境细节；\n"
+                    "3. 参考信息只是客观数据与方向提示，严禁复述、套用或轻度改写其中的文字；\n"
+                    "4. 可自然结合当前聊天氛围收尾，但不必强行关联；\n"
+                    "5. 简短生动，直接输出你要说的话，不要输出任何系统指令标记或数据列表。"
                 )
                 try:
                     await ctx.push_system(prompt, trigger_agent=True)
@@ -1383,6 +1450,7 @@ async def _stop_runtime() -> None:
     lease_ledger.clear()
     chat_key_locks.clear()
     _wake_inject_cache.clear()
+    _persona_cache.clear()
 
     if _store is not None:
         _store.clear_all()

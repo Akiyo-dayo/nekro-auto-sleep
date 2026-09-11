@@ -315,6 +315,10 @@ def pick_dream(seed: str, percent: int) -> str | None:
     Higher quality tends to nice dreams, poor quality to nightmares. A perfect
     night (>= 115) skips the dream line entirely — sleeping like a log means
     remembering nothing.
+
+    Only used as the fallback text when LLM greeting generation is unavailable;
+    the LLM path receives ``dream_tone_hint`` instead so the model invents its
+    own dream instead of paraphrasing a canned one.
     """
     if percent >= 115:
         return None
@@ -323,6 +327,35 @@ def pick_dream(seed: str, percent: int) -> str | None:
     if percent >= 70:
         return stable_pick(seed, ODD_DREAMS)
     return stable_pick(seed, BAD_DREAMS)
+
+
+def dream_tone_hint(percent: int) -> str | None:
+    """Directional dream-tone hint for LLM-generated greetings.
+
+    Returns only a coarse mood direction so the model can invent the dream
+    content itself — embedding the canned dream sentences in the prompt makes
+    the output read like the hardcoded version.
+    """
+    if percent >= 115:
+        return "一夜无梦，睡得极沉"
+    if percent >= 95:
+        return "做了个好梦"
+    if percent >= 70:
+        return "做了个怪诞的梦"
+    return "做了个不太好的梦"
+
+
+def dream_seed_hint(seed: str) -> str:
+    """Deterministic per-(chat, night) random seed for LLM dream generation.
+
+    Not a topic list — returns an opaque hex fragment used as an "inspiration
+    dice" in the prompt. Identical persona + similar sleep data makes the model
+    collapse onto the same dream theme every night; a different opaque seed per
+    chat/night decorrelates the sampling trajectory while leaving the model
+    completely free to pick any topic itself.
+    """
+    h = hashlib.sha256(seed.encode()).hexdigest()
+    return h[:8]
 
 
 def compute_streak_note(history: dict[str, int], sleep_date: str, good_threshold: int = 95) -> str | None:

@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import sys
 from datetime import datetime, timedelta
+from enum import Enum
 from types import ModuleType
 from unittest.mock import AsyncMock, MagicMock
 from pydantic import BaseModel
 import importlib.util
 import pathlib
+
+import pytest
 
 from zoneinfo import ZoneInfo
 
@@ -337,6 +340,15 @@ def _setup_mock_nekro_agent() -> None:
         def __init__(self, *args, **kwargs):
             self.module_name = kwargs.get("module_name", "nekro_auto_sleep")
             self.key = kwargs.get("key", "Akiyo_dayo.nekro_auto_sleep")
+            # Real hosts (KroMiose upstream & Akiyo fork) keep the enable flag
+            # in ``_is_enabled`` and expose it through the ``is_enabled``
+            # @property; there is NO ``enabled`` attribute. The collector
+            # marks load-time-disabled plugins by writing ``_is_enabled``
+            # directly, without firing ``on_disabled`` callbacks.
+            self._is_enabled = True
+        @property
+        def is_enabled(self) -> bool:
+            return self._is_enabled
         def mount(self, *a, **kw): pass
         def mount_config(self, *a, **kw): return lambda cls: cls
         def get_config(self, config_cls): return config_cls()
@@ -371,8 +383,11 @@ def _setup_mock_nekro_agent() -> None:
     api.schemas = schemas
 
     signal = ModuleType("nekro_agent.api.signal")
-    class MsgSignal:
-        pass
+    class MsgSignal(Enum):
+        FORCE_TRIGGER = -1
+        CONTINUE = 0
+        BLOCK_TRIGGER = 1
+        BLOCK_ALL = 2
     signal.MsgSignal = MsgSignal
     sys.modules["nekro_agent.api.signal"] = signal
     api.signal = signal
@@ -391,6 +406,27 @@ def _setup_mock_nekro_agent() -> None:
     db_mod.DBPluginData = DBPluginData
     sys.modules["nekro_agent.models"] = models_mod
     sys.modules["nekro_agent.models.db_plugin_data"] = db_mod
+
+
+def _load_plugin_module():
+    """Load the real ``__init__.py`` under the mock host (fresh exec).
+
+    ``conftest`` deliberately never executes ``__init__.py`` because it needs
+    a host; tests that exercise host-facing logic exec it here against the
+    mock installed by ``_setup_mock_nekro_agent``. Re-executing per call keeps
+    each test on pristine module state (fresh ``plugin``/``config``/globals).
+    """
+    _setup_mock_nekro_agent()
+    nas_mod = sys.modules["nekro_auto_sleep"]
+    pkg_root = pathlib.Path(__file__).resolve().parent.parent
+    init_file = pkg_root / "__init__.py"
+    spec = importlib.util.spec_from_file_location(
+        "nekro_auto_sleep",
+        init_file,
+        submodule_search_locations=[str(pkg_root)],
+    )
+    spec.loader.exec_module(nas_mod)
+    return nas_mod
 
 
 class TestPersistenceAndToolEnhancements:
@@ -492,7 +528,7 @@ class TestPersistenceAndToolEnhancements:
         prompt, trigger = pushed_prompts[0]
         assert trigger is True
         assert "就寝时间" in prompt
-        assert "符合你人设口吻" in prompt
+        assert "符合你口吻" in prompt
 
     @pytest.mark.asyncio
     async def test_dynamic_bedtime_fallback_on_error(self, monkeypatch):
@@ -615,8 +651,7 @@ class TestPersistenceAndToolEnhancements:
 
     @pytest.mark.asyncio
     async def test_resume_sleep_tool_error_handling(self, monkeypatch):
-        _setup_mock_nekro_agent()
-        nas_mod = sys.modules["nekro_auto_sleep"]
+        nas_mod = _load_plugin_module()
         from nekro_auto_sleep.persistence import SleepStateStore
 
         class MockBackend:
@@ -634,6 +669,9 @@ class TestPersistenceAndToolEnhancements:
         )
         await store.save(init_state)
         monkeypatch.setattr(nas_mod, "_store", store)
+        # Tool guards require an active runtime before domain logic runs
+        monkeypatch.setattr(nas_mod, "_is_runtime_active", True)
+        monkeypatch.setattr(nas_mod.plugin, "_is_enabled", True)
 
         class MockCtx:
             chat_key = "c_awake"
@@ -710,8 +748,7 @@ class TestPersistenceAndToolEnhancements:
         lease_ledger.clear()
 
     def test_plugin_active_fail_open_when_disabled(self, monkeypatch):
-        _setup_mock_nekro_agent()
-        nas_mod = sys.modules["nekro_auto_sleep"]
+        nas_mod = _load_plugin_module()
 
         # 1. When runtime is not active, _is_plugin_active returns False
         monkeypatch.setattr(nas_mod, "_is_runtime_active", False)
@@ -723,6 +760,253 @@ class TestPersistenceAndToolEnhancements:
         monkeypatch.setattr(nas_mod.plugin, "enabled", False, raising=False)
         assert nas_mod._is_plugin_active() is False
         assert nas_mod._is_sleeping("any_chat") is False
+        monkeypatch.delattr(nas_mod.plugin, "enabled", raising=False)
+
+        # 3. Realistic host shapes (regression for the restart-with-disabled
+        #    bug): KroMiose upstream and the Akiyo fork expose ``is_enabled``
+        #    as a @property returning bool and have NO ``enabled`` attribute.
+        #    The collector writes ``plugin._is_enabled = False`` directly
+        #    without firing ``on_disabled`` when the plugin loads disabled,
+        #    so ``_is_runtime_active`` alone stays True.
+        monkeypatch.setattr(nas_mod, "_is_runtime_active", True)
+        monkeypatch.setattr(nas_mod.plugin, "_is_enabled", False)
+        assert nas_mod._is_plugin_active() is False
+        assert nas_mod._is_sleeping("any_chat") is False
+
+    def test_plugin_host_enabled_probe_shapes(self, monkeypatch):
+        """The host-enable probe must handle every known flag shape."""
+        nas_mod = _load_plugin_module()
+        monkeypatch.setattr(nas_mod, "_is_runtime_active", True)
+        plugin = nas_mod.plugin
+
+        # Property form (KroMiose upstream / Akiyo fork): bool via @property
+        monkeypatch.setattr(plugin, "_is_enabled", False)
+        assert nas_mod._plugin_host_enabled() is False
+        monkeypatch.setattr(plugin, "_is_enabled", True)
+        assert nas_mod._plugin_host_enabled() is True
+
+        # Plain-attribute ``enabled`` form (unknown hosts)
+        class AttrHostOff:
+            enabled = False
+
+        class AttrHostOn:
+            enabled = True
+
+        monkeypatch.setattr(nas_mod, "plugin", AttrHostOff())
+        assert nas_mod._plugin_host_enabled() is False
+        monkeypatch.setattr(nas_mod, "plugin", AttrHostOn())
+        assert nas_mod._plugin_host_enabled() is True
+
+        # Callable ``is_enabled()`` method form (unknown/future hosts)
+        class MethodHostOff:
+            def is_enabled(self):
+                return False
+
+        class MethodHostOn:
+            def is_enabled(self):
+                return True
+
+        monkeypatch.setattr(nas_mod, "plugin", MethodHostOff())
+        assert nas_mod._plugin_host_enabled() is False
+        monkeypatch.setattr(nas_mod, "plugin", MethodHostOn())
+        assert nas_mod._plugin_host_enabled() is True
+
+        # Unknown shape (no recognizable flag) -> stays enabled (fail-safe
+        # for the sleep gate; layer-1 hooks are still host-guarded)
+        class OpaqueHost:
+            pass
+
+        monkeypatch.setattr(nas_mod, "plugin", OpaqueHost())
+        assert nas_mod._plugin_host_enabled() is True
+
+    @pytest.mark.asyncio
+    async def test_is_sleeping_fail_open_when_host_disabled_with_asleep_state(self, monkeypatch):
+        """Restart-with-disabled: wraps installed by init, host flips
+        ``_is_enabled`` without callbacks, persisted state is ASLEEP — the
+        dispatch-layer gate must still fail open so user messages can
+        trigger the LLM."""
+        nas_mod = _load_plugin_module()
+
+        class MockCtx:
+            chat_key = "chat_host_disabled"
+
+        class MockBackend:
+            def __init__(self):
+                self.data = {}
+
+            async def get(self, chat_key=None, store_key=""):
+                return self.data.get(store_key)
+
+            async def set(self, chat_key=None, store_key="", value=""):
+                self.data[store_key] = value
+
+        store = nas_mod.SleepStateStore(MockBackend())
+        await store.save(
+            ChatSleepState(chat_key="chat_host_disabled", status=SleepStatus.ASLEEP)
+        )
+        monkeypatch.setattr(nas_mod, "_store", store)
+
+        # init_method() ran unconditionally at load -> runtime active...
+        monkeypatch.setattr(nas_mod, "_is_runtime_active", True)
+        # ...but the collector marked the plugin disabled without callbacks
+        monkeypatch.setattr(nas_mod.plugin, "_is_enabled", False)
+
+        assert nas_mod._is_sleeping("chat_host_disabled") is False
+
+        # Re-enabling restores gate behaviour
+        monkeypatch.setattr(nas_mod.plugin, "_is_enabled", True)
+        assert nas_mod._is_sleeping("chat_host_disabled") is True
+
+    @pytest.mark.asyncio
+    async def test_is_sleeping_fail_open_when_master_switch_off(self, monkeypatch):
+        """config.ENABLED=False must also fail the dispatch gate open, or
+        chats put to sleep before the switch was turned off stay stuck:
+        messages never trigger the LLM and the wake protocol is dead."""
+        nas_mod = _load_plugin_module()
+
+        class MockBackend:
+            def __init__(self):
+                self.data = {}
+
+            async def get(self, chat_key=None, store_key=""):
+                return self.data.get(store_key)
+
+            async def set(self, chat_key=None, store_key="", value=""):
+                self.data[store_key] = value
+
+        store = nas_mod.SleepStateStore(MockBackend())
+        await store.save(ChatSleepState(chat_key="chat_master_off", status=SleepStatus.ASLEEP))
+        monkeypatch.setattr(nas_mod, "_store", store)
+        monkeypatch.setattr(nas_mod, "_is_runtime_active", True)
+        monkeypatch.setattr(nas_mod.plugin, "_is_enabled", True)
+
+        assert nas_mod._is_sleeping("chat_master_off") is True
+
+        monkeypatch.setattr(nas_mod.config, "ENABLED", False)
+        assert nas_mod._is_sleeping("chat_master_off") is False
+
+    @pytest.mark.asyncio
+    async def test_schedule_agent_task_wrapper_fail_open_when_host_disabled(self, monkeypatch):
+        """End-to-end dispatch-layer check: with the plugin host-disabled and
+        the chat persisted as ASLEEP, the schedule_agent_task wrapper must
+        let the original call through (LLM triggers)."""
+        nas_mod = _load_plugin_module()
+
+        class MockBackend:
+            def __init__(self):
+                self.data = {}
+
+            async def get(self, chat_key=None, store_key=""):
+                return self.data.get(store_key)
+
+            async def set(self, chat_key=None, store_key="", value=""):
+                self.data[store_key] = value
+
+        store = nas_mod.SleepStateStore(MockBackend())
+        await store.save(ChatSleepState(chat_key="chat_e2e", status=SleepStatus.ASLEEP))
+        monkeypatch.setattr(nas_mod, "_store", store)
+        monkeypatch.setattr(nas_mod, "_is_runtime_active", True)
+        monkeypatch.setattr(nas_mod.plugin, "_is_enabled", False)
+
+        from nekro_auto_sleep.runtime import make_schedule_agent_task_wrapper
+
+        wrapper = make_schedule_agent_task_wrapper(nas_mod._is_sleeping, nas_mod._has_permission)
+
+        called = []
+
+        async def original_agent_task(*args, **kwargs):
+            called.append(True)
+            return "agent_result"
+
+        res = await wrapper(original_agent_task, chat_key="chat_e2e")
+        assert res == "agent_result"
+        assert len(called) == 1
+
+    @pytest.mark.asyncio
+    async def test_on_system_message_guard_when_inactive(self, monkeypatch):
+        """on_system_message must bail out before _get_store() can assert
+        when the runtime is torn down (host disable path)."""
+        nas_mod = _load_plugin_module()
+        from nekro_agent.api.signal import MsgSignal
+
+        class MockCtx:
+            chat_key = "chat_guard"
+
+        monkeypatch.setattr(nas_mod, "_is_runtime_active", False)
+        monkeypatch.setattr(nas_mod, "_store", None)
+        signal = await nas_mod.on_system_message(MockCtx(), "system text")
+        assert signal == MsgSignal.CONTINUE
+
+    @pytest.mark.asyncio
+    async def test_on_user_message_guard_when_host_disabled(self, monkeypatch):
+        """First-layer hook must CONTINUE when the host disabled the plugin
+        at load time (restart scenario, no callbacks fired)."""
+        nas_mod = _load_plugin_module()
+        from nekro_agent.api.signal import MsgSignal
+
+        class MockCtx:
+            chat_key = "chat_hook_guard"
+
+        class MockMsg:
+            platform_userid = "u1"
+            sender_id = "u1"
+            content_text = "大家早上好"
+            channel_type = "group"
+            is_tome = False
+            ext_data = None
+
+        monkeypatch.setattr(nas_mod, "_is_runtime_active", True)
+        monkeypatch.setattr(nas_mod.plugin, "_is_enabled", False)
+        signal = await nas_mod.on_user_message(MockCtx(), MockMsg())
+        assert signal == MsgSignal.CONTINUE
+
+    @pytest.mark.asyncio
+    async def test_resume_sleep_tool_raises_when_inactive(self, monkeypatch):
+        nas_mod = _load_plugin_module()
+
+        monkeypatch.setattr(nas_mod, "_is_runtime_active", False)
+        with pytest.raises(RuntimeError):
+            await nas_mod.resume_sleep_tool(None)
+
+    @pytest.mark.asyncio
+    async def test_get_sleep_report_raises_when_inactive(self, monkeypatch):
+        nas_mod = _load_plugin_module()
+
+        monkeypatch.setattr(nas_mod, "_is_runtime_active", False)
+        with pytest.raises(RuntimeError):
+            await nas_mod.get_sleep_report_tool(None)
+
+    @pytest.mark.asyncio
+    async def test_get_sleep_report_uses_public_read_through(self, monkeypatch):
+        """The report tool must not touch store private members."""
+        nas_mod = _load_plugin_module()
+
+        class MockCtx:
+            chat_key = "chat_report"
+
+        class MockBackend:
+            def __init__(self):
+                self.data = {}
+
+            async def get(self, chat_key=None, store_key=""):
+                return self.data.get(store_key)
+
+            async def set(self, chat_key=None, store_key="", value=""):
+                self.data[store_key] = value
+
+        store = nas_mod.SleepStateStore(MockBackend())
+        monkeypatch.setattr(nas_mod, "_store", store)
+        monkeypatch.setattr(nas_mod, "_is_runtime_active", True)
+        monkeypatch.setattr(nas_mod.plugin, "_is_enabled", True)
+
+        # Cold cache -> ensure_loaded materializes the state under the lock
+        state = await store.ensure_loaded("chat_report")
+        assert state.chat_key == "chat_report"
+        assert state.status == SleepStatus.AWAKE
+
+        report = await nas_mod.get_sleep_report_tool(MockCtx())
+        assert "清醒" in report
+
 
     def test_wake_intent_detection(self):
         _setup_mock_nekro_agent()
@@ -772,4 +1056,95 @@ class TestPersistenceAndToolEnhancements:
         is_conf, is_canc = nas_mod._check_wake_intent(FakeMsg("我要出门了待会儿再回来"), persona_name="bot")
         assert is_conf is False
         assert is_canc is False
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_disable_scenarios(self, monkeypatch):
+        """End-to-end dispatch matrix against fake host singletons.
+
+        Simulates the enable-flag shape shared by both supported hosts
+        (KroMiose upstream and the Akiyo fork: ``is_enabled`` @property over
+        ``_is_enabled``, no ``enabled`` attribute) and walks the full matrix:
+        the gate blocks while enabled+asleep, fails open on
+        restart-with-disabled, fails open after runtime WebUI disable
+        (wraps restored), fails open when the master switch is off, and the
+        gate closes again on re-enable.
+        """
+        nas_mod = _load_plugin_module()
+
+        # Fake host message_service singleton (what _install_wraps wraps)
+        scheduled = []
+
+        class FakeMessageService:
+            async def schedule_agent_task(self, *args, **kwargs):
+                scheduled.append((args, kwargs))
+                return "scheduled"
+
+            async def _run_chat_agent_task(self, *args, **kwargs):
+                return "ran"
+
+        fake_ms = FakeMessageService()
+
+        services_mod = ModuleType("nekro_agent.services")
+        ms_mod = ModuleType("nekro_agent.services.message_service")
+        ms_mod.message_service = fake_ms
+        services_mod.message_service = ms_mod
+        sys.modules["nekro_agent.services"] = services_mod
+        sys.modules["nekro_agent.services.message_service"] = ms_mod
+        sys.modules["nekro_agent"].services = services_mod
+
+        class MockBackend:
+            def __init__(self):
+                self.data = {}
+
+            async def get(self, chat_key=None, store_key=""):
+                return self.data.get(store_key)
+
+            async def set(self, chat_key=None, store_key="", value=""):
+                self.data[store_key] = value
+
+        store = nas_mod.SleepStateStore(MockBackend())
+        await store.save(ChatSleepState(chat_key="chat_e2e", status=SleepStatus.ASLEEP))
+
+        async def _activate_runtime():
+            # Re-seed the store: _stop_runtime clears its cache (persisted
+            # data survives; a real re-enable reloads from the backend)
+            await store.save(ChatSleepState(chat_key="chat_e2e", status=SleepStatus.ASLEEP))
+            monkeypatch.setattr(nas_mod, "_store", store)
+            monkeypatch.setattr(nas_mod, "_is_runtime_active", True)
+            monkeypatch.setattr(nas_mod.plugin, "_is_enabled", True)
+            monkeypatch.setattr(nas_mod.config, "ENABLED", True)
+            nas_mod._installed_wraps.clear()
+            nas_mod._install_wraps()
+
+        async def _schedule():
+            return await fake_ms.schedule_agent_task(chat_key="chat_e2e")
+
+        # 1. Enabled + ASLEEP -> gate blocks (core feature intact)
+        await _activate_runtime()
+        res = await _schedule()
+        assert res is None and len(scheduled) == 0
+
+        # 2. Restart-with-disabled: the collector wrote ``_is_enabled=False``
+        #    directly without firing callbacks; wraps from init stay installed
+        monkeypatch.setattr(nas_mod.plugin, "_is_enabled", False)
+        res = await _schedule()
+        assert res == "scheduled" and len(scheduled) == 1
+
+        # 3. Runtime WebUI disable: on_disabled -> _stop_runtime unwraps
+        monkeypatch.setattr(nas_mod.plugin, "_is_enabled", True)
+        await nas_mod._stop_runtime()
+        assert not getattr(fake_ms.schedule_agent_task, "__nekro_auto_sleep_wrapped__", False)
+        res = await _schedule()
+        assert res == "scheduled" and len(scheduled) == 2
+
+        # 4. Master switch off with ASLEEP state -> fail open
+        await _activate_runtime()
+        monkeypatch.setattr(nas_mod.config, "ENABLED", False)
+        res = await _schedule()
+        assert res == "scheduled" and len(scheduled) == 3
+
+        # 5. Re-enable -> gate closes again
+        monkeypatch.setattr(nas_mod.config, "ENABLED", True)
+        res = await _schedule()
+        assert res is None and len(scheduled) == 3
 

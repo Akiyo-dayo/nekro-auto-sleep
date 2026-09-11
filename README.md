@@ -5,7 +5,7 @@
 ## 功能
 
 - **定时入睡与随机起床**：默认每晚 23:00 静默入睡，次日 06:45–08:30 之间随机自然醒
-- **两次叫醒协议**：睡眠中用户有效呼叫→固定提示（不经 LLM）→**任何人在窗口内发出的任何消息**（不限发送者、不匹配关键词）→正常唤醒进 LLM
+- **两次叫醒协议**：睡眠中用户有效呼叫→固定提示（不经 LLM）→窗口内确认意图（提及 Bot 或命中确认词；回复「不要」等否定词取消）→正常唤醒进 LLM；窗口内无关闲聊继续静默拦截
 - **静默拦截**：睡眠期间随机回复、主动回复、普通系统消息被完全拦截，不触发 LLM
 - **定时任务兼容**：定时任务可临时唤醒执行，完成后自动恢复睡眠，且计入睡眠质量
 - **主动睡下**：Bot 可调用 `resume_sleep` 工具重新入睡
@@ -175,6 +175,29 @@ try/except 保护，插件 handler 的 TypeError 会直接炸掉整条消息处�
 安全机制：私有标记 `__nekro_auto_sleep_wrapped__` 防重复安装；`__nekro_auto_sleep_original__`
 保存原函数，cleanup 时 `unwrap_callable` 完全还原；除 `schedule_agent_task` 外
 其余目标均为 `hasattr` 能力探测的可选项，缺失时自动降级。
+
+### 禁用态 Fail-Open 保护（v1.2.1 修复）
+
+「睡眠门卫」一旦在派发层拦截消息，就必须保证**插件被禁用后绝不吞消息**。
+两个宿主（KroMiose 上游 / Akiyo 分叉）的插件启用标志形态一致：`NekroPlugin.is_enabled`
+是 **@property**（底层 `_is_enabled` 字段），且不存在 `enabled` 属性。插件据此做了
+四层防御：
+
+1. **宿主态探测 `_plugin_host_enabled()`**：同时兼容属性式 `is_enabled`（property
+   返回 bool）、方法式 `is_enabled()`、以及 `enabled` 属性三种形态。探测不到已知
+   形态时按「已启用」处理（睡眠门卫继续工作），宿主明确报告禁用时一律 Fail-Open。
+2. **钩子层**：`on_user_message` / `on_system_message` 在访问存储前先检查
+   `_is_plugin_active()`——这覆盖了「宿主重启时插件加载为禁用态」的场景
+   （此时 collector 直接写 `_is_enabled=False`，**不触发** `on_disabled` 回调，
+   `init_method()` 却已无条件执行并安装了运行时包装）。
+3. **派发层**：`_is_sleeping()` 在插件失活、宿主禁用或总开关 `ENABLED=false`
+   时一律返回 False，`schedule_agent_task` / `_run_chat_agent_task` 包装直接放行。
+   这同时修复了「总开关关闭时，已入睡会话永久卡在拦截态、无法叫醒也无法触发
+   LLM」的陷阱。
+4. **维护循环**：同样检查 `_is_plugin_active()`，宿主禁用期间不再入睡/结算。
+
+运行时 WebUI 禁用（不重启）依旧走 `on_disabled` → `_stop_runtime()` 完整卸载
+包装并还原宿主方法。
 
 ### 对上游 v2.4.x 的核查结论（2026-09-03）
 

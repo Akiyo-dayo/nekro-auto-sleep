@@ -191,6 +191,15 @@ class SleepStateStore:
             state = ChatSleepState(chat_key=chat_key)
         return state
 
+    async def ensure_loaded(self, chat_key: str) -> ChatSleepState:
+        """Load or create the state for chat_key under its lock.
+
+        Public read-through for callers outside ``with_state`` that still need
+        the state materialized (e.g. the sleep-report sandbox tool).
+        """
+        async with self._get_lock(chat_key):
+            return await self.load_or_create(chat_key)
+
     async def with_state(
         self,
         chat_key: str,

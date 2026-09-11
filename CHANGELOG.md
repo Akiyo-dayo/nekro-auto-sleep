@@ -1,5 +1,71 @@
 # 更新日志 (CHANGELOG)
 
+## [v1.2.2] - 2026-09-11
+
+### 修复：LLM 问候语预设影子与题材坍缩
+
+- **问题**：开启 `LLM_GREETINGS_ENABLED` 后，起床问候的实际输出仍像写死版本。
+  两层根因：
+  1. **预设文本泄漏进 prompt**：`_settle_wake` 将 `pick_dream()` /
+     `quality_tier()` / `compute_streak_note()` 返回的成品文案原文塞入
+     LLM 参考信息，模型自然复述/轻度改写这些句子（实测输出"梦见手机屏幕
+     碎成蜘蛛网弹红字报警"= `BAD_DREAMS` 原文改写）。
+  2. **人设锚定导致题材坍缩**：去掉预设文本后，相同人设 + 相似睡眠数据 +
+     多会话同时结算，使各会话独立调用的 LLM 输出收敛到同一题材
+     （实测全部为"服务器炸了/代码没保存/生产环境崩了"类技术故障梦）。
+- **修复**：
+  - LLM prompt 只注入客观数据（睡眠时长、质量分、评定等级）与方向性基调
+    （`dream_tone_hint`：好梦/怪梦/不好的梦/一夜无梦），不再注入任何成品文案；
+    预设文案（`pick_dream` / `quality_tier` 评语 / `BEDTIME_GREETS`）仅保留在
+    LLM 调用失败时的 fallback 兜底路径。
+  - 新增 `dream_seed_hint()`：按 `(chat_key, sleep_date)` 确定性生成不透明的
+    随机"灵感骰子"（sha256 片段）注入 prompt——不含任何题材信息，仅让每次
+    生成的上下文不同以去相关采样轨迹，梦境题材完全由模型自行决定
+    （可现实、幻想、日常、荒诞或与群聊上下文相关）。
+  - prompt 明确约束：人设契合限定在语气/口癖/情绪风格层面，题材不必与
+    职业相关，严禁复述参考文字。
+- **实测**（广州生产实例真实群聊）：梦境题材从全部坍缩为"生产故障"分散为
+  动物、超现实、群聊场景、天气等多样主题，口吻仍契合人设。
+
+## [v1.2.1] - 2026-09-11
+
+### 严重修复：插件禁用后仍拦截消息（WebUI 禁用 Fail-Open）
+
+- **根因**：宿主（KroMiose 上游 v2.3.x/v2.4.x 与 Akiyo 分叉）的插件启用标志
+  `NekroPlugin.is_enabled` 是 **@property（返回 bool）**，且不存在 `enabled` 属性；
+  v1.2.0 的探测代码以 `callable(plugin.is_enabled)` 判断，对该形态永远失效。
+  「宿主重启时插件已禁用」场景下 collector 无条件执行 `init_method()`（安装全部
+  运行时包装）后直接写 `_is_enabled=False` **且不触发 `on_disabled` 回调**，
+  导致持久化状态为 ASLEEP 的会话继续在派发层吞掉 Agent 任务、消息无法触发 LLM。
+- **修复**：
+  - 新增 `_plugin_host_enabled()` 探测，兼容三种宿主形态：属性式 `is_enabled`
+    （property 返回 bool）、方法式 `is_enabled()`、`enabled` 属性；未知形态按
+    已启用处理（门卫继续工作），确认禁用一律 Fail-Open。
+  - `on_user_message` / `on_system_message` 在访问存储前统一检查
+    `_is_plugin_active()`，同时消除禁用期间 `_get_store()` 断言异常炸掉框架
+    无保护分发链的风险。
+  - `_is_sleeping()`（派发层包装的门卫）在插件失活、宿主禁用或总开关
+    `ENABLED=false` 时一律放行——同时修复「总开关关闭时已入睡会话永久卡死、
+    无法叫醒也无法触发 LLM」的陷阱。
+  - 维护循环增加 `_is_plugin_active()` 守卫，宿主禁用期间不再入睡/结算。
+  - 沙盒工具 `resume_sleep` / `get_sleep_report` 增加活性守卫（未启用时
+    raise，遵循插件规范）。
+- **测试**：
+  - 重写 v1.2.0 的假阳性用例（此前通过 monkeypatch 注入宿主并不存在的
+    `enabled` 属性制造了虚假的通过）；mock 升级为真实宿主语义
+    （`_is_enabled` 字段 + `is_enabled` property + 真实 `MsgSignal` 枚举值）。
+  - 新增 10 项回归测试：探测形态矩阵、重启禁用场景、总开关场景、
+    运行时禁用卸载、钩子守卫、沙盒工具守卫，以及覆盖
+    「阻塞→禁用放行→运行时禁用还原→总开关放行→重启用恢复阻塞」
+    全矩阵的端到端用例。全套 98 项测试通过。
+
+### 其他改进
+
+- `SleepStateStore` 新增公共 `ensure_loaded()` 读穿透接口，`get_sleep_report`
+  不再访问 store 私有成员。
+- 人设名查询增加 60 秒 TTL 缓存，降低高频群每消息的 DB 开销。
+- 修正 `叫醒确认窗口` 与 `启用自动睡眠` 的 WebUI 配置描述，与 v1.2.0 行为一致。
+
 ## [v1.2.0] - 2026-09-11
 
 ### 新增与重构
