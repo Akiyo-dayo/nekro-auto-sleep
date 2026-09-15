@@ -67,7 +67,6 @@ from .persistence import DATA_KEY, SleepStateStore
 from .quality import (
     compute_quality,
     compute_streak_note,
-    dream_topic_hint,
     dream_tone_hint,
     pick_dream,
     quality_tier,
@@ -102,7 +101,7 @@ plugin = NekroPlugin(
     name="自动睡眠",
     module_name="nekro_auto_sleep",
     description="为每个会话提供独立的拟人化睡眠周期：叫醒协议、睡眠质量评分、梦境播报与连续打卡",
-    version="1.2.3",
+    version="1.2.4",
     author="Akiyo_dayo",
     url="https://github.com/Akiyo-dayo/NekroAgent_ByAkiyo",
     allow_sleep=True,
@@ -353,6 +352,21 @@ class SleepConfig(ConfigBase):
             ),
         ).model_dump(),
     )
+    DREAM_TOPIC_CONSTRAINTS: str = Field(
+        default="不得与昨晚的梦境题材重复",
+        title="梦境负面约束",
+        json_schema_extra=ExtraField(
+            is_textarea=True,
+            placeholder="不得与昨晚的梦境题材重复",
+            i18n_title=i18n.i18n_text(zh_CN="梦境负面约束", en_US="Dream Negative Constraints"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="梦境由 AI 结合人设与聊天上下文自由发挥，但必须遵守这里的负面约束；"
+                "多条约束用换行、分号或中文分号分隔，留空表示不加约束",
+                en_US="Dreams are freely improvised by AI from persona and chat context, but must obey these negative constraints; "
+                "separate multiple constraints with newline or semicolons, leave empty for none",
+            ),
+        ).model_dump(),
+    )
     BEDTIME_CHANCE: float = Field(
         default=0.35,
         title="晚安消息概率",
@@ -545,6 +559,18 @@ def _parse_keywords() -> list[str]:
 def _parse_confirm_keywords() -> list[str]:
     raw = getattr(config, "WAKE_CONFIRM_KEYWORDS", "要,叫醒,醒来,起床,是,是的,确认")
     return [k.strip() for k in raw.replace("\n", ",").split(",") if k.strip()]
+
+
+def _parse_dream_constraints() -> list[str]:
+    """Parse the configurable negative constraints for dream improvisation."""
+    raw = getattr(config, "DREAM_TOPIC_CONSTRAINTS", "")
+    if not raw:
+        return []
+    return [
+        c.strip()
+        for c in raw.replace("；", ";").replace("\n", ";").split(";")
+        if c.strip()
+    ]
 
 
 def _is_mention_bot(message: ChatMessage, persona_name: str) -> bool:
@@ -1318,8 +1344,11 @@ async def _settle_wake(
                     dream_tone = dream_tone_hint(settled_quality)
                     if dream_tone:
                         ref_lines.append(f"- 昨晚做梦基调：{dream_tone}")
-                    dream_topic = dream_topic_hint(f"dream-topic:{chat_key}:{sleep_date}")
-                    ref_lines.append(f"- 梦境题材方向（当夜随机抽取）：{dream_topic}")
+                    dream_constraints = _parse_dream_constraints()
+                    if dream_constraints:
+                        ref_lines.append(
+                            "- 梦境负面约束（必须遵守）：" + "；".join(dream_constraints)
+                        )
                 if note_text:
                     ref_lines.append(f"- 作息打卡数据：{note_text}")
                 ref_info = "\n".join(ref_lines)
@@ -1332,8 +1361,9 @@ async def _settle_wake(
                     "1. 说话的语气、口癖、情绪风格要契合你的身份性格设定；\n"
                     "2. 你的精神状态必须与睡眠数据一致：睡得好就清爽舒畅，数据差才允许困倦；"
                     "不要每天都写成没睡醒的样子；\n"
-                    "3. 若提及梦境，请以「梦境题材方向」为起点自由虚构细节——可以天马行空地改编，"
-                    "但不要脱离该题材又落回你的职业、编程或群聊日常；\n"
+                    "3. 若提及梦境，请结合你的记忆、人设与近期聊天氛围自由虚构——"
+                    "可参考聊天记录里你昨晚说了什么梦，但不得违反「梦境负面约束」，"
+                    "也不要每天落入同一类题材；\n"
                     "4. 参考信息只是客观数据与方向提示，严禁复述、套用或轻度改写其中的文字；\n"
                     "5. 可自然结合当前聊天氛围收尾，但不必强行关联；\n"
                     "6. 简短生动，直接输出你要说的话，不要输出任何系统指令标记或数据列表。"

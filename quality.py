@@ -358,52 +358,6 @@ def dream_tone_hint(percent: int) -> str | None:
     return "做了个不太好的梦"
 
 
-DREAM_TOPICS: tuple[str, ...] = (
-    "一场说走就走的海边旅行",
-    "回到童年过暑假",
-    "在太空中漂浮漫游",
-    "古代江湖里当侠客",
-    "一场热闹的音乐会",
-    "逛动物园遇到会说话的动物",
-    "运动会上的接力赛",
-    "搬家时翻出旧物",
-    "开了一家奇怪的小吃店",
-    "坐错了车到了陌生的城市",
-    "考试前发现自己没复习",
-    "雨天里等一辆公交车",
-    "森林里迷路又找到出口",
-    "在天台上乘凉看星星",
-    "坐着雪国列车穿越雪原",
-    "清晨的菜市场讨价还价",
-    "在游戏厅赢了一堆代币",
-    "逛美术馆时画里的人活了",
-    "修理一辆老自行车",
-    "当了一天外卖骑手",
-    "在图书馆睡着了被锁在里面",
-    "台风天被困在便利店",
-    "学会了骑马",
-    "参加一场婚礼当了花童",
-    "钓鱼钓上来一只靴子",
-    "在山顶看日出差点迟到",
-    "跟朋友摆摊卖手作",
-    "在迷宫般的地下商场找出口",
-    "给流浪猫搭了个窝",
-    "拍了一部两分钟的短片",
-)
-
-
-def dream_topic_hint(seed: str) -> str:
-    """Deterministic dream topic direction for LLM-generated greetings.
-
-    An opaque per-night seed could not decorrelate the model from its persona
-    and chat context (observed in production: a programmer persona produced
-    code-themed nightmares every single night). Picking a concrete topic from
-    a varied pool gives the model an explicit direction to riff on while still
-    leaving all details to its own invention.
-    """
-    return stable_pick(seed, DREAM_TOPICS)
-
-
 def compute_streak_note(history: dict[str, int], sleep_date: str, good_threshold: int = 95) -> str | None:
     """One-line streak/trend note based on settled quality history.
 

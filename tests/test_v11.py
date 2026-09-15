@@ -1291,7 +1291,8 @@ class TestV123Fixes:
             for t in sent_texts
         )
         assert len(pushed_prompts) == 1
-        assert "梦境题材方向" in pushed_prompts[0]
+        assert "梦境负面约束" in pushed_prompts[0]
+        assert "不得与昨晚的梦境题材重复" in pushed_prompts[0]
 
     @pytest.mark.asyncio
     async def test_quiet_night_no_notice_by_default(self, monkeypatch):
