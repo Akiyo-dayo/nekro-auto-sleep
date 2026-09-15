@@ -9,6 +9,7 @@ Plugin key: Akiyo_dayo.nekro_auto_sleep
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from datetime import datetime
@@ -66,7 +67,7 @@ from .persistence import DATA_KEY, SleepStateStore
 from .quality import (
     compute_quality,
     compute_streak_note,
-    dream_seed_hint,
+    dream_topic_hint,
     dream_tone_hint,
     pick_dream,
     quality_tier,
@@ -101,7 +102,7 @@ plugin = NekroPlugin(
     name="自动睡眠",
     module_name="nekro_auto_sleep",
     description="为每个会话提供独立的拟人化睡眠周期：叫醒协议、睡眠质量评分、梦境播报与连续打卡",
-    version="1.2.2",
+    version="1.2.3",
     author="Akiyo_dayo",
     url="https://github.com/Akiyo-dayo/NekroAgent_ByAkiyo",
     allow_sleep=True,
@@ -364,13 +365,13 @@ class SleepConfig(ConfigBase):
         ).model_dump(),
     )
     WAKE_NOTICE_ALWAYS: bool = Field(
-        default=True,
+        default=False,
         title="无打扰也发晨间报告",
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="无打扰也发晨间报告", en_US="Morning Report Always"),
             i18n_description=i18n.i18n_text(
-                zh_CN="开启后即使夜里没人叫醒也发送晨间睡眠报告；关闭则仅在被叫醒过的夜晚发送",
-                en_US="Send the morning report even when nobody tried to wake the bot; disable to report only after wake attempts",
+                zh_CN="默认关闭：仅当夜里发生过真实叫醒尝试时才发送晨间睡眠报告（防打扰）；开启后即使没人叫醒也发送",
+                en_US="Off by default: the morning report is only sent when someone actually tried to wake the bot at night; enable to always send it",
             ),
         ).model_dump(),
     )
@@ -492,20 +493,47 @@ def _check_install_dir_name() -> None:
 
 
 async def _get_persona_name(ctx: AgentCtx) -> str:
-    """Get persona name, falling back to config default (short TTL cache)."""
+    """Get persona name, falling back to config default (short TTL cache).
+
+    Host shapes vary across versions (verified against framework sources):
+    - Akiyo fork / upstream 2.4.x: ``AgentCtx.db_chat_channel`` is a SYNC
+      property returning ``Optional[DBChatChannel]`` — it is None whenever the
+      ctx was built without pre-fetching the channel row, and awaiting either
+      None or the model instance raises TypeError, which the previous
+      ``await ctx.db_chat_channel`` implementation swallowed into the fallback
+      name ("Bot") on every single call.
+    - Older audited versions exposed an awaitable attribute instead.
+    A missing channel row falls back to a direct DB lookup by chat_key.
+    DBPreset exposes ``name`` (and ``title``); DefaultPreset only ``name``.
+    """
     chat_key = ctx.chat_key
     now = time.monotonic()
     cached = _persona_cache.get(chat_key)
     if cached is not None and now - cached[0] < _PERSONA_CACHE_TTL_SECONDS:
         return cached[1]
+
+    db_channel = getattr(ctx, "db_chat_channel", None)
     try:
-        db_channel = await ctx.db_chat_channel
-        preset = await db_channel.get_preset()
-        if preset and hasattr(preset, "name") and preset.name:
-            _persona_cache[chat_key] = (now, preset.name)
-            return preset.name
+        if callable(db_channel):
+            db_channel = db_channel()
+        if inspect.isawaitable(db_channel):
+            db_channel = await db_channel
+        if db_channel is None:
+            from nekro_agent.models.db_chat_channel import DBChatChannel
+
+            db_channel = await DBChatChannel.get_or_none(chat_key=chat_key)
+        if db_channel is not None and hasattr(db_channel, "get_preset"):
+            preset = await db_channel.get_preset()
+            if preset is not None:
+                for attr in ("name", "title"):
+                    value = getattr(preset, attr, None)
+                    if isinstance(value, str) and value.strip():
+                        _persona_cache[chat_key] = (now, value.strip())
+                        return value.strip()
     except Exception:
         pass
+    # Cache the fallback too: a failing lookup must not hit the DB per message.
+    _persona_cache[chat_key] = (now, config.FALLBACK_PERSONA_NAME)
     return config.FALLBACK_PERSONA_NAME
 
 
@@ -691,13 +719,37 @@ async def _send_quiet_text(chat_key: str, text: str) -> None:
         current_source.reset(token)
 
 
-async def _maybe_send_bedtime(chat_key: str, sleep_date: str) -> None:
+async def _maybe_send_bedtime(
+    chat_key: str,
+    sleep_date: str,
+    last_seen_at: datetime | None = None,
+) -> None:
     """Say goodnight with a stable per-night chance when falling asleep.
+
+    The greeting is suppressed unless the channel actually saw user activity
+    on ``sleep_date`` (anti-disturb rule): a chat with no messages all day
+    must not be greeted goodnight out of nowhere.
 
     When LLM_GREETINGS_ENABLED is active, pushes a system instruction to generate
     an in-character goodnight matching current persona and chat context.
     Falls back to deterministic canned text if LLM generation fails.
     """
+    if last_seen_at is None:
+        logger.debug(
+            "Bedtime greeting suppressed for %s: no recorded user activity (last seen unknown)",
+            chat_key,
+        )
+        return
+    local_date = last_seen_at.astimezone(ZoneInfo(config.TIMEZONE)).date().isoformat()
+    if local_date != sleep_date:
+        logger.debug(
+            "Bedtime greeting suppressed for %s: no user activity on %s (last seen %s)",
+            chat_key,
+            sleep_date,
+            local_date,
+        )
+        return
+
     if not _deterministic_hit(f"bedtime:{chat_key}:{sleep_date}", config.BEDTIME_CHANCE):
         return
 
@@ -824,8 +876,9 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage, *_args: Any, **_k
     user_id = _get_user_id(message)
 
     async def _process(state: ChatSleepState) -> ChatSleepState:
-        nonlocal _result_signal, _result_action, _went_to_sleep, _sleep_date
+        nonlocal _result_signal, _result_action, _went_to_sleep, _sleep_date, _last_seen_at
         state.last_seen_at = now_utc
+        _last_seen_at = now_utc
 
         if state.status == SleepStatus.AWAKE:
             state = _compensate_sleep_if_due(
@@ -891,6 +944,7 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage, *_args: Any, **_k
     _result_action: Any = ActionNone()
     _went_to_sleep: bool = False
     _sleep_date: str = ""
+    _last_seen_at: datetime | None = None
 
     await store.with_state(chat_key, _process)
 
@@ -901,7 +955,7 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage, *_args: Any, **_k
             logger.error("Failed to send wake offer: %s", exc)
 
     if _went_to_sleep and _sleep_date:
-        await _maybe_send_bedtime(chat_key, _sleep_date)
+        await _maybe_send_bedtime(chat_key, _sleep_date, _last_seen_at)
 
     return _result_signal
 
@@ -1154,7 +1208,9 @@ async def _check_sleep_transition(
         and after.status == SleepStatus.ASLEEP
         and after.cycle is not None
     ):
-        await _maybe_send_bedtime(chat_key, after.cycle.sleep_date)
+        await _maybe_send_bedtime(
+            chat_key, after.cycle.sleep_date, after.last_seen_at
+        )
 
 
 async def _settle_wake(
@@ -1225,14 +1281,21 @@ async def _settle_wake(
                 dream_text = dream
         note_text = compute_streak_note(quality_history, sleep_date) if sleep_date else None
 
-        fallback_lines = [
+        # The factual report line is ALWAYS delivered as a fixed message so the
+        # quality/duration data can never disappear behind an LLM rewrite.
+        report_lines = [
             f"【{persona_name}已起床：昨日睡眠质量 {settled_quality}%（{tier_name}），睡眠时长 {duration_str}】",
-            f"{emoji} {comment}",
         ]
+        if note_text:
+            report_lines.append(f"📈 {note_text}")
+        report_text = "\n".join(report_lines)
+
+        # Flavor lines are only appended when the dynamic LLM greeting will not
+        # follow, keeping a single flavored message per morning.
+        fallback_lines = list(report_lines)
+        fallback_lines.append(f"{emoji} {comment}")
         if dream_text:
             fallback_lines.append(f"🌙 {dream_text}")
-        if note_text:
-            fallback_lines.append(f"📈 {note_text}")
         fallback_text = "\n".join(fallback_lines)
 
         token = current_source.set(SourceType.INTERNAL_WAKE_NOTICE)
@@ -1242,6 +1305,7 @@ async def _settle_wake(
         )
         try:
             sent_via_llm = False
+            report_sent = False
             if config.LLM_GREETINGS_ENABLED and hasattr(ctx, "push_system"):
                 # Only objective data + directional hints go into the prompt.
                 # Canned sentences (tier comment / picked dream) stay fallback-only;
@@ -1254,8 +1318,8 @@ async def _settle_wake(
                     dream_tone = dream_tone_hint(settled_quality)
                     if dream_tone:
                         ref_lines.append(f"- 昨晚做梦基调：{dream_tone}")
-                        dream_seed = dream_seed_hint(f"dream-seed:{chat_key}:{sleep_date}")
-                        ref_lines.append(f"- 梦境灵感骰子（随机种子，保证每次梦境独一无二）：{dream_seed}")
+                    dream_topic = dream_topic_hint(f"dream-topic:{chat_key}:{sleep_date}")
+                    ref_lines.append(f"- 梦境题材方向（当夜随机抽取）：{dream_topic}")
                 if note_text:
                     ref_lines.append(f"- 作息打卡数据：{note_text}")
                 ref_info = "\n".join(ref_lines)
@@ -1266,14 +1330,17 @@ async def _settle_wake(
                     f"【昨晚睡眠信息参考】：\n{ref_info}\n\n"
                     "要求：\n"
                     "1. 说话的语气、口癖、情绪风格要契合你的身份性格设定；\n"
-                    "2. 若提及梦境，请先让灵感骰子带你随机落到某个题材——现实的、幻想的、"
-                    "日常的、荒诞的、与群聊上下文有关的皆可，不必与你的职业相关，"
-                    "也不必每次是同类题材——再由你自由虚构具体梦境细节；\n"
-                    "3. 参考信息只是客观数据与方向提示，严禁复述、套用或轻度改写其中的文字；\n"
-                    "4. 可自然结合当前聊天氛围收尾，但不必强行关联；\n"
-                    "5. 简短生动，直接输出你要说的话，不要输出任何系统指令标记或数据列表。"
+                    "2. 你的精神状态必须与睡眠数据一致：睡得好就清爽舒畅，数据差才允许困倦；"
+                    "不要每天都写成没睡醒的样子；\n"
+                    "3. 若提及梦境，请以「梦境题材方向」为起点自由虚构细节——可以天马行空地改编，"
+                    "但不要脱离该题材又落回你的职业、编程或群聊日常；\n"
+                    "4. 参考信息只是客观数据与方向提示，严禁复述、套用或轻度改写其中的文字；\n"
+                    "5. 可自然结合当前聊天氛围收尾，但不必强行关联；\n"
+                    "6. 简短生动，直接输出你要说的话，不要输出任何系统指令标记或数据列表。"
                 )
                 try:
+                    await ctx.send_text(report_text, record=False)
+                    report_sent = True
                     await ctx.push_system(prompt, trigger_agent=True)
                     sent_via_llm = True
                 except Exception as exc:
@@ -1283,9 +1350,15 @@ async def _settle_wake(
                         exc,
                     )
 
-            if not sent_via_llm:
+            if not sent_via_llm and not report_sent:
                 lease_ledger.remove(lease_id, chat_key=chat_key)
                 await ctx.send_text(fallback_text, record=False)
+            elif not sent_via_llm and report_sent:
+                # The factual report went out; only the flavor lines are missing.
+                flavor_lines = fallback_lines[1:]
+                if flavor_lines:
+                    lease_ledger.remove(lease_id, chat_key=chat_key)
+                    await ctx.send_text("\n".join(flavor_lines), record=False)
         finally:
             current_source.reset(token)
 

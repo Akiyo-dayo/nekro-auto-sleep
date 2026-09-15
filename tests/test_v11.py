@@ -522,13 +522,43 @@ class TestPersistenceAndToolEnhancements:
         )
         monkeypatch.setattr(nas_mod, "_deterministic_hit", lambda *_: True)
         monkeypatch.setattr(nas_mod.config, "LLM_GREETINGS_ENABLED", True)
+        # Active on the sleep date (2025-01-01 15:00 UTC = 2025-01-01 23:00 +8)
+        active_seen = datetime(2025, 1, 1, 7, 0, tzinfo=UTC)
 
-        await nas_mod._maybe_send_bedtime("chat1", "2025-01-01")
+        await nas_mod._maybe_send_bedtime("chat1", "2025-01-01", active_seen)
         assert len(pushed_prompts) == 1
         prompt, trigger = pushed_prompts[0]
         assert trigger is True
         assert "就寝时间" in prompt
         assert "符合你口吻" in prompt
+
+    @pytest.mark.asyncio
+    async def test_bedtime_suppressed_on_quiet_channel(self, monkeypatch):
+        _setup_mock_nekro_agent()
+        nas_mod = sys.modules["nekro_auto_sleep"]
+
+        pushed_prompts = []
+
+        class MockCtx:
+            async def push_system(self, prompt, trigger_agent=False):
+                pushed_prompts.append((prompt, trigger_agent))
+
+        monkeypatch.setattr(
+            nas_mod.AgentCtx,
+            "create_by_chat_key",
+            AsyncMock(return_value=MockCtx()),
+        )
+        monkeypatch.setattr(nas_mod, "_deterministic_hit", lambda *_: True)
+        monkeypatch.setattr(nas_mod.config, "LLM_GREETINGS_ENABLED", True)
+
+        # Last user message was the previous day -> channel was quiet all day.
+        stale_seen = datetime(2024, 12, 31, 7, 0, tzinfo=UTC)
+        await nas_mod._maybe_send_bedtime("chat1", "2025-01-01", stale_seen)
+        assert pushed_prompts == []
+
+        # No recorded activity at all -> also suppressed.
+        await nas_mod._maybe_send_bedtime("chat1", "2025-01-01", None)
+        assert pushed_prompts == []
 
     @pytest.mark.asyncio
     async def test_dynamic_bedtime_fallback_on_error(self, monkeypatch):
@@ -553,8 +583,9 @@ class TestPersistenceAndToolEnhancements:
             "_send_quiet_text",
             AsyncMock(side_effect=lambda ck, text: fallback_sent.append((ck, text))),
         )
+        active_seen = datetime(2025, 1, 1, 7, 0, tzinfo=UTC)
 
-        await nas_mod._maybe_send_bedtime("chat1", "2025-01-01")
+        await nas_mod._maybe_send_bedtime("chat1", "2025-01-01", active_seen)
         assert len(fallback_sent) == 1
         assert fallback_sent[0][0] == "chat1"
 
@@ -1148,3 +1179,152 @@ class TestPersistenceAndToolEnhancements:
         res = await _schedule()
         assert res is None and len(scheduled) == 3
 
+
+class TestV123Fixes:
+    """v1.2.3 fixes: persona resolution, report restore, quiet-channel gates."""
+
+    @pytest.mark.asyncio
+    async def test_persona_name_from_sync_property(self, monkeypatch):
+        nas_mod = _load_plugin_module()
+        nas_mod._persona_cache.clear()
+
+        class MockPreset:
+            name = "可洛"
+            title = "可洛"
+
+        class MockChannel:
+            async def get_preset(self):
+                return MockPreset()
+
+        class MockCtx:
+            chat_key = "chat_persona"
+
+            @property
+            def db_chat_channel(self):
+                return MockChannel()
+
+        # The sync Optional[DBChatChannel] property shape (Akiyo fork 2.4.x)
+        # used to raise on ``await ctx.db_chat_channel`` and always yield "Bot".
+        assert await nas_mod._get_persona_name(MockCtx()) == "可洛"
+
+    @pytest.mark.asyncio
+    async def test_persona_name_falls_back_when_channel_missing(self, monkeypatch):
+        nas_mod = _load_plugin_module()
+        nas_mod._persona_cache.clear()
+
+        class MockCtx:
+            chat_key = "chat_no_channel"
+
+            @property
+            def db_chat_channel(self):
+                return None
+
+        # DB fallback import fails under the mock host -> config fallback name.
+        assert (
+            await nas_mod._get_persona_name(MockCtx())
+            == nas_mod.config.FALLBACK_PERSONA_NAME
+        )
+
+    def _report_store(self):
+        from nekro_auto_sleep.persistence import SleepStateStore
+
+        class MockBackend:
+            def __init__(self):
+                self.data = {}
+
+            async def get(self, chat_key=None, store_key=""):
+                return self.data.get(store_key)
+
+            async def set(self, chat_key=None, store_key="", value=""):
+                self.data[store_key] = value
+
+        return SleepStateStore(MockBackend())
+
+    @pytest.mark.asyncio
+    async def test_wake_report_line_restored_with_attempts(self, monkeypatch):
+        _setup_mock_nekro_agent()
+        nas_mod = sys.modules["nekro_auto_sleep"]
+
+        store = self._report_store()
+        now = datetime(2026, 9, 2, 0, 30, tzinfo=UTC)
+        base = _make_state()
+        cycle = base.cycle.model_copy(
+            update={
+                "wake_attempts": [
+                    WakeAttempt(
+                        user_id="u1", chat_key="chat_report",
+                        attempted_at=datetime(2026, 9, 1, 16, 0, tzinfo=UTC),
+                    )
+                ]
+            }
+        )
+        init_state = base.model_copy(
+            update={"chat_key": "chat_report", "cycle": cycle}
+        )
+        await store.save(init_state)
+
+        sent_texts = []
+        pushed_prompts = []
+
+        class MockCtx:
+            chat_key = "chat_report"
+
+            async def push_system(self, prompt, trigger_agent=False):
+                pushed_prompts.append(prompt)
+
+            async def send_text(self, text, record=False):
+                sent_texts.append(text)
+
+        monkeypatch.setattr(
+            nas_mod.AgentCtx,
+            "create_by_chat_key",
+            AsyncMock(return_value=MockCtx()),
+        )
+        monkeypatch.setattr(nas_mod.config, "LLM_GREETINGS_ENABLED", True)
+        # WAKE_NOTICE_ALWAYS keeps the new default (False): a night WITH a
+        # wake attempt must still notify.
+
+        await nas_mod._settle_wake(store, "chat_report", now)
+        # The factual report line is delivered even on the LLM path.
+        assert any(
+            "已起床" in t and "睡眠质量" in t and "睡眠时长" in t
+            for t in sent_texts
+        )
+        assert len(pushed_prompts) == 1
+        assert "梦境题材方向" in pushed_prompts[0]
+
+    @pytest.mark.asyncio
+    async def test_quiet_night_no_notice_by_default(self, monkeypatch):
+        _setup_mock_nekro_agent()
+        nas_mod = sys.modules["nekro_auto_sleep"]
+
+        store = self._report_store()
+        now = datetime(2026, 9, 2, 0, 30, tzinfo=UTC)
+        init_state = _make_state().model_copy(
+            update={"chat_key": "chat_quiet"}
+        )
+        await store.save(init_state)
+
+        sent_texts = []
+        pushed_prompts = []
+
+        class MockCtx:
+            chat_key = "chat_quiet"
+
+            async def push_system(self, prompt, trigger_agent=False):
+                pushed_prompts.append(prompt)
+
+            async def send_text(self, text, record=False):
+                sent_texts.append(text)
+
+        monkeypatch.setattr(
+            nas_mod.AgentCtx,
+            "create_by_chat_key",
+            AsyncMock(return_value=MockCtx()),
+        )
+        monkeypatch.setattr(nas_mod.config, "LLM_GREETINGS_ENABLED", True)
+        # Default WAKE_NOTICE_ALWAYS=False + zero wake attempts -> silence.
+
+        await nas_mod._settle_wake(store, "chat_quiet", now)
+        assert sent_texts == []
+        assert pushed_prompts == []

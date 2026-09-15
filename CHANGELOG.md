@@ -1,5 +1,63 @@
 # 更新日志 (CHANGELOG)
 
+## [v1.2.3] - 2026-09-15
+
+### 严重修复：睡眠评分恒为下限、晨报数据行消失与多处回归（生产实证定位）
+
+广州 8021 生产实例连续多日实证（数据库 `quality_history` 全量 60 分、
+晨间 LLM prompt 显示"睡眠时长 0 分钟"、群里每早固定"头昏沉沉/梦见代码"）
+定位出四个问题并全部修复：
+
+- **问题 1（防打扰设计被覆盖）**：
+  - `WAKE_NOTICE_ALWAYS` 默认值从 `true` 改回 `false`，恢复原设计
+    （§10.2：仅当夜里发生过真实叫醒尝试才发送晨间报告）；当天无任何
+    消息的频道/群聊不再收到晨报。
+  - 晚安消息增加"当天活动"闸门：`_maybe_send_bedtime` 现要求
+    `last_seen_at` 的本地日期等于 `sleep_date`（当天有过用户消息）才发送；
+    全天无消息或无记录的频道静默跳过。
+- **问题 2（叫醒固定回复显示 "Bot" 而非人设名）**：
+  - 根因：宿主（Akiyo 分叉 2.4.x）的 `AgentCtx.db_chat_channel` 是
+    **同步 property** 且可能为 `None`，旧代码 `await ctx.db_chat_channel`
+    对其 await 必然抛 `TypeError` 被吞掉，每次都回退到
+    `FALLBACK_PERSONA_NAME`（"Bot"）。
+  - 修复：`_get_persona_name` 重写为能力探测式——兼容同步属性 / 可调用 /
+    可等待三种形态；`None` 时按 `chat_key` 直查 `DBChatChannel` 兜底；
+    人设名取 `name`，缺省再取 `title`；回退结果也进入 60s TTL 缓存，
+    避免每条消息打库。
+- **问题 3（睡眠质量评分恒 60 / 时长 0——晨报数据全错的根因）**：
+  - `compute_actual_sleep_seconds` 与 `compute_fragmentation` 都会**跳过
+    `close_at=None` 的未闭合片段**；而 `_settle_wake` 在结算时是
+    **先算时长/评分、后闭合片段**，于是每晚：时长=0（coverage=0，
+    -40 分）、fragmentation=1（-18 分）→ raw ≈ 40 → 被钳制到
+    `QUALITY_MIN`（60）。所有频道、所有夜晚恒 60 分。
+  - 修复：未闭合片段按 `now_utc`（缺省为计划起床点）计入并与目标睡眠
+    窗口取交集（§10.3）；`compute_fragmentation` 新增 `open_end` 参数，
+    `compute_quality` 内部传入 `planned_wake_at`。修复后同一生产数据
+    复算：无打扰整夜 94 分（睡得不错档）。
+- **问题 4（晨报数据行被 LLM 问候吞掉）**：
+  - v1.2.2 的 LLM 路径要求模型"严禁复述参考数据"，导致
+    「【XX已起床：昨日睡眠质量 X%，睡眠时长 Y】」这条数据行彻底消失。
+  - 修复：结算时**始终先发固定数据报告行**（含打卡 note，
+    `record=False`），再触发 LLM 动态问候；LLM 关闭或失败时追加原
+    v1.1.x 风格的 emoji 评语与罐头梦境行。报告已发出而 LLM 失败时
+    只补风味行，不重复报告头。
+- **问题 4b（梦境题材高度与代码相关）**：
+  - 根因：评分恒 60 → `dream_tone_hint` 每晚都是"做了个不太好的梦"，
+    加上人设（程序员角色）与群聊上下文锚定，模型每晚输出技术故障噩梦；
+    v1.2.2 的"灵感骰子"（不透明 hex 种子）无法对题材去相关，实测无效。
+  - 修复：新增 `dream_topic_hint()`——从 30 个覆盖旅行/童年/太空/江湖/
+    音乐会/菜市场等方向的题材池中按 `(chat_key, sleep_date)` 确定性
+    抽取，作为「梦境题材方向」注入 prompt；同时 prompt 增加
+    "精神状态必须与睡眠数据一致，睡得好就清爽舒畅，不要每天都写成
+    没睡醒的样子"。评分修复后基调本身也会随真实分数分布。
+- **测试基建**：`tests/__init__.py` 移除——pytest ≥ 8.4 会沿
+  `__init__.py` 链把 conftest 当作 `nekro_auto_sleep.tests.conftest`
+  导入，从而在收集前执行依赖宿主的插件 `__init__.py`（pytest 8.4.2
+  实测即报 `ModuleNotFoundError: nekro_agent`）；pytest.ini 补充说明。
+- **测试**：新增未闭合片段时长/碎片度/评分回归、人设名同步属性解析、
+    晚安活动闸门、晨报数据行恢复、默认静默夜不通知等用例；
+    全套 107 项通过。
+
 ## [v1.2.2] - 2026-09-11
 
 ### 修复：LLM 问候语预设影子与题材坍缩

@@ -429,14 +429,26 @@ def format_sleep_duration(total_seconds: float) -> str:
         return f"{hours} 小时 {minutes} 分钟"
 
 
-def compute_actual_sleep_seconds(cycle: SleepCycle) -> float:
-    """Compute total sleep time from segments, excluding timer intervals and early-wake gaps."""
+def compute_actual_sleep_seconds(
+    cycle: SleepCycle,
+    now_utc: datetime | None = None,
+) -> float:
+    """Compute total sleep time from segments, excluding timer intervals and early-wake gaps.
+
+    A segment that is still open counts up to ``now_utc`` (or the planned wake
+    time when omitted): settlement computes quality BEFORE closing the final
+    segment, and skipping open segments made every night score as zero sleep,
+    pinning the quality to the configured minimum.
+    Durations are additionally clamped to the target sleep window (spec §10.3).
+    """
+    target_start = cycle.sleep_at
+    target_end = cycle.planned_wake_at
+    open_end = now_utc or target_end
     total = 0.0
     for seg in cycle.sleep_segments:
-        if seg.close_at is None:
-            continue
-        seg_start = seg.open_at
-        seg_end = seg.close_at
+        seg_start = max(seg.open_at, target_start)
+        seg_end = seg.close_at if seg.close_at is not None else open_end
+        seg_end = min(seg_end, target_end)
         seg_duration = (seg_end - seg_start).total_seconds()
         if seg_duration > 0:
             total += seg_duration

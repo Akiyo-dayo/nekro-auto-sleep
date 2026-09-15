@@ -293,6 +293,85 @@ class TestSleepDuration:
         secs = compute_actual_sleep_seconds(cycle)
         assert secs == 9.5 * 3600
 
+    def test_open_segment_counts_to_planned_wake(self, default_snapshot):
+        # Regression (v1.2.3): settlement computes quality BEFORE closing the
+        # final segment; skipping open segments scored every night as zero
+        # sleep and floored the quality to the minimum.
+        seg = SleepSegment(
+            open_at=datetime(2026, 8, 13, 15, 0, tzinfo=UTC),
+            close_at=None,
+        )
+        cycle = SleepCycle(
+            cycle_id="test-open",
+            sleep_date="2026-08-13",
+            timezone="Asia/Shanghai",
+            sleep_at=datetime(2026, 8, 13, 15, 0, tzinfo=UTC),
+            planned_wake_at=datetime(2026, 8, 14, 0, 30, tzinfo=UTC),
+            config_snapshot=default_snapshot,
+            quality_seed="abc",
+            sleep_segments=[seg],
+        )
+        secs = compute_actual_sleep_seconds(cycle)
+        assert secs == 9.5 * 3600
+
+    def test_open_segment_respects_now_utc(self, default_snapshot):
+        seg = SleepSegment(
+            open_at=datetime(2026, 8, 13, 15, 0, tzinfo=UTC),
+            close_at=None,
+        )
+        cycle = SleepCycle(
+            cycle_id="test-open-now",
+            sleep_date="2026-08-13",
+            timezone="Asia/Shanghai",
+            sleep_at=datetime(2026, 8, 13, 15, 0, tzinfo=UTC),
+            planned_wake_at=datetime(2026, 8, 14, 0, 30, tzinfo=UTC),
+            config_snapshot=default_snapshot,
+            quality_seed="abc",
+            sleep_segments=[seg],
+        )
+        now = datetime(2026, 8, 13, 18, 0, tzinfo=UTC)
+        assert compute_actual_sleep_seconds(cycle, now) == 3.0 * 3600
+
+    def test_segment_clamped_to_target_window(self, default_snapshot):
+        # A segment closed after planned_wake (delayed settlement) must not
+        # count beyond the target sleep window (spec §10.3).
+        seg = SleepSegment(
+            open_at=datetime(2026, 8, 13, 15, 0, tzinfo=UTC),
+            close_at=datetime(2026, 8, 14, 2, 0, tzinfo=UTC),
+        )
+        cycle = SleepCycle(
+            cycle_id="test-clamp",
+            sleep_date="2026-08-13",
+            timezone="Asia/Shanghai",
+            sleep_at=datetime(2026, 8, 13, 15, 0, tzinfo=UTC),
+            planned_wake_at=datetime(2026, 8, 14, 0, 30, tzinfo=UTC),
+            config_snapshot=default_snapshot,
+            quality_seed="abc",
+            sleep_segments=[seg],
+        )
+        assert compute_actual_sleep_seconds(cycle) == 9.5 * 3600
+
+    def test_quality_not_floored_with_open_segment(self, default_snapshot):
+        from nekro_auto_sleep.quality import compute_quality
+
+        seg = SleepSegment(
+            open_at=datetime(2026, 8, 13, 15, 0, tzinfo=UTC),
+            close_at=None,
+        )
+        cycle = SleepCycle(
+            cycle_id="test-quality-open",
+            sleep_date="2026-08-13",
+            timezone="Asia/Shanghai",
+            sleep_at=datetime(2026, 8, 13, 15, 0, tzinfo=UTC),
+            planned_wake_at=datetime(2026, 8, 14, 0, 30, tzinfo=UTC),
+            config_snapshot=default_snapshot,
+            quality_seed="abc",
+            sleep_segments=[seg],
+        )
+        duration = compute_actual_sleep_seconds(cycle)
+        # Undisturbed full night must not sit at the quality floor (60).
+        assert compute_quality(cycle, duration) >= 90
+
     def test_clean_expired_offers(self):
         from nekro_auto_sleep.engine import clean_expired_offers
         from nekro_auto_sleep.models import PendingWakeOffer
