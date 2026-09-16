@@ -6,7 +6,7 @@ Domain layer — no host imports. All time parameters are aware UTC datetimes.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Literal
 
 from zoneinfo import ZoneInfo
@@ -403,17 +403,29 @@ def handle_message_while_asleep(
 # ---------------------------------------------------------------------------
 
 
-def should_send_wake_notice(cycle: SleepCycle, always: bool = False) -> bool:
+def should_send_wake_notice(
+    cycle: SleepCycle,
+    always: bool = False,
+    last_seen_at: datetime | None = None,
+) -> bool:
     """Check if natural wake notice should be sent (spec §10.2).
 
-    ``always`` sends the morning report even on undisturbed nights; with the
-    default False only nights with (unconfirmed) wake attempts get a notice.
+    ``always`` sends the morning report unconditionally; otherwise the channel
+    must have seen at least one user message since local midnight of
+    ``cycle.sleep_date`` — overnight messages blocked while asleep count too.
+    A channel with no user activity that day stays completely silent.
     """
     if cycle.ended_while_early_awake:
         return False
     if always:
         return True
-    return bool(cycle.wake_attempts)
+    if last_seen_at is None:
+        return False
+    tz = ZoneInfo(cycle.timezone)
+    day_start = datetime.combine(
+        date.fromisoformat(cycle.sleep_date), time.min, tzinfo=tz
+    )
+    return last_seen_at >= day_start
 
 
 def format_sleep_duration(total_seconds: float) -> str:
@@ -474,7 +486,9 @@ def settle_natural_wake(
     if was_early_awake:
         return state, None
 
-    if not should_send_wake_notice(state.cycle, always=always_notice):
+    if not should_send_wake_notice(
+        state.cycle, always=always_notice, last_seen_at=state.last_seen_at
+    ):
         return state, None
 
     sleep_secs = compute_actual_sleep_seconds(state.cycle)

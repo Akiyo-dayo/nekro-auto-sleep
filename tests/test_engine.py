@@ -238,6 +238,9 @@ class TestNaturalWake:
         state, _ = handle_message_while_asleep(
             state, call_time, "user1", "Bot", valid_call=True
         )
+        # the plugin hook records every user message into last_seen_at;
+        # the morning report gate keys off that activity, not the attempt
+        state.last_seen_at = call_time
 
         wake_time = state.cycle.planned_wake_at
         state, action = settle_natural_wake(state, wake_time, "Bot", 103)

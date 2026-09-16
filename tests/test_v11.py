@@ -192,12 +192,30 @@ class TestWakeInjectText:
 
 
 class TestWakeNoticeCondition:
-    def test_default_requires_attempts(self):
+    def test_default_requires_same_day_activity(self):
         state = _make_state()
         state = settle_natural_wake(state, state.cycle.planned_wake_at, "Bot", 100)[0]
+        # no recorded user activity -> silent
         assert not should_send_wake_notice(state.cycle)
 
-    def test_always_sends_without_attempts(self):
+    def test_activity_on_sleep_date_sends(self):
+        state = _make_state()
+        state = settle_natural_wake(state, state.cycle.planned_wake_at, "Bot", 100)[0]
+        # user messaged on sleep_date (22:00 local) before bedtime
+        seen_day = datetime(2026, 9, 1, 14, 0, tzinfo=UTC)
+        assert should_send_wake_notice(state.cycle, last_seen_at=seen_day)
+        # overnight message (01:30 local next day) also counts
+        seen_night = datetime(2026, 9, 1, 17, 30, tzinfo=UTC)
+        assert should_send_wake_notice(state.cycle, last_seen_at=seen_night)
+
+    def test_stale_activity_stays_silent(self):
+        state = _make_state()
+        state = settle_natural_wake(state, state.cycle.planned_wake_at, "Bot", 100)[0]
+        # last message was 23:59 local on the day BEFORE sleep_date
+        seen_old = datetime(2026, 8, 31, 15, 59, tzinfo=UTC)
+        assert not should_send_wake_notice(state.cycle, last_seen_at=seen_old)
+
+    def test_always_sends_without_activity(self):
         state = _make_state()
         state = settle_natural_wake(state, state.cycle.planned_wake_at, "Bot", 100)[0]
         assert should_send_wake_notice(state.cycle, always=True)
@@ -889,34 +907,6 @@ class TestPersistenceAndToolEnhancements:
         assert nas_mod._is_sleeping("chat_host_disabled") is True
 
     @pytest.mark.asyncio
-    async def test_is_sleeping_fail_open_when_master_switch_off(self, monkeypatch):
-        """config.ENABLED=False must also fail the dispatch gate open, or
-        chats put to sleep before the switch was turned off stay stuck:
-        messages never trigger the LLM and the wake protocol is dead."""
-        nas_mod = _load_plugin_module()
-
-        class MockBackend:
-            def __init__(self):
-                self.data = {}
-
-            async def get(self, chat_key=None, store_key=""):
-                return self.data.get(store_key)
-
-            async def set(self, chat_key=None, store_key="", value=""):
-                self.data[store_key] = value
-
-        store = nas_mod.SleepStateStore(MockBackend())
-        await store.save(ChatSleepState(chat_key="chat_master_off", status=SleepStatus.ASLEEP))
-        monkeypatch.setattr(nas_mod, "_store", store)
-        monkeypatch.setattr(nas_mod, "_is_runtime_active", True)
-        monkeypatch.setattr(nas_mod.plugin, "_is_enabled", True)
-
-        assert nas_mod._is_sleeping("chat_master_off") is True
-
-        monkeypatch.setattr(nas_mod.config, "ENABLED", False)
-        assert nas_mod._is_sleeping("chat_master_off") is False
-
-    @pytest.mark.asyncio
     async def test_schedule_agent_task_wrapper_fail_open_when_host_disabled(self, monkeypatch):
         """End-to-end dispatch-layer check: with the plugin host-disabled and
         the chat persisted as ASLEEP, the schedule_agent_task wrapper must
@@ -1097,8 +1087,7 @@ class TestPersistenceAndToolEnhancements:
         ``_is_enabled``, no ``enabled`` attribute) and walks the full matrix:
         the gate blocks while enabled+asleep, fails open on
         restart-with-disabled, fails open after runtime WebUI disable
-        (wraps restored), fails open when the master switch is off, and the
-        gate closes again on re-enable.
+        (wraps restored), and the gate closes again on re-enable.
         """
         nas_mod = _load_plugin_module()
 
@@ -1143,7 +1132,6 @@ class TestPersistenceAndToolEnhancements:
             monkeypatch.setattr(nas_mod, "_store", store)
             monkeypatch.setattr(nas_mod, "_is_runtime_active", True)
             monkeypatch.setattr(nas_mod.plugin, "_is_enabled", True)
-            monkeypatch.setattr(nas_mod.config, "ENABLED", True)
             nas_mod._installed_wraps.clear()
             nas_mod._install_wraps()
 
@@ -1168,16 +1156,10 @@ class TestPersistenceAndToolEnhancements:
         res = await _schedule()
         assert res == "scheduled" and len(scheduled) == 2
 
-        # 4. Master switch off with ASLEEP state -> fail open
+        # 4. Re-enable -> gate closes again
         await _activate_runtime()
-        monkeypatch.setattr(nas_mod.config, "ENABLED", False)
         res = await _schedule()
-        assert res == "scheduled" and len(scheduled) == 3
-
-        # 5. Re-enable -> gate closes again
-        monkeypatch.setattr(nas_mod.config, "ENABLED", True)
-        res = await _schedule()
-        assert res is None and len(scheduled) == 3
+        assert res is None and len(scheduled) == 2
 
 
 class TestV123Fixes:
@@ -1259,7 +1241,12 @@ class TestV123Fixes:
             }
         )
         init_state = base.model_copy(
-            update={"chat_key": "chat_report", "cycle": cycle}
+            update={
+                "chat_key": "chat_report",
+                "cycle": cycle,
+                # the wake attempt implies a user message that night
+                "last_seen_at": datetime(2026, 9, 1, 16, 0, tzinfo=UTC),
+            }
         )
         await store.save(init_state)
 
@@ -1281,8 +1268,8 @@ class TestV123Fixes:
             AsyncMock(return_value=MockCtx()),
         )
         monkeypatch.setattr(nas_mod.config, "LLM_GREETINGS_ENABLED", True)
-        # WAKE_NOTICE_ALWAYS keeps the new default (False): a night WITH a
-        # wake attempt must still notify.
+        # WAKE_NOTICE_ALWAYS keeps the default (False): a channel WITH
+        # same-day user activity must still notify.
 
         await nas_mod._settle_wake(store, "chat_report", now)
         # The factual report line is delivered even on the LLM path.
@@ -1324,7 +1311,7 @@ class TestV123Fixes:
             AsyncMock(return_value=MockCtx()),
         )
         monkeypatch.setattr(nas_mod.config, "LLM_GREETINGS_ENABLED", True)
-        # Default WAKE_NOTICE_ALWAYS=False + zero wake attempts -> silence.
+        # Default WAKE_NOTICE_ALWAYS=False + no same-day user activity -> silence.
 
         await nas_mod._settle_wake(store, "chat_quiet", now)
         assert sent_texts == []

@@ -101,7 +101,7 @@ plugin = NekroPlugin(
     name="自动睡眠",
     module_name="nekro_auto_sleep",
     description="为每个会话提供独立的拟人化睡眠周期：叫醒协议、睡眠质量评分、梦境播报与连续打卡",
-    version="1.2.4",
+    version="1.2.5",
     author="Akiyo_dayo",
     url="https://github.com/Akiyo-dayo/NekroAgent_ByAkiyo",
     allow_sleep=True,
@@ -124,20 +124,10 @@ plugin = NekroPlugin(
 class SleepConfig(ConfigBase):
     """自动睡眠配置"""
 
-    ENABLED: bool = Field(
-        default=True,
-        title="启用自动睡眠",
-        json_schema_extra=ExtraField(
-            i18n_title=i18n.i18n_text(zh_CN="启用自动睡眠", en_US="Enable Auto Sleep"),
-            i18n_description=i18n.i18n_text(
-                zh_CN="总开关，关闭后立即停止全部拦截（含已在睡眠中的会话，消息正常触发回复）；已有睡眠状态保留，重新开启后恢复",
-                en_US="Master switch; turning it off immediately stops all interception (including chats already asleep, messages trigger normally); existing sleep states are kept and resume on re-enable",
-            ),
-        ).model_dump(),
-    )
     TIMEZONE: str = Field(
         default="Asia/Shanghai",
         title="时区",
+        description="IANA 时区名称，所有睡眠时间按此时区解释",
         json_schema_extra=ExtraField(
             placeholder="Asia/Shanghai",
             i18n_title=i18n.i18n_text(zh_CN="时区", en_US="Timezone"),
@@ -150,6 +140,7 @@ class SleepConfig(ConfigBase):
     SLEEP_TIME: str = Field(
         default="23:00",
         title="入睡时间",
+        description="每日自动入睡的时间，格式 HH:MM",
         json_schema_extra=ExtraField(
             placeholder="23:00",
             i18n_title=i18n.i18n_text(zh_CN="入睡时间", en_US="Bedtime"),
@@ -162,6 +153,7 @@ class SleepConfig(ConfigBase):
     WAKE_TIME_START: str = Field(
         default="06:45",
         title="起床时间范围（起始）",
+        description="随机起床时间的最早时刻，格式 HH:MM",
         json_schema_extra=ExtraField(
             placeholder="06:45",
             i18n_title=i18n.i18n_text(zh_CN="起床时间范围（起始）", en_US="Wake Range Start"),
@@ -174,6 +166,7 @@ class SleepConfig(ConfigBase):
     WAKE_TIME_END: str = Field(
         default="08:30",
         title="起床时间范围（结束）",
+        description="随机起床时间的最晚时刻，格式 HH:MM",
         json_schema_extra=ExtraField(
             placeholder="08:30",
             i18n_title=i18n.i18n_text(zh_CN="起床时间范围（结束）", en_US="Wake Range End"),
@@ -186,17 +179,19 @@ class SleepConfig(ConfigBase):
     WAKE_RANDOM_STEP_MINUTES: int = Field(
         default=1,
         title="起床随机粒度（分钟）",
+        description="随机起床时刻的候选步长：在起床范围内每隔 N 分钟生成一个候选点，实际起床时刻从这些整点中随机抽取；1=可落在任意整分钟，15=只会落在 :00/:15/:30/:45；取值 1-60",
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="起床随机粒度（分钟）", en_US="Wake Random Step (min)"),
             i18n_description=i18n.i18n_text(
-                zh_CN="在起床范围内按此分钟数生成候选起床点，1-60",
-                en_US="Candidate wake times are generated at this minute interval within the range, 1-60",
+                zh_CN="随机起床时刻的候选步长：在起床范围内每隔 N 分钟生成一个候选点，实际起床时刻从这些整点中随机抽取；1=可落在任意整分钟，15=只会落在 :00/:15/:30/:45；取值 1-60",
+                en_US="Candidate step for the random wake time: one candidate every N minutes within the wake range and the picked time always lands on one of these points; 1 = any whole minute, 15 = only :00/:15/:30/:45; range 1-60",
             ),
         ).model_dump(),
     )
     NEAR_WAKE_RATIO: float = Field(
         default=0.15,
         title="接近起床判定比例",
+        description="睡眠区间末尾的比例，在此范围内提示语改为「还没起床」，0-0.5",
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="接近起床判定比例", en_US="Near Wake Ratio"),
             i18n_description=i18n.i18n_text(
@@ -208,6 +203,7 @@ class SleepConfig(ConfigBase):
     WAKE_CONFIRM_WINDOW_SECONDS: int = Field(
         default=180,
         title="叫醒确认窗口（秒）",
+        description="首次呼叫提问后的等待确认窗口，需在窗口内提及 Bot 或回复确认词（如：要、叫醒）才能唤醒；回复否定词（如：不要、算了）则取消，10-1800",
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="叫醒确认窗口（秒）", en_US="Wake Confirm Window (s)"),
             i18n_description=i18n.i18n_text(
@@ -219,6 +215,7 @@ class SleepConfig(ConfigBase):
     HISTORY_MODE: str = Field(
         default="preserve",
         title="历史记录模式",
+        description="preserve: 首次叫醒消息保留在历史中；strict: 完全拦截不记录",
         json_schema_extra=ExtraField(
             placeholder="preserve",
             i18n_title=i18n.i18n_text(zh_CN="历史记录模式", en_US="History Mode"),
@@ -231,6 +228,7 @@ class SleepConfig(ConfigBase):
     CALL_KEYWORDS: str = Field(
         default="醒醒,起床,在吗",
         title="呼叫关键词",
+        description="触发叫醒的关键词，逗号或换行分隔",
         json_schema_extra=ExtraField(
             is_textarea=True,
             i18n_title=i18n.i18n_text(zh_CN="呼叫关键词", en_US="Call Keywords"),
@@ -243,6 +241,7 @@ class SleepConfig(ConfigBase):
     WAKE_CONFIRM_KEYWORDS: str = Field(
         default="要,叫醒,醒来,起床,是,是的,确认",
         title="唤醒确认关键词",
+        description="提问后确认唤醒的关键词，逗号或换行分隔（例如：要,叫醒）",
         json_schema_extra=ExtraField(
             is_textarea=True,
             i18n_title=i18n.i18n_text(zh_CN="唤醒确认关键词", en_US="Wake Confirm Keywords"),
@@ -255,6 +254,7 @@ class SleepConfig(ConfigBase):
     FALLBACK_PERSONA_NAME: str = Field(
         default="Bot",
         title="默认人格名",
+        description="无法获取当前预设名称时使用的回退名",
         json_schema_extra=ExtraField(
             placeholder="Bot",
             i18n_title=i18n.i18n_text(zh_CN="默认人格名", en_US="Fallback Persona Name"),
@@ -267,6 +267,7 @@ class SleepConfig(ConfigBase):
     EARLY_WAKE_IDLE_MINUTES: int = Field(
         default=10,
         title="提前叫醒空闲超时（分钟）",
+        description="被叫醒后无新互动的自动睡回时间，1-240",
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="提前叫醒空闲超时（分钟）", en_US="Early Wake Idle Timeout (min)"),
             i18n_description=i18n.i18n_text(
@@ -278,6 +279,7 @@ class SleepConfig(ConfigBase):
     WAKE_NOTICE_GRACE_MINUTES: int = Field(
         default=120,
         title="离线补发宽限期（分钟）",
+        description="重启后补发自然醒通知的最大延迟，超过则静默结算，0-1440",
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="离线补发宽限期（分钟）", en_US="Wake Notice Grace Period (min)"),
             i18n_description=i18n.i18n_text(
@@ -289,6 +291,7 @@ class SleepConfig(ConfigBase):
     MAINTENANCE_INTERVAL_SECONDS: int = Field(
         default=15,
         title="维护循环间隔（秒）",
+        description="后台维护任务的检查间隔，2-300",
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="维护循环间隔（秒）", en_US="Maintenance Interval (s)"),
             i18n_description=i18n.i18n_text(
@@ -300,6 +303,7 @@ class SleepConfig(ConfigBase):
     TIMER_AGENT_WAIT_TIMEOUT_SECONDS: int = Field(
         default=900,
         title="定时任务等待超时（秒）",
+        description="插件等待定时任务完成的最大时间，超时后清理租约但不取消核心任务，30-7200",
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="定时任务等待超时（秒）", en_US="Timer Agent Wait Timeout (s)"),
             i18n_description=i18n.i18n_text(
@@ -311,6 +315,7 @@ class SleepConfig(ConfigBase):
     QUALITY_MIN: int = Field(
         default=60,
         title="睡眠质量下限",
+        description="睡眠质量百分比的最低值，0-100",
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="睡眠质量下限", en_US="Quality Min"),
             i18n_description=i18n.i18n_text(
@@ -322,6 +327,7 @@ class SleepConfig(ConfigBase):
     QUALITY_MAX: int = Field(
         default=120,
         title="睡眠质量上限",
+        description="睡眠质量百分比的最高值，100-200，不小于下限",
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="睡眠质量上限", en_US="Quality Max"),
             i18n_description=i18n.i18n_text(
@@ -333,6 +339,7 @@ class SleepConfig(ConfigBase):
     QUALITY_JITTER_POINTS: float = Field(
         default=4.0,
         title="质量稳定扰动幅度",
+        description="每次睡眠质量的随机扰动范围（正负），0-15",
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="质量稳定扰动幅度", en_US="Quality Jitter Points"),
             i18n_description=i18n.i18n_text(
@@ -344,6 +351,7 @@ class SleepConfig(ConfigBase):
     DREAM_ENABLED: bool = Field(
         default=True,
         title="晨间梦境播报",
+        description="自然醒报告中附带一条当夜梦境（睡得越差越容易做噩梦）",
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="晨间梦境播报", en_US="Dream Report"),
             i18n_description=i18n.i18n_text(
@@ -355,6 +363,7 @@ class SleepConfig(ConfigBase):
     DREAM_TOPIC_CONSTRAINTS: str = Field(
         default="不得与昨晚的梦境题材重复",
         title="梦境负面约束",
+        description="梦境由 AI 结合人设与聊天上下文自由发挥，但必须遵守这里的负面约束；多条约束用换行、分号或中文分号分隔，留空表示不加约束",
         json_schema_extra=ExtraField(
             is_textarea=True,
             placeholder="不得与昨晚的梦境题材重复",
@@ -370,6 +379,7 @@ class SleepConfig(ConfigBase):
     BEDTIME_CHANCE: float = Field(
         default=0.35,
         title="晚安消息概率",
+        description="入睡时主动说晚安的概率，0-1；每晚以固定随机种子判定，重启不会重复发送",
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="晚安消息概率", en_US="Bedtime Greeting Chance"),
             i18n_description=i18n.i18n_text(
@@ -381,17 +391,19 @@ class SleepConfig(ConfigBase):
     WAKE_NOTICE_ALWAYS: bool = Field(
         default=False,
         title="无打扰也发晨间报告",
+        description="默认关闭：仅当该频道当日（入睡日零点起，含夜间被静默拦截的消息）有过用户消息时才发送晨间报告，完全沉寂的频道不打扰；开启后无视频道活跃度一律发送",
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="无打扰也发晨间报告", en_US="Morning Report Always"),
             i18n_description=i18n.i18n_text(
-                zh_CN="默认关闭：仅当夜里发生过真实叫醒尝试时才发送晨间睡眠报告（防打扰）；开启后即使没人叫醒也发送",
-                en_US="Off by default: the morning report is only sent when someone actually tried to wake the bot at night; enable to always send it",
+                zh_CN="默认关闭：仅当该频道当日（入睡日零点起，含夜间被静默拦截的消息）有过用户消息时才发送晨间报告，完全沉寂的频道不打扰；开启后无视频道活跃度一律发送",
+                en_US="Off by default: the morning report is only sent when the channel saw user messages that day (from local midnight of the sleep date, including messages silently blocked overnight); fully inactive channels are left alone. Enable to always send regardless of activity",
             ),
         ).model_dump(),
     )
     QUALITY_HISTORY_DAYS: int = Field(
         default=14,
         title="质量历史保留天数",
+        description="每个会话保留的每日睡眠质量记录条数，用于连续打卡与趋势，1-90",
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="质量历史保留天数", en_US="Quality History Days"),
             i18n_description=i18n.i18n_text(
@@ -403,6 +415,7 @@ class SleepConfig(ConfigBase):
     LLM_GREETINGS_ENABLED: bool = Field(
         default=True,
         title="人设动态问候",
+        description="开启后，晚安与早晨睡醒招呼将结合当前人设与群聊上下文由AI动态生成，不再使用固定话术",
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="人设动态问候", en_US="Dynamic Persona Greetings"),
             i18n_description=i18n.i18n_text(
@@ -663,12 +676,11 @@ def _get_user_id(message: ChatMessage) -> str:
 def _is_sleeping(chat_key: str) -> bool:
     """Quick check if a chat_key is in sleep state (for runtime wrappers).
 
-    Fail-open whenever the plugin is inactive, host-disabled, or the master
-    switch (config.ENABLED) is off: a disabled plugin must never swallow
-    agent tasks, and chats put to sleep before the master switch was turned
-    off must not stay stuck behind the dispatch-layer gate.
+    Fail-open whenever the plugin is inactive or host-disabled: a disabled
+    plugin must never swallow agent tasks, and chats put to sleep before the
+    plugin was disabled must not stay stuck behind the dispatch-layer gate.
     """
-    if not _is_plugin_active() or not config.ENABLED:
+    if not _is_plugin_active():
         return False
     if _store is None:
         return False
@@ -892,7 +904,7 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage, *_args: Any, **_k
     # *_args/**_kwargs: upstream 2.4+ may extend hook signatures; extra
     # parameters are accepted and ignored so a signature change can never
     # TypeError through the framework's un-guarded dispatch loop.
-    if not _is_plugin_active() or not config.ENABLED:
+    if not _is_plugin_active():
         return MsgSignal.CONTINUE
 
     chat_key = ctx.chat_key
@@ -992,7 +1004,7 @@ async def on_system_message(ctx: AgentCtx, message: str, *_args: Any, **_kwargs:
     # writing ``plugin._is_enabled = False`` without firing ``on_disabled``,
     # so this hook can still be dispatched while ``_store`` is being torn down
     # or already gone. Bail out before ``_get_store()`` can assert.
-    if not _is_plugin_active() or not config.ENABLED:
+    if not _is_plugin_active():
         return MsgSignal.CONTINUE
 
     chat_key = ctx.chat_key
@@ -1055,7 +1067,7 @@ async def resume_sleep_tool(*call_args: Any, **call_kwargs: Any) -> str:
     The host normally passes ctx positionally; pulling it from either args or
     kwargs keeps the tool resilient to sandbox call-shape changes.
     """
-    if not _is_plugin_active() or not config.ENABLED:
+    if not _is_plugin_active():
         raise RuntimeError("自动睡眠插件当前未启用，无法执行重新入睡操作")
     _ctx: AgentCtx = call_args[0] if call_args else call_kwargs.get("ctx")
     chat_key = _ctx.chat_key
@@ -1100,7 +1112,7 @@ async def resume_sleep_tool(*call_args: Any, **call_kwargs: Any) -> str:
 )
 async def get_sleep_report_tool(*call_args: Any, **call_kwargs: Any) -> str:
     """Report the chat's current sleep status and recent quality history."""
-    if not _is_plugin_active() or not config.ENABLED:
+    if not _is_plugin_active():
         raise RuntimeError("自动睡眠插件当前未启用，无法查询睡眠报告")
     _ctx: AgentCtx = call_args[0] if call_args else call_kwargs.get("ctx")
     chat_key = _ctx.chat_key
@@ -1146,7 +1158,7 @@ async def _maintenance_loop() -> None:
             interval = max(2, min(300, config.MAINTENANCE_INTERVAL_SECONDS))
             await asyncio.sleep(interval)
 
-            if not _is_plugin_active() or not config.ENABLED:
+            if not _is_plugin_active():
                 continue
 
             now_utc = datetime.now(ZoneInfo("UTC"))
