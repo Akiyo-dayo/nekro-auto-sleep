@@ -1,0 +1,80 @@
+{
+  "schema_version": 2,
+  "chat_key": "onebot_v11-group_123456789",
+  "status": "ASLEEP",
+  "last_seen_at": null,
+  "pending_offer": {
+    "user_id": "u_42",
+    "offered_at": "2026-08-17T15:30:00Z",
+    "expires_at": "2026-08-17T15:33:00Z"
+  },
+  "offers_sent_tonight": 2,
+  "last_offer_at": "2026-08-17T15:30:00Z",
+  "snooze_until": "2026-08-17T16:00:00Z",
+  "skip_sleep_date": null,
+  "bedtime_notice_date": "2026-08-17",
+  "idle_sleep_deadline": null,
+  "cycle": {
+    "cycle_id": "abcdef123456",
+    "sleep_date": "2026-08-17",
+    "timezone": "Asia/Shanghai",
+    "sleep_at": "2026-08-17T15:00:00Z",
+    "planned_wake_at": "2026-08-17T22:17:00Z",
+    "config_snapshot": {
+      "timezone": "Asia/Shanghai",
+      "sleep_time": "23:00",
+      "wake_time_start": "06:45",
+      "wake_time_end": "08:30",
+      "wake_random_step_minutes": 1,
+      "wake_confirm_window_seconds": 180,
+      "history_mode": "preserve",
+      "call_keywords": [
+        "醒醒",
+        "起床"
+      ],
+      "fallback_persona_name": "Bot",
+      "early_wake_idle_minutes": 10,
+      "quality_min": 20,
+      "quality_max": 120,
+      "quality_jitter_points": 2.0,
+      "near_wake_minutes": 60,
+      "sleep_target_hours": 8.0,
+      "urgent_keywords": [],
+      "answer_scope": "offeree",
+      "max_offers_per_night": 3,
+      "offer_cooldown_minutes": 20,
+      "snooze_minutes": 30,
+      "asleep_prompt": "【{persona}已经睡了 要叫醒{persona}吗？】",
+      "near_wake_prompt": "【{persona}还没起床 要叫醒{persona}吗？】",
+      "near_wake_ratio": 0.15
+    },
+    "quality_seed": "seed0001",
+    "sleep_segments": [
+      {
+        "open_at": "2026-08-17T15:00:00Z",
+        "close_at": null
+      }
+    ],
+    "wake_attempts": [
+      {
+        "user_id": "u_42",
+        "chat_key": "onebot_v11-group_123456789",
+        "attempted_at": "2026-08-17T15:30:00Z",
+        "is_confirmed": false,
+        "confirmed_at": null
+      }
+    ],
+    "timer_intervals": [],
+    "notification_status": "pending",
+    "settled_at": null,
+    "ended_while_early_awake": false,
+    "quality_breakdown": {
+      "raw": 71.5,
+      "score": 71.0
+    }
+  },
+  "woken_at": null,
+  "woken_by": null,
+  "woken_reason": null,
+  "wake_decision_pending": false
+}

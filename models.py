@@ -12,6 +12,9 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 
 SCHEMA_VERSION = 1
+# Highest schema this build can read: 2 is what the p0-batch1 line wrote, and
+# persistence migrates it on load. Anything above this is left untouched.
+READABLE_SCHEMA_VERSION = 2
 PLUGIN_KEY = "Akiyo_dayo.nekro_auto_sleep"
 DATA_KEY = "state.v1"
 
@@ -150,21 +153,42 @@ class PendingWakeOffer(BaseModel):
 
 
 class ChatSleepState(BaseModel):
-    """Top-level persisted state for one chat_key."""
+    """Top-level persisted state for one chat_key.
+
+    The fields below ``quality_history`` are optional with defaults, so a 1.2.5
+    row still validates unchanged and a row migrated from the p0-batch1 v2
+    format keeps the values it shares with this version.
+    """
 
     schema_version: int = SCHEMA_VERSION
     chat_key: str
     status: SleepStatus = SleepStatus.AWAKE
     last_seen_at: datetime | None = None
     pending_wake_offers: dict[str, PendingWakeOffer] = Field(default_factory=dict)
+    # Anti-spam counters (v1.3.0): how many wake offers went out tonight and
+    # when the last one did, so the next call cannot flood the channel.
+    offers_sent_tonight: int = 0
+    last_offer_at: datetime | None = None
+    # Local sleep_date the operator asked the bot to stay up through.
+    skip_sleep_date: str | None = None
     idle_sleep_deadline: datetime | None = None
     cycle: SleepCycle | None = None
     quality_history: dict[str, int] = Field(
         default_factory=dict,
         description="sleep_date (YYYY-MM-DD) -> settled quality percent, for streaks and reports",
     )
+    # Who got the bot up early, and when. Only used to decide whether a message
+    # during AWAKE_EARLY is aimed at the bot (see on_user_message).
+    woken_at: datetime | None = None
+    woken_by: str | None = None
 
-    @field_validator("last_seen_at", "idle_sleep_deadline", mode="before")
+    @field_validator(
+        "last_seen_at",
+        "idle_sleep_deadline",
+        "last_offer_at",
+        "woken_at",
+        mode="before",
+    )
     @classmethod
     def _parse_utc(cls, v: object) -> object:
         if isinstance(v, str) and v.endswith("Z"):
@@ -174,9 +198,9 @@ class ChatSleepState(BaseModel):
     @field_validator("schema_version")
     @classmethod
     def _check_version(cls, v: int) -> int:
-        if v > SCHEMA_VERSION:
+        if v > READABLE_SCHEMA_VERSION:
             raise ValueError(
-                f"Unknown schema version {v} > {SCHEMA_VERSION}; "
+                f"Unknown schema version {v} > {READABLE_SCHEMA_VERSION}; "
                 "refusing to load to avoid data corruption"
             )
         return v

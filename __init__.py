@@ -63,7 +63,7 @@ from .models import (
     SleepStatus,
     SourceType,
 )
-from .persistence import DATA_KEY, SleepStateStore
+from .persistence import DATA_KEY, SleepStateStore, StateProtectedError
 from .quality import (
     compute_quality,
     compute_streak_note,
@@ -679,10 +679,14 @@ def _is_sleeping(chat_key: str) -> bool:
     Fail-open whenever the plugin is inactive or host-disabled: a disabled
     plugin must never swallow agent tasks, and chats put to sleep before the
     plugin was disabled must not stay stuck behind the dispatch-layer gate.
+    A protected chat_key (unreadable persisted row) behaves like a channel with
+    sleep turned off.
     """
     if not _is_plugin_active():
         return False
     if _store is None:
+        return False
+    if _store.is_protected(chat_key):
         return False
     state = _store.get_cached(chat_key)
     if state is None:
@@ -984,7 +988,11 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage, *_args: Any, **_k
     _sleep_date: str = ""
     _last_seen_at: datetime | None = None
 
-    await store.with_state(chat_key, _process)
+    try:
+        await store.with_state(chat_key, _process)
+    except StateProtectedError:
+        # Unreadable row: keep it byte-for-byte, behave like sleep disabled.
+        return MsgSignal.CONTINUE
 
     if isinstance(_result_action, ActionSendFixed):
         try:
@@ -996,7 +1004,6 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage, *_args: Any, **_k
         await _maybe_send_bedtime(chat_key, _sleep_date, _last_seen_at)
 
     return _result_signal
-
 
 @plugin.mount_on_system_message()
 async def on_system_message(ctx: AgentCtx, message: str, *_args: Any, **_kwargs: Any) -> MsgSignal | None:
@@ -1075,6 +1082,9 @@ async def resume_sleep_tool(*call_args: Any, **call_kwargs: Any) -> str:
     now_utc = datetime.now(ZoneInfo("UTC"))
     persona_name = await _get_persona_name(_ctx)
 
+    if store.is_protected(chat_key):
+        return "无法重新入睡：本频道的睡眠数据无法读取，已按未启用睡眠处理。"
+
     result_text = ""
 
     async def _process(state: ChatSleepState) -> ChatSleepState:
@@ -1090,6 +1100,8 @@ async def resume_sleep_tool(*call_args: Any, **call_kwargs: Any) -> str:
 
     try:
         await store.with_state(chat_key, _process)
+    except StateProtectedError:
+        return "无法重新入睡：本频道的睡眠数据无法读取，已按未启用睡眠处理。"
     except ValueError as exc:
         logger.info("Cannot resume sleep for %s: %s", chat_key, exc)
         return f"无法重新入睡：{exc}"
@@ -1119,9 +1131,15 @@ async def get_sleep_report_tool(*call_args: Any, **call_kwargs: Any) -> str:
     store = _get_store()
     now_utc = datetime.now(ZoneInfo("UTC"))
 
+    if store.is_protected(chat_key):
+        return "本频道的睡眠数据无法读取，已原样保留；当前按未启用睡眠处理。"
+
     state = store.get_cached(chat_key)
     if state is None:
-        state = await store.ensure_loaded(chat_key)
+        try:
+            state = await store.ensure_loaded(chat_key)
+        except StateProtectedError:
+            return "本频道的睡眠数据无法读取，已原样保留；当前按未启用睡眠处理。"
 
     if state.status == SleepStatus.ASLEEP and state.cycle is not None:
         status_line = (
@@ -1184,6 +1202,10 @@ async def _maintain_chat(
     tz: ZoneInfo,
 ) -> None:
     """Run maintenance checks for a single chat_key."""
+    if store.is_protected(chat_key):
+        # Unreadable row: never build a fresh state on top of it.
+        return
+
     state = store.get_cached(chat_key)
     if state is None:
         return
@@ -1207,7 +1229,10 @@ async def _maintain_chat(
             async def _purge(s: ChatSleepState) -> ChatSleepState:
                 return clean_expired_offers(s, now_utc)
 
-            await store.with_state(chat_key, _purge)
+            try:
+                await store.with_state(chat_key, _purge)
+            except StateProtectedError:
+                return
 
         if state.cycle and now_utc >= state.cycle.planned_wake_at:
             if not has_active_timer_lease(state) and not lease_ledger.has_active_for_chat(chat_key):
@@ -1221,7 +1246,10 @@ async def _maintain_chat(
             if not has_active_timer_lease(state):
                 async def _idle_back(s: ChatSleepState) -> ChatSleepState:
                     return handle_idle_sleep_back(s, now_utc)
-                await store.with_state(chat_key, _idle_back)
+                try:
+                    await store.with_state(chat_key, _idle_back)
+                except StateProtectedError:
+                    return
 
 
 async def _check_sleep_transition(
@@ -1231,13 +1259,19 @@ async def _check_sleep_transition(
     tz: ZoneInfo,
 ) -> None:
     """Compensate AWAKE -> ASLEEP for the active scheduled sleep cycle."""
+    if store.is_protected(chat_key):
+        return
+
     before = store.get_cached(chat_key)
     was_awake = before is not None and before.status == SleepStatus.AWAKE
 
     async def _sleep(s: ChatSleepState) -> ChatSleepState:
         return _compensate_sleep_if_due(s, now_utc, tz)
 
-    await store.with_state(chat_key, _sleep)
+    try:
+        await store.with_state(chat_key, _sleep)
+    except StateProtectedError:
+        return
 
     after = store.get_cached(chat_key)
     if (
@@ -1257,6 +1291,9 @@ async def _settle_wake(
     now_utc: datetime,
 ) -> None:
     """Settle natural wake-up, record quality history and send the morning report."""
+    if store.is_protected(chat_key):
+        return
+
     should_notify = False
     settled_quality: int = 0
     settled_duration: float = 0.0
@@ -1299,7 +1336,10 @@ async def _settle_wake(
         quality_history = history
         return new_state.model_copy(update={"quality_history": history})
 
-    await store.with_state(chat_key, _wake)
+    try:
+        await store.with_state(chat_key, _wake)
+    except StateProtectedError:
+        return
 
     if not should_notify:
         return

@@ -13,6 +13,7 @@ import importlib.util
 import pathlib
 import sys
 from datetime import datetime, timedelta
+from types import ModuleType
 from unittest.mock import AsyncMock
 
 import pytest
@@ -20,6 +21,28 @@ from zoneinfo import ZoneInfo
 
 _PKG_ROOT = pathlib.Path(__file__).resolve().parent.parent
 _SUBMODULES = ("models", "schedule", "quality", "engine", "persistence", "runtime")
+
+
+class _BlockRealHost:
+    """Refuse to import a real NekroAgent checkout from inside the test run.
+
+    Importing the real host creates its ``data/`` tree in the working copy and
+    loads production config, neither of which a test may do. Every host-facing
+    test installs its own stub tree in ``sys.modules`` first, so this finder
+    only ever fires on an accidental import.
+    """
+
+    def find_spec(self, fullname, path=None, target=None):  # noqa: ANN001
+        if fullname == "nekro_agent" or fullname.startswith("nekro_agent."):
+            raise ImportError(
+                f"{fullname} must not be imported for real during tests; "
+                "use tests/hoststub.py instead"
+            )
+        return None
+
+
+if not any(isinstance(f, _BlockRealHost) for f in sys.meta_path):
+    sys.meta_path.insert(0, _BlockRealHost())
 
 
 def _register_alias_package() -> None:
@@ -52,11 +75,66 @@ from nekro_auto_sleep.persistence import SleepStateStore, StoreBackend
 from nekro_auto_sleep.schedule import create_config_snapshot
 
 
+def _load_hoststub() -> ModuleType:
+    """Import ``tests/hoststub.py`` without depending on how pytest set sys.path."""
+    existing = sys.modules.get("hoststub")
+    if isinstance(existing, ModuleType) and hasattr(existing, "install"):
+        return existing
+    spec = importlib.util.spec_from_file_location(
+        "hoststub", pathlib.Path(__file__).resolve().parent / "hoststub.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["hoststub"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+hoststub = _load_hoststub()
+
+
+def load_plugin_module():
+    """Exec the real ``__init__.py`` against the stub host.
+
+    The stub tree is installed for the duration of the call only: the module
+    keeps its imported objects, and every other suite gets a pristine
+    ``sys.modules``. Re-executing per test keeps each case on fresh globals.
+    """
+    hoststub.set_channel_factory(None)
+    hoststub.set_ctx_factory(None)
+    restore = hoststub.install()
+    try:
+        nas_mod = sys.modules["nekro_auto_sleep"]
+        spec = importlib.util.spec_from_file_location(
+            "nekro_auto_sleep",
+            _PKG_ROOT / "__init__.py",
+            submodule_search_locations=[str(_PKG_ROOT)],
+        )
+        spec.loader.exec_module(nas_mod)
+    finally:
+        restore()
+    return nas_mod
+
+
+@pytest.fixture
+def plugin_mod():
+    """The plugin wiring module loaded against the stub host."""
+    return load_plugin_module()
+
+
+@pytest.fixture
+def wired_store(plugin_mod):
+    """Point the freshly loaded plugin at an in-memory store."""
+    backend = FakeStoreBackend()
+    plugin_mod._store = SleepStateStore(backend)
+    return plugin_mod._store
+
+
 class FakeStoreBackend:
     """In-memory PluginStore backend for testing."""
 
     def __init__(self) -> None:
         self._data: dict[str, str] = {}
+        self.set_calls = 0
 
     def _key(self, chat_key: str, user_key: str, store_key: str) -> str:
         return f"{chat_key}|{user_key}|{store_key}"
@@ -72,6 +150,7 @@ class FakeStoreBackend:
         k = self._key(chat_key, user_key, store_key)
         existed = k in self._data
         self._data[k] = value
+        self.set_calls += 1
         return 1 if existed else 0
 
     async def delete(
