@@ -182,6 +182,10 @@ def transition_to_sleep(
             "status": SleepStatus.ASLEEP,
             "cycle": cycle,
             "pending_wake_offers": {},
+            # A new night means a new allowance: the cap and the cooldown are
+            # per sleep cycle, not per calendar day or per process lifetime.
+            "offers_sent_tonight": 0,
+            "last_offer_at": None,
             "idle_sleep_deadline": None,
         }
     )
@@ -294,6 +298,26 @@ def clean_expired_offers(
     return state
 
 
+def offer_is_suppressed(
+    state: ChatSleepState,
+    now_utc: datetime,
+    snapshot: ConfigSnapshot,
+) -> str | None:
+    """Why the bot must not ask to be woken again right now, if it must not.
+
+    A chat that keeps calling at 3am would otherwise get one question per
+    message. Two limits, both per sleep cycle: a nightly cap on how many
+    questions were asked, and a cooldown between two of them.
+    """
+    if state.offers_sent_tonight >= max(0, snapshot.max_offers_per_night):
+        return "nightly limit"
+    if state.last_offer_at is not None:
+        cooldown = timedelta(minutes=max(0, snapshot.offer_cooldown_minutes))
+        if now_utc - state.last_offer_at < cooldown:
+            return "cooldown"
+    return None
+
+
 def handle_message_while_asleep(
     state: ChatSleepState,
     now_utc: datetime,
@@ -365,6 +389,13 @@ def handle_message_while_asleep(
     if not valid_call:
         return state, ActionStayAsleep()
 
+    suppressed = offer_is_suppressed(state, now_utc, snap)
+    if suppressed is not None:
+        # Called again, but tonight's allowance is spent or the last question was
+        # just sent. Stay silent rather than ask a fourth time at 3am.
+        logger.debug("Not offering to wake %s (%s)", state.chat_key, suppressed)
+        return state, ActionStayAsleep()
+
     # First call or expired previous offer -> send fixed prompt
     pending[user_id] = PendingWakeOffer(
         user_id=user_id,
@@ -381,7 +412,13 @@ def handle_message_while_asleep(
         )
     )
     state.cycle = state.cycle.model_copy(update={"wake_attempts": wake_attempts})
-    state = state.model_copy(update={"pending_wake_offers": pending})
+    state = state.model_copy(
+        update={
+            "pending_wake_offers": pending,
+            "offers_sent_tonight": state.offers_sent_tonight + 1,
+            "last_offer_at": now_utc,
+        }
+    )
 
     near = is_near_wake(
         now_utc,

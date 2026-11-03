@@ -169,7 +169,10 @@ class TestWakeProtocol:
             state, now1, "user1", "Bot", valid_call=True
         )
 
-        now2 = now1 + timedelta(seconds=200)  # Past 180s window
+        # Past the 180 s confirm window *and* past the 20 min offer cooldown
+        # (v1.3.0): the intent of this case is "an expired offer is re-asked",
+        # not "re-asked 200 s later", which the cooldown now forbids on purpose.
+        now2 = now1 + timedelta(minutes=25)
         state, action = handle_message_while_asleep(
             state, now2, "user1", "Bot", valid_call=True
         )

@@ -345,6 +345,34 @@ class SleepConfig(ConfigBase):
             ),
         ).model_dump(),
     )
+    MAX_OFFERS_PER_NIGHT: int = Field(
+        default=3,
+        title="每晚叫醒提问上限（次）",
+        description="同一晚最多向用户发出几次「要叫醒吗」的提问，超过后当晚不再提问，0-20（0 表示不提问）",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(
+                zh_CN="每晚叫醒提问上限（次）", en_US="Max Wake Offers Per Night"
+            ),
+            i18n_description=i18n.i18n_text(
+                zh_CN="同一晚最多向用户发出几次「要叫醒吗」的提问，超过后当晚不再提问，0-20（0 表示不提问）",
+                en_US="How many wake-up questions may be asked in one night; afterwards the bot stays quiet, 0-20 (0 disables offers)",
+            ),
+        ).model_dump(),
+    )
+    OFFER_COOLDOWN_MINUTES: int = Field(
+        default=20,
+        title="叫醒提问冷却（分钟）",
+        description="两次「要叫醒吗」提问之间的最短间隔，避免同一晚被连续追问，0-720",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(
+                zh_CN="叫醒提问冷却（分钟）", en_US="Wake Offer Cooldown (min)"
+            ),
+            i18n_description=i18n.i18n_text(
+                zh_CN="两次「要叫醒吗」提问之间的最短间隔，避免同一晚被连续追问，0-720",
+                en_US="Minimum gap between two wake-up questions, so one night cannot be flooded, 0-720",
+            ),
+        ).model_dump(),
+    )
     WAKE_NOTICE_GRACE_MINUTES: int = Field(
         default=120,
         title="离线补发宽限期（分钟）",
@@ -957,6 +985,8 @@ def _make_config_snapshot(cfg: Any = None) -> Any:
         quality_max=cfg.QUALITY_MAX,
         quality_jitter_points=cfg.QUALITY_JITTER_POINTS,
         confirm_keywords=getattr(cfg, "WAKE_CONFIRM_KEYWORDS", "要,叫醒,醒来,起床,是,是的,确认"),
+        max_offers_per_night=cfg.MAX_OFFERS_PER_NIGHT,
+        offer_cooldown_minutes=cfg.OFFER_COOLDOWN_MINUTES,
     )
 
 

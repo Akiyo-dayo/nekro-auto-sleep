@@ -191,6 +191,8 @@ def create_config_snapshot(
     quality_max: int,
     quality_jitter_points: float,
     confirm_keywords: str | list[str] = ("要", "叫醒", "醒来", "起床", "是", "是的", "确认"),
+    max_offers_per_night: int = 3,
+    offer_cooldown_minutes: int = 20,
 ) -> ConfigSnapshot:
     """Create a ConfigSnapshot from current config values."""
     if isinstance(call_keywords, str):
@@ -221,4 +223,6 @@ def create_config_snapshot(
         quality_min=quality_min,
         quality_max=quality_max,
         quality_jitter_points=quality_jitter_points,
+        max_offers_per_night=max_offers_per_night,
+        offer_cooldown_minutes=offer_cooldown_minutes,
     )

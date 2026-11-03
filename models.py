@@ -110,6 +110,10 @@ class ConfigSnapshot(BaseModel):
     quality_min: int
     quality_max: int
     quality_jitter_points: float
+    # Anti-spam limits, snapshotted with the rest so a config change mid-night
+    # cannot retroactively allow (or forbid) offers already sent tonight.
+    max_offers_per_night: int = 3
+    offer_cooldown_minutes: int = 20
 
 
 class SleepCycle(BaseModel):
