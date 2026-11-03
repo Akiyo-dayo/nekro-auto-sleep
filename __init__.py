@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -860,6 +861,84 @@ def _is_mention_bot(message: ChatMessage, persona_name: str) -> bool:
     return bool(_is_reply_to_bot(message))
 
 
+# Trailing particles and punctuation that carry no meaning for a yes/no answer.
+# Stripping them is what turns 好的 / 要啊 / 嗯~ into the bare keyword.
+_TRAILING_NOISE = "的啊呀吧了哦喔噢呢嘛呗嘞哒~～!！?？。.,，、;；:：… "
+_PUNCTUATION = "!！?？。.,，、;；:：…()（）\"“”'‘’"
+
+
+def _fold(text: str) -> str:
+    """Case/width folding and punctuation removal, whitespace collapsed.
+
+    Whitespace is collapsed rather than deleted: ASCII keywords are matched on
+    word boundaries, and squashing "wake up" into "wakeup" would break that.
+    """
+    if not text:
+        return ""
+    folded = []
+    for ch in text.strip():
+        code = ord(ch)
+        if code == 0x3000:  # ideographic space
+            ch = " "
+        elif 0xFF01 <= code <= 0xFF5E:  # full-width ASCII
+            ch = chr(code - 0xFEE0)
+        folded.append(ch)
+    cleaned = "".join(c for c in folded if c not in _PUNCTUATION).lower()
+    return " ".join(cleaned.split())
+
+
+def _normalize(text: str) -> str:
+    """Fold a reply and trim the trailing particles a bare answer picks up."""
+    return _fold(text).rstrip(_TRAILING_NOISE)
+
+
+def _is_ascii(word: str) -> bool:
+    return all(ord(c) < 128 for c in word)
+
+
+def _matches_whole_answer(candidate: str, keyword: str) -> bool:
+    """Whether the whole reply *is* this keyword (allowing 嗯嗯 / 好好)."""
+    if not candidate or not keyword:
+        return False
+    if candidate == keyword:
+        return True
+    return len(keyword) == 1 and set(candidate) == {keyword}
+
+
+def _matches_inside(folded: str, keyword: str) -> bool:
+    """Whether the keyword appears inside a longer reply, safely.
+
+    Single characters are deliberately excluded here. 要 / 好 / 对 are far too
+    common to read as consent mid-sentence — with a plain substring match
+    「我要睡了」 and 「对不起吵到你了」 both came out as "yes". They still count
+    when they *are* the whole answer, which is how people actually reply to a
+    yes/no question.
+    """
+    if len(keyword) < 2:
+        return False
+    if _is_ascii(keyword):
+        return re.search(rf"\b{re.escape(keyword)}\b", folded) is not None
+    return keyword in folded
+
+
+def _matches(folded: str, keywords: list[str]) -> bool:
+    """Match a folded reply against a keyword list.
+
+    Whole-answer matching is tried against both the folded reply and its
+    particle-trimmed form, because the trimming that turns 「好的」 into 「好」
+    would otherwise turn 「算了」 into 「算」 and lose the keyword entirely.
+    Keywords themselves are only folded, never trimmed.
+    """
+    trimmed = folded.rstrip(_TRAILING_NOISE)
+    folded_keywords = [_fold(kw) for kw in keywords]
+    folded_keywords = [kw for kw in folded_keywords if kw]
+
+    for kw in folded_keywords:
+        if _matches_whole_answer(folded, kw) or _matches_whole_answer(trimmed, kw):
+            return True
+    return any(_matches_inside(folded, kw) for kw in folded_keywords)
+
+
 def _is_valid_call(message: ChatMessage, persona_name: str, cfg: Any = None) -> bool:
     """Check if a message constitutes a valid wake-up call (spec §6.1)."""
     if _is_mention_bot(message, persona_name):
@@ -882,7 +961,15 @@ def _check_wake_intent(
 
     Returns (is_confirm, is_cancel).
     - is_cancel: True if user expresses negative intent ('不要', '不用', '算了', etc.)
-    - is_confirm: True if user mentions bot OR triggers confirm keywords (e.g. '要') without negative prefix.
+    - is_confirm: True if user mentions bot OR the whole answer is a confirm
+      keyword (e.g. '要', '好的').
+
+    The answer is read as an *answer*, not scanned for substrings: a single
+    character like 要 counts only when it is the whole reply (or repeated, 要要),
+    so 「我要出门了」 stays chatter while 「要」 wakes the bot. Longer keywords
+    (叫醒 / 起床 / wake up) still match inside a sentence, on word boundaries for
+    ASCII. Call keywords are untouched — they are still plain substring matches,
+    because calling the bot mid-sentence is exactly what they are for.
     """
     text = message.content_text if hasattr(message, "content_text") else str(message)
     text_clean = text.strip() if text else ""
@@ -894,25 +981,16 @@ def _check_wake_intent(
             return False, True
 
     # 1. 提及 bot（私聊、@Bot、包含名字、回复Bot）
-    is_mention = _is_mention_bot(message, persona_name)
+    if _is_mention_bot(message, persona_name):
+        return True, False
 
-    # 2. 触发配置里的确认词（例如“要”、“叫醒”等）
+    # 2. 整句就是确认词（例如“要”、“好的”、“嗯嗯”）
     if confirm_keywords is None:
         confirm_keywords = _parse_confirm_keywords(cfg)
 
-    has_confirm_kw = False
-    for kw in confirm_keywords:
-        if not kw:
-            continue
-        if kw in text_clean:
-            # 针对单字词（如“要”、“是”），若在长句中且未提及bot，避免日常水群误触（如“我要出门了”）
-            if len(kw) == 1 and len(text_clean) > 10 and not is_mention:
-                continue
-            has_confirm_kw = True
-            break
-
-    is_confirm = is_mention or has_confirm_kw
-    return is_confirm, False
+    if _matches(_fold(text_clean), confirm_keywords):
+        return True, False
+    return False, False
 
 
 def _is_reply_to_bot(message: ChatMessage) -> bool:
