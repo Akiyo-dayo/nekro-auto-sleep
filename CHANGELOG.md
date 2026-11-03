@@ -1,5 +1,91 @@
 # 更新日志 (CHANGELOG)
 
+## [v1.3.0] - 2026-11-03
+
+### 新功能：多实例作息、`/sleep` 运维命令、插件日志接入宿主
+
+本版把 `fix/p0-batch1` 线上一批经过生产验证的修复搬回 1.2.5 主线，**不改变**任何现有
+配置项语义与数据格式：`state.v1` 仍是 `schema_version: 1`，只是额外能读 p0 线写下的
+`schema_version: 2`（读入时迁移，写回时降回 1）。
+
+- **数据安全：读不懂的数据一律不覆盖**（新增 `StateProtectedError`）：
+  - 以前遇到损坏 JSON、未知更高 schema、字段校验失败，`load` 返回 `None`，随后
+    `load_or_create` 造一个全新的 `AWAKE` 状态并在下一次 `save` 时**把原行冲掉**。
+    现在这几种情况都会把该 chat_key 标记为「受保护」：`load` 返回 `None`、
+    `with_state` 不调用回调也不落库、`save` 直接抛错，原始字节原样保留。
+  - 错误日志每个 chat_key 只打一次，避免维护循环每分钟刷屏。
+  - 新增 `migrate_v2_payload`：p0 线的单数 `pending_offer` 迁移到本版的
+    `pending_wake_offers`（按 user_id 归档），两边同名共享的字段
+    （`offers_sent_tonight`、`last_offer_at`、`woken_at`、`woken_by`、
+    `skip_sleep_date`）直接沿用，p0 独有的字段被忽略。
+- **多实例：同一群里两个 Bot 可以各睡各的**：
+  - 新增 `resolve_scoped_config` 探测，按频道所属 `instance_key` 解析实例级插件配置，
+    而不是永远读全局 `config.yaml`；后台维护任务没有入站上下文，所以必须显式传入
+    `instance_key` 才拿得到实例配置。
+  - 每个频道解析一次并缓存 300 秒（`ChatSettings`），配置写入后显式失效；
+    解析失败一律退回全局配置，绝不因为读配置失败而中断一轮维护。
+  - 周期快照、晚安播报、维护判断、空闲倒计时全部改用该频道的配置。
+- **自己 Bot 的消息不算呼叫**：两个实例同群时，一方唤醒提示里的「要叫醒 X 吗」
+  含有另一方的名字（本身就是唤醒关键词），过去会让两个 Bot 互相唤醒到协议放弃。
+  现在通过 `DBAdapterInstance.provider_account_id` 认出本部署自己的账号：
+  只记录「频道有动静」，既不判呼叫、不答唤醒提示，也不刷新空闲倒计时。
+  账号列表同样缓存 300 秒，查询失败等价于「不知道有自己的 Bot」，即 1.2.5 行为。
+- **插件日志接入宿主**（`_HostLogBridge`）：领域层走标准库 `logging`，宿主走 loguru，
+  过去插件所有 INFO 都无处可去。现在把本包 logger 桥到宿主 logger，启动时装、停用时卸，
+  重复调用无副作用；`%s` 占位符在桥内先格式化（loguru 用 `{}`，直接透传会打成原文）。
+- **唤醒提示防刷**：新增 `MAX_OFFERS_PER_NIGHT`（默认 3）与
+  `OFFER_COOLDOWN_MINUTES`（默认 20），并随每晚快照冻结——配置在半夜改动不会追溯
+  改变已经发过的次数。超出限制时直接保持睡眠、不再发提示，也不会因为「没被理会的
+  呼叫」继续扣睡眠质量。计数与冷却在每个睡眠周期开始时归零。
+- **确认关键词按整句判断**：`WAKE_CONFIRM_KEYWORDS` 以前是子串匹配，「我要睡了」
+  会因为含「要」被判成「是，叫醒我」。现在先做全角/大小写/标点归一，再按**整句**
+  匹配（允许去掉句尾语气词）；单字关键词（要/好/对）只在整句就是它时才算确认。
+  关键词仍然可以写多字词，行为向后兼容。
+- **提前醒来后只有「对着它说」才续命**：`AWAKE_EARLY` 状态下过去任何一条消息都会
+  刷新空闲倒计时，群里随便聊两句就能让它一直不睡。现在只有消息指向本 Bot（@ 或呼叫
+  关键词），或来自当初把它叫醒的那个人（`woken_by`）时才刷新。
+- **沙盒方法改名 `resume_sleep`**：宿主渲染沙盒方法时用的是 `method.func.__name__`，
+  所以 `resume_sleep_tool` 这个名字会原样出现在提示词里，模型照着调用的也是它。
+  现在函数名即 `resume_sleep` / `get_sleep_report`，旧名保留为模块级别名。
+  同时挂 `collect_available_methods`：`resume_sleep` 只在 `AWAKE_EARLY` 且还没到
+  计划起床时间时才交给模型，其余时候它根本不该出现在工具列表里。
+- **「已睡下」跟在本轮回复之后**：`resume_sleep` 在 agent 轮次中途执行，过去直接
+  `send_text` 会让【已睡下】跑到模型那句「那我先睡啦」**前面**。现在改为后台任务，
+  等 `message_service.running_tasks[chat_key]` 里本轮任务结束后再发（最长等 120 秒，
+  拿不到任务句柄时退化为 0.5 秒让出一次事件循环）；插件停用时统一取消。
+- **`/sleep` 运维命令**（全部 `SUPER_USER`）：
+  - `/sleep status`：当前作息（含每个字段的来源：全局/实例/人设/本频道）、当前状态、
+    今夜已提示次数、本夜呼叫统计、最近一夜质量。
+  - `/sleep now`：立刻入睡，周期从当下开始，计划起床时间仍按原作息随机。
+  - `/sleep wake`：立刻起床并结算这一夜。
+  - `/sleep skip`：今夜不入睡（`skip_sleep_date`），明晚自动恢复。
+  - `/sleep set <tz|bed|wake-start|wake-end> <值> [scope=channel|preset]` 与
+    `/sleep unset [scope]`：按频道或按人设覆盖作息。
+  - 另注册一个顶层 `sleep` 命令做分发：宿主只在第一个空格处切分命令行，所以
+    `/sleep status` 到手的命令名是 `sleep`，没有分发器就只会得到沉默；
+    `/sleep.status` 的写法同样可用。
+  - 作息覆盖按字段分层：**本频道 > 人设 > 实例配置 > 全局**，存在
+    `schedule_override.v1`（按 chat_key）和 `preset_schedule.v1.<preset_id>` 两个键下，
+    与每夜状态分开保存——覆盖的生命周期比一夜长，不该因为某夜状态坏掉而丢失。
+- **新增 `tests/test_host_contract.py`**：手写桩全绿不代表桩和真宿主一致，所以用
+  `ast` 解析真实 NekroAgent 源码，校验本版依赖的每一项宿主事实（信号取值、
+  `BLOCK_ALL` 在落库前返回、`running_tasks` 按频道记录、`db_chat_channel` 是同步
+  property、沙盒方法按函数名渲染、休眠插件不披露方法、`resolve_scoped_config` 收
+  显式 `instance_key`、`provider_account_id`、命令行切分位置等）。
+  未设置 `NEKRO_AGENT_SRC` 时整个模块跳过。
+
+### 升级说明
+
+- **无需手动迁移数据**。`state.v1` 保持 `schema_version: 1`；从 p0 线回退或前移都可以，
+  两边共有的字段继续有效。
+- **新增两个配置项**（`MAX_OFFERS_PER_NIGHT`、`OFFER_COOLDOWN_MINUTES`），
+  `config.yaml` 里没有时按默认值 3 / 20 生效，不需要改文件。
+- **`resume_sleep_tool` / `get_sleep_report_tool` 仍是可导入的别名**，但提示词里出现的
+  名字变成了 `resume_sleep` / `get_sleep_report`；如果自建提示词硬编码了旧名，请同步。
+- **`/sleep` 命令需要超级用户**；普通用户看不到也不可执行。
+- 行为变化两处，均为修复：唤醒提示现在每夜最多 3 次、间隔至少 20 分钟；
+  确认关键词按整句判断，「我要睡了」不再被当成同意被叫醒。
+
 ## [v1.2.5] - 2026-09-16
 
 ### 变更：晨报闸门改为「当日频道活跃」、移除内部总开关、补齐 WebUI 配置说明

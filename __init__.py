@@ -252,9 +252,9 @@ plugin = NekroPlugin(
     name="自动睡眠",
     module_name="nekro_auto_sleep",
     description="为每个会话提供独立的拟人化睡眠周期：叫醒协议、睡眠质量评分、梦境播报与连续打卡",
-    version="1.2.5",
+    version="1.3.0",
     author="Akiyo_dayo",
-    url="https://github.com/Akiyo-dayo/NekroAgent_ByAkiyo",
+    url="https://github.com/Akiyo-dayo/nekro-auto-sleep",
     # Never dormant, on purpose. With ``allow_sleep=True`` the host puts a
     # plugin to sleep after a few rounds (``services/plugin/prompt_activation.py``
     # ``is_sleep_effective`` / ``is_sleeping``), and a sleeping plugin discloses
