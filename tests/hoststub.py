@@ -31,7 +31,7 @@ class MsgSignal(enum.Enum):
 
 
 class ConfigBase(BaseModel):
-    pass
+    model_config = {"extra": "ignore"}
 
 
 class ExtraField(BaseModel):
@@ -87,6 +87,14 @@ def instance_key_of(chat_key: str) -> str:
     return parts[1] if len(parts) >= 3 else ""
 
 
+class _ChatChannelQuery:
+    def __init__(self, chat_key: str) -> None:
+        self._chat_key = chat_key
+
+    async def first(self) -> Optional["FakeChatChannel"]:
+        return _channel_factory(self._chat_key)
+
+
 class FakeChatChannel:
     def __init__(
         self,
@@ -106,7 +114,15 @@ class FakeChatChannel:
         return self._preset
 
     @classmethod
+    def filter(cls, chat_key: str = "", **kwargs: Any) -> _ChatChannelQuery:
+        return _ChatChannelQuery(chat_key)
+
+    @classmethod
     async def get_channel(cls, chat_key: str = "") -> "FakeChatChannel":
+        return _channel_factory(chat_key)
+
+    @classmethod
+    async def get_or_none(cls, chat_key: str = "") -> "FakeChatChannel":
         return _channel_factory(chat_key)
 
 

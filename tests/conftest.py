@@ -98,6 +98,10 @@ def load_plugin_module():
     The stub tree is installed for the duration of the call only: the module
     keeps its imported objects, and every other suite gets a pristine
     ``sys.modules``. Re-executing per test keeps each case on fresh globals.
+
+    Tests that exercise lazy host imports (the instance-config path, the own-bot
+    account lookup) must use the ``plugin_mod`` fixture instead, which keeps the
+    stub installed for the whole test.
     """
     hoststub.set_channel_factory(None)
     hoststub.set_ctx_factory(None)
@@ -116,9 +120,34 @@ def load_plugin_module():
 
 
 @pytest.fixture
-def plugin_mod():
-    """The plugin wiring module loaded against the stub host."""
-    return load_plugin_module()
+def host_stub():
+    """Install the stub host for the whole test and restore it afterwards."""
+    hoststub.set_channel_factory(None)
+    hoststub.set_ctx_factory(None)
+    hoststub.clear_instance_config_overrides()
+    hoststub.set_own_bot_accounts([])
+    restore = hoststub.install()
+    try:
+        yield hoststub
+    finally:
+        hoststub.set_channel_factory(None)
+        hoststub.set_ctx_factory(None)
+        hoststub.clear_instance_config_overrides()
+        hoststub.set_own_bot_accounts([])
+        restore()
+
+
+@pytest.fixture
+def plugin_mod(host_stub):
+    """The plugin wiring module loaded against a live stub host."""
+    nas_mod = sys.modules["nekro_auto_sleep"]
+    spec = importlib.util.spec_from_file_location(
+        "nekro_auto_sleep",
+        _PKG_ROOT / "__init__.py",
+        submodule_search_locations=[str(_PKG_ROOT)],
+    )
+    spec.loader.exec_module(nas_mod)
+    return nas_mod
 
 
 @pytest.fixture

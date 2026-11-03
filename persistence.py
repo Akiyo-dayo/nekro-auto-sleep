@@ -291,7 +291,11 @@ class SleepStateStore:
         the state materialized (e.g. the sleep-report sandbox tool).
         """
         async with self._get_lock(chat_key):
-            return await self.load_or_create(chat_key)
+            state = await self.load(chat_key)
+            if state is None:
+                state = ChatSleepState(chat_key=chat_key)
+            self._cache[chat_key] = state
+            return state
 
     async def with_state(
         self,
@@ -310,6 +314,7 @@ class SleepStateStore:
             new_state = await fn(state)
             if chat_key in self._protected:
                 return new_state
+            self._cache[chat_key] = new_state
             if new_state != old_state:
                 await self.save(new_state)
             return new_state

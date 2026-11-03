@@ -12,6 +12,7 @@ import asyncio
 import inspect
 import logging
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -443,6 +444,113 @@ _is_runtime_active: bool = False
 _PERSONA_CACHE_TTL_SECONDS = 60.0
 _persona_cache: dict[str, tuple[float, str]] = {}
 
+# Per-channel resolved settings. The maintenance loop asks per channel per tick
+# and resolving costs a channel lookup, so a 5 minute TTL plus explicit
+# invalidation on write is plenty.
+_SETTINGS_CACHE_TTL_SECONDS = 300.0
+_settings_cache: dict[str, tuple[float, "ChatSettings"]] = {}
+
+
+@dataclass(frozen=True)
+class ChatSettings:
+    """Everything that varies per channel, resolved once.
+
+    ``config`` is the plugin config as it applies to *this channel's instance*.
+    Two accounts can sit in the same group; they already keep separate nights
+    because their chat_keys differ, but their settings would otherwise come from
+    the global file, because background tasks carry no instance context for the
+    host's scoped config proxy to pick up. Resolving it explicitly here is what
+    makes two bots in one group able to keep genuinely different hours.
+    """
+
+    instance_key: str
+    config: Any
+
+
+async def _channel_for(chat_key: str):
+    """The channel row for this chat_key, or None when it cannot be looked up."""
+    try:
+        from nekro_agent.models.db_chat_channel import DBChatChannel
+
+        for attr in ("get_channel", "get_or_none"):
+            lookup = getattr(DBChatChannel, attr, None)
+            if callable(lookup):
+                return await lookup(chat_key=chat_key)
+    except Exception as exc:  # noqa: BLE001 - host shapes vary by fork
+        logger.debug("Cannot load channel %s: %s", chat_key, exc)
+    return None
+
+
+def _instance_config(instance_key: str):
+    """The plugin config as it applies to one adapter instance.
+
+    Fork-only: upstream has no per-instance config layer, and the probe below
+    simply falls through to the global config there. Resolved by explicit
+    ``instance_key`` rather than through the host contextvar, because the
+    maintenance loop is a background task and carries no inbound context.
+
+    Verified against the host: ``resolve_scoped_config(plugin_key, config_cls,
+    global_config, instance_key)`` in ``nekro_agent/services/plugin/scope.py``.
+    """
+    if not instance_key:
+        return config
+    try:
+        from nekro_agent.services.plugin.scope import resolve_scoped_config
+    except ImportError:
+        return config
+    try:
+        global_config = plugin.get_global_config(SleepConfig)
+        return resolve_scoped_config(
+            plugin.key, SleepConfig, global_config, instance_key
+        )
+    except Exception as exc:  # noqa: BLE001 - never let config resolution break a tick
+        logger.warning("Cannot resolve config for instance %r: %s", instance_key, exc)
+        return config
+
+
+def _instance_schedule_fields(instance_key: str) -> set[str]:
+    """Which schedule fields this instance actually overrides (for provenance)."""
+    if not instance_key:
+        return set()
+    try:
+        from nekro_agent.services.plugin.scope import load_instance_config_overrides
+
+        overrides = load_instance_config_overrides(plugin.key, instance_key)
+    except Exception:
+        return set()
+    mapping = {
+        "TIMEZONE": "timezone",
+        "SLEEP_TIME": "sleep_time",
+        "WAKE_TIME_START": "wake_time_start",
+        "WAKE_TIME_END": "wake_time_end",
+    }
+    return {field for key, field in mapping.items() if key in overrides}
+
+
+def invalidate_settings_cache(chat_key: str | None = None) -> None:
+    if chat_key is None:
+        _settings_cache.clear()
+    else:
+        _settings_cache.pop(chat_key, None)
+
+
+async def _settings_for(chat_key: str) -> ChatSettings:
+    """Resolve this channel's effective plugin config (300 s cache)."""
+    cached = _settings_cache.get(chat_key)
+    if cached is not None and (time.monotonic() - cached[0]) < _SETTINGS_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    channel = await _channel_for(chat_key)
+    instance_key = str(getattr(channel, "instance_key", "") or "")
+    settings = ChatSettings(instance_key=instance_key, config=_instance_config(instance_key))
+    _settings_cache[chat_key] = (time.monotonic(), settings)
+    return settings
+
+
+def _cfg(settings: ChatSettings) -> Any:
+    """Read one config field for a channel, without repeating ``.config``."""
+    return settings.config
+
 
 def _plugin_host_enabled() -> bool:
     """Best-effort probe of the host-side enable state of this plugin.
@@ -560,17 +668,21 @@ async def _get_persona_name(ctx: AgentCtx) -> str:
     except Exception:
         pass
     # Cache the fallback too: a failing lookup must not hit the DB per message.
-    _persona_cache[chat_key] = (now, config.FALLBACK_PERSONA_NAME)
-    return config.FALLBACK_PERSONA_NAME
+    try:
+        fallback = (await _settings_for(chat_key)).config.FALLBACK_PERSONA_NAME
+    except Exception:  # noqa: BLE001 - a name lookup must never break a message
+        fallback = config.FALLBACK_PERSONA_NAME
+    _persona_cache[chat_key] = (now, fallback)
+    return fallback
 
 
-def _parse_keywords() -> list[str]:
-    raw = config.CALL_KEYWORDS
+def _parse_keywords(cfg: Any = None) -> list[str]:
+    raw = (cfg or config).CALL_KEYWORDS
     return [k.strip() for k in raw.replace("\n", ",").split(",") if k.strip()]
 
 
-def _parse_confirm_keywords() -> list[str]:
-    raw = getattr(config, "WAKE_CONFIRM_KEYWORDS", "要,叫醒,醒来,起床,是,是的,确认")
+def _parse_confirm_keywords(cfg: Any = None) -> list[str]:
+    raw = getattr(cfg or config, "WAKE_CONFIRM_KEYWORDS", "要,叫醒,醒来,起床,是,是的,确认")
     return [k.strip() for k in raw.replace("\n", ",").split(",") if k.strip()]
 
 
@@ -598,12 +710,12 @@ def _is_mention_bot(message: ChatMessage, persona_name: str) -> bool:
     return bool(_is_reply_to_bot(message))
 
 
-def _is_valid_call(message: ChatMessage, persona_name: str) -> bool:
+def _is_valid_call(message: ChatMessage, persona_name: str, cfg: Any = None) -> bool:
     """Check if a message constitutes a valid wake-up call (spec §6.1)."""
     if _is_mention_bot(message, persona_name):
         return True
     text = message.content_text if hasattr(message, "content_text") else str(message)
-    keywords = _parse_keywords()
+    keywords = _parse_keywords(cfg)
     for kw in keywords:
         if kw in text:
             return True
@@ -614,6 +726,7 @@ def _check_wake_intent(
     message: ChatMessage,
     persona_name: str,
     confirm_keywords: list[str] | None = None,
+    cfg: Any = None,
 ) -> tuple[bool, bool]:
     """Check wake confirmation intent during the pending offer window.
 
@@ -635,7 +748,7 @@ def _check_wake_intent(
 
     # 2. 触发配置里的确认词（例如“要”、“叫醒”等）
     if confirm_keywords is None:
-        confirm_keywords = _parse_confirm_keywords()
+        confirm_keywords = _parse_confirm_keywords(cfg)
 
     has_confirm_kw = False
     for kw in confirm_keywords:
@@ -704,23 +817,24 @@ def _has_permission(chat_key: str) -> bool:
     return lease_ledger.has_active_for_chat(chat_key)
 
 
-def _make_config_snapshot() -> Any:
+def _make_config_snapshot(cfg: Any = None) -> Any:
+    cfg = cfg if cfg is not None else config
     return create_config_snapshot(
-        timezone=config.TIMEZONE,
-        sleep_time=config.SLEEP_TIME,
-        wake_time_start=config.WAKE_TIME_START,
-        wake_time_end=config.WAKE_TIME_END,
-        wake_random_step_minutes=config.WAKE_RANDOM_STEP_MINUTES,
-        near_wake_ratio=config.NEAR_WAKE_RATIO,
-        wake_confirm_window_seconds=config.WAKE_CONFIRM_WINDOW_SECONDS,
-        history_mode=config.HISTORY_MODE,
-        call_keywords=config.CALL_KEYWORDS,
-        fallback_persona_name=config.FALLBACK_PERSONA_NAME,
-        early_wake_idle_minutes=config.EARLY_WAKE_IDLE_MINUTES,
-        quality_min=config.QUALITY_MIN,
-        quality_max=config.QUALITY_MAX,
-        quality_jitter_points=config.QUALITY_JITTER_POINTS,
-        confirm_keywords=getattr(config, "WAKE_CONFIRM_KEYWORDS", "要,叫醒,醒来,起床,是,是的,确认"),
+        timezone=cfg.TIMEZONE,
+        sleep_time=cfg.SLEEP_TIME,
+        wake_time_start=cfg.WAKE_TIME_START,
+        wake_time_end=cfg.WAKE_TIME_END,
+        wake_random_step_minutes=cfg.WAKE_RANDOM_STEP_MINUTES,
+        near_wake_ratio=cfg.NEAR_WAKE_RATIO,
+        wake_confirm_window_seconds=cfg.WAKE_CONFIRM_WINDOW_SECONDS,
+        history_mode=cfg.HISTORY_MODE,
+        call_keywords=cfg.CALL_KEYWORDS,
+        fallback_persona_name=cfg.FALLBACK_PERSONA_NAME,
+        early_wake_idle_minutes=cfg.EARLY_WAKE_IDLE_MINUTES,
+        quality_min=cfg.QUALITY_MIN,
+        quality_max=cfg.QUALITY_MAX,
+        quality_jitter_points=cfg.QUALITY_JITTER_POINTS,
+        confirm_keywords=getattr(cfg, "WAKE_CONFIRM_KEYWORDS", "要,叫醒,醒来,起床,是,是的,确认"),
     )
 
 
@@ -782,7 +896,8 @@ async def _maybe_send_bedtime(
             chat_key,
         )
         return
-    local_date = last_seen_at.astimezone(ZoneInfo(config.TIMEZONE)).date().isoformat()
+    cfg = (await _settings_for(chat_key)).config
+    local_date = last_seen_at.astimezone(ZoneInfo(cfg.TIMEZONE)).date().isoformat()
     if local_date != sleep_date:
         logger.debug(
             "Bedtime greeting suppressed for %s: no user activity on %s (last seen %s)",
@@ -792,7 +907,7 @@ async def _maybe_send_bedtime(
         )
         return
 
-    if not _deterministic_hit(f"bedtime:{chat_key}:{sleep_date}", config.BEDTIME_CHANCE):
+    if not _deterministic_hit(f"bedtime:{chat_key}:{sleep_date}", cfg.BEDTIME_CHANCE):
         return
 
     try:
@@ -801,7 +916,7 @@ async def _maybe_send_bedtime(
         logger.warning("Cannot create ctx for %s: %s", chat_key, exc)
         return
 
-    if config.LLM_GREETINGS_ENABLED and hasattr(ctx, "push_system"):
+    if cfg.LLM_GREETINGS_ENABLED and hasattr(ctx, "push_system"):
         prompt = (
             "【系统提示：时间已到你的就寝时间，你准备入睡休息。】\n"
             "请用符合你口吻的第一人称，向频道大家道一声晚安并告知你准备睡了。\n"
@@ -871,12 +986,13 @@ def _compensate_sleep_if_due(
     state: ChatSleepState,
     now_utc: datetime,
     tz: ZoneInfo,
+    cfg: Any = None,
 ) -> ChatSleepState:
     """Enter the currently active sleep cycle even after a delayed check/reload."""
     if state.status != SleepStatus.AWAKE:
         return state
 
-    snapshot = _make_config_snapshot()
+    snapshot = _make_config_snapshot(cfg)
     sleep_date = find_sleep_date_for_now(
         now_utc,
         tz,
@@ -916,6 +1032,9 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage, *_args: Any, **_k
     now_utc = datetime.now(ZoneInfo("UTC"))
     persona_name = await _get_persona_name(ctx)
     user_id = _get_user_id(message)
+    settings = await _settings_for(chat_key)
+    cfg = settings.config
+    tz = ZoneInfo(cfg.TIMEZONE)
 
     async def _process(state: ChatSleepState) -> ChatSleepState:
         nonlocal _result_signal, _result_action, _went_to_sleep, _sleep_date, _last_seen_at
@@ -926,7 +1045,8 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage, *_args: Any, **_k
             state = _compensate_sleep_if_due(
                 state,
                 now_utc,
-                ZoneInfo(config.TIMEZONE),
+                tz,
+                cfg,
             )
             if state.status == SleepStatus.AWAKE:
                 _result_signal = MsgSignal.CONTINUE
@@ -946,13 +1066,13 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage, *_args: Any, **_k
             # Step 1: a valid call asks the question and opens the confirm window.
             # Step 2: while pending, user must mention bot OR trigger confirm keywords
             #         (e.g. '要') to confirm wake. Otherwise stays asleep (e.g. water chats).
-            valid_call = _is_valid_call(message, persona_name)
+            valid_call = _is_valid_call(message, persona_name, cfg)
             confirm_kws = (
                 state.cycle.config_snapshot.confirm_keywords
                 if state.cycle and hasattr(state.cycle.config_snapshot, "confirm_keywords")
                 else None
             )
-            is_confirm, is_cancel = _check_wake_intent(message, persona_name, confirm_kws)
+            is_confirm, is_cancel = _check_wake_intent(message, persona_name, confirm_kws, cfg)
             state, action = handle_message_while_asleep(
                 state,
                 now_utc,
@@ -1180,11 +1300,10 @@ async def _maintenance_loop() -> None:
                 continue
 
             now_utc = datetime.now(ZoneInfo("UTC"))
-            tz = ZoneInfo(config.TIMEZONE)
 
             for chat_key in list(store.known_chat_keys()):
                 try:
-                    await _maintain_chat(store, chat_key, now_utc, tz)
+                    await _maintain_chat(store, chat_key, now_utc)
                 except Exception as exc:
                     logger.error("Maintenance error for %s: %s", chat_key, exc)
 
@@ -1199,9 +1318,14 @@ async def _maintain_chat(
     store: SleepStateStore,
     chat_key: str,
     now_utc: datetime,
-    tz: ZoneInfo,
+    tz: ZoneInfo | None = None,
 ) -> None:
-    """Run maintenance checks for a single chat_key."""
+    """Run maintenance checks for a single chat_key.
+
+    ``tz`` is optional: when omitted the channel's own instance timezone is
+    used, which is what the maintenance loop does so that two accounts in one
+    group can follow different hours.
+    """
     if store.is_protected(chat_key):
         # Unreadable row: never build a fresh state on top of it.
         return
@@ -1210,8 +1334,13 @@ async def _maintain_chat(
     if state is None:
         return
 
+    settings = await _settings_for(chat_key)
+    cfg = settings.config
+    if tz is None:
+        tz = ZoneInfo(cfg.TIMEZONE)
+
     if state.status == SleepStatus.AWAKE:
-        snapshot = _make_config_snapshot()
+        snapshot = _make_config_snapshot(cfg)
         sleep_date = find_sleep_date_for_now(
             now_utc,
             tz,
@@ -1220,7 +1349,7 @@ async def _maintain_chat(
             snapshot.wake_time_end,
         )
         if sleep_date is not None:
-            await _check_sleep_transition(store, chat_key, now_utc, tz)
+            await _check_sleep_transition(store, chat_key, now_utc, tz, cfg)
 
     elif state.status == SleepStatus.ASLEEP:
         if state.pending_wake_offers and any(
@@ -1257,16 +1386,20 @@ async def _check_sleep_transition(
     chat_key: str,
     now_utc: datetime,
     tz: ZoneInfo,
+    cfg: Any = None,
 ) -> None:
     """Compensate AWAKE -> ASLEEP for the active scheduled sleep cycle."""
     if store.is_protected(chat_key):
         return
 
+    if cfg is None:
+        cfg = (await _settings_for(chat_key)).config
+
     before = store.get_cached(chat_key)
     was_awake = before is not None and before.status == SleepStatus.AWAKE
 
     async def _sleep(s: ChatSleepState) -> ChatSleepState:
-        return _compensate_sleep_if_due(s, now_utc, tz)
+        return _compensate_sleep_if_due(s, now_utc, tz, cfg)
 
     try:
         await store.with_state(chat_key, _sleep)
@@ -1294,6 +1427,7 @@ async def _settle_wake(
     if store.is_protected(chat_key):
         return
 
+    cfg = (await _settings_for(chat_key)).config
     should_notify = False
     settled_quality: int = 0
     settled_duration: float = 0.0
@@ -1310,26 +1444,26 @@ async def _settle_wake(
         sleep_date = s.cycle.sleep_date
         new_state, action = settle_natural_wake(
             s, now_utc, persona_name, settled_quality,
-            always_notice=config.WAKE_NOTICE_ALWAYS,
+            always_notice=cfg.WAKE_NOTICE_ALWAYS,
         )
         if isinstance(action, ActionSendWakeNotice):
             should_notify = True
-            if config.WAKE_NOTICE_GRACE_MINUTES > 0:
-                grace_seconds = config.WAKE_NOTICE_GRACE_MINUTES * 60.0
+            if cfg.WAKE_NOTICE_GRACE_MINUTES > 0:
+                grace_seconds = cfg.WAKE_NOTICE_GRACE_MINUTES * 60.0
                 delay_seconds = (now_utc - s.cycle.planned_wake_at).total_seconds()
                 if delay_seconds > grace_seconds:
                     logger.info(
                         "Wake notice suppressed for %s: delayed by %.1f min (grace limit: %d min)",
                         s.chat_key,
                         delay_seconds / 60.0,
-                        config.WAKE_NOTICE_GRACE_MINUTES,
+                        cfg.WAKE_NOTICE_GRACE_MINUTES,
                     )
                     should_notify = False
 
         history = dict(s.quality_history)
         if sleep_date:
             history[sleep_date] = settled_quality
-            keep = max(1, min(90, config.QUALITY_HISTORY_DAYS))
+            keep = max(1, min(90, cfg.QUALITY_HISTORY_DAYS))
             if len(history) > keep:
                 for old in sorted(history)[:-keep]:
                     history.pop(old, None)
@@ -1353,7 +1487,7 @@ async def _settle_wake(
 
         tier_name, emoji, comment = quality_tier(settled_quality)
         dream_text = ""
-        if config.DREAM_ENABLED and sleep_date:
+        if cfg.DREAM_ENABLED and sleep_date:
             dream = pick_dream(f"dream:{chat_key}:{sleep_date}", settled_quality)
             if dream:
                 dream_text = dream
@@ -1384,7 +1518,7 @@ async def _settle_wake(
         try:
             sent_via_llm = False
             report_sent = False
-            if config.LLM_GREETINGS_ENABLED and hasattr(ctx, "push_system"):
+            if cfg.LLM_GREETINGS_ENABLED and hasattr(ctx, "push_system"):
                 # Only objective data + directional hints go into the prompt.
                 # Canned sentences (tier comment / picked dream) stay fallback-only;
                 # feeding them in makes the model paraphrase the hardcoded version.
@@ -1392,7 +1526,7 @@ async def _settle_wake(
                     f"- 睡眠时长：{duration_str}",
                     f"- 睡眠质量：{settled_quality}%（状态评定：{tier_name}）",
                 ]
-                if config.DREAM_ENABLED and sleep_date:
+                if cfg.DREAM_ENABLED and sleep_date:
                     dream_tone = dream_tone_hint(settled_quality)
                     if dream_tone:
                         ref_lines.append(f"- 昨晚做梦基调：{dream_tone}")
@@ -1606,6 +1740,7 @@ async def _stop_runtime() -> None:
     chat_key_locks.clear()
     _wake_inject_cache.clear()
     _persona_cache.clear()
+    invalidate_settings_cache()
 
     if _store is not None:
         _store.clear_all()
