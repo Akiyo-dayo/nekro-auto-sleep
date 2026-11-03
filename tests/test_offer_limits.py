@@ -79,15 +79,17 @@ class TestNightlyCap:
         assert state.offers_sent_tonight == 3
         assert offer_is_suppressed(state, NIGHT + timedelta(hours=3), snapshot) == "nightly limit"
 
-    def test_cap_zero_means_never_ask(self, plugin_mod):
-        snapshot = _snapshot(plugin_mod, MAX_OFFERS_PER_NIGHT=0)
+    def test_both_zero_restores_the_unlimited_1_2_5_behaviour(self, plugin_mod):
+        snapshot = _snapshot(plugin_mod, MAX_OFFERS_PER_NIGHT=0, OFFER_COOLDOWN_MINUTES=0)
         state = _sleeping(snapshot)
 
-        state, action = _call(state, NIGHT + timedelta(minutes=1))
+        # Each call lands after the previous 180 s confirm window has expired.
+        for i in range(6):
+            state, action = _call(state, NIGHT + timedelta(minutes=1 + i * 4))
+            assert isinstance(action, ActionSendFixed), f"call {i + 1} was not asked"
 
-        assert isinstance(action, ActionStayAsleep)
-        assert state.offers_sent_tonight == 0
-        assert state.pending_wake_offers == {}
+        assert state.offers_sent_tonight == 6
+        assert offer_is_suppressed(state, NIGHT + timedelta(minutes=30), snapshot) is None
 
     def test_cap_is_per_cycle_not_per_day(self, plugin_mod):
         snapshot = _snapshot(plugin_mod, MAX_OFFERS_PER_NIGHT=1)

@@ -332,9 +332,11 @@ def offer_is_suppressed(
 
     A chat that keeps calling at 3am would otherwise get one question per
     message. Two limits, both per sleep cycle: a nightly cap on how many
-    questions were asked, and a cooldown between two of them.
+    questions were asked, and a cooldown between two of them. 0 turns either
+    limit off, which is the 1.2.5 behaviour.
     """
-    if state.offers_sent_tonight >= max(0, snapshot.max_offers_per_night):
+    cap = snapshot.max_offers_per_night
+    if cap > 0 and state.offers_sent_tonight >= cap:
         return "nightly limit"
     if state.last_offer_at is not None:
         cooldown = timedelta(minutes=max(0, snapshot.offer_cooldown_minutes))

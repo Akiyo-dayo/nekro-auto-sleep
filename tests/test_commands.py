@@ -506,3 +506,18 @@ class TestCommandGuards:
         plugin_mod, _store = wired
         response = await plugin_mod.sleep_status_command(_ctx("unknown-chat"))
         assert response.status == "success"
+
+    @pytest.mark.parametrize(
+        "command",
+        ["sleep_status_command", "sleep_now_command", "sleep_wake_command", "sleep_skip_command"],
+    )
+    async def test_unreadable_row_is_answered_and_left_untouched(self, wired, command):
+        plugin_mod, store = wired
+        raw = "{not json"
+        await store._backend.set(chat_key=CHAT_KEY, store_key="state.v1", value=raw)
+
+        response = await getattr(plugin_mod, command)(_ctx())
+
+        assert response.status != "success"
+        assert "无法读取" in response.message
+        assert await store._backend.get(chat_key=CHAT_KEY, store_key="state.v1") == raw

@@ -457,28 +457,28 @@ class SleepConfig(ConfigBase):
     MAX_OFFERS_PER_NIGHT: int = Field(
         default=3,
         title="每晚叫醒提问上限（次）",
-        description="同一晚最多向用户发出几次「要叫醒吗」的提问，超过后当晚不再提问，0-20（0 表示不提问）",
+        description="同一晚最多向用户发出几次「要叫醒吗」的提问，超过后当晚不再提问，0-20（0 表示不限，即 1.2.5 的行为）",
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(
                 zh_CN="每晚叫醒提问上限（次）", en_US="Max Wake Offers Per Night"
             ),
             i18n_description=i18n.i18n_text(
-                zh_CN="同一晚最多向用户发出几次「要叫醒吗」的提问，超过后当晚不再提问，0-20（0 表示不提问）",
-                en_US="How many wake-up questions may be asked in one night; afterwards the bot stays quiet, 0-20 (0 disables offers)",
+                zh_CN="同一晚最多向用户发出几次「要叫醒吗」的提问，超过后当晚不再提问，0-20（0 表示不限，即 1.2.5 的行为）",
+                en_US="How many wake-up questions may be asked in one night; afterwards the bot stays quiet, 0-20 (0 means no limit, the 1.2.5 behaviour)",
             ),
         ).model_dump(),
     )
     OFFER_COOLDOWN_MINUTES: int = Field(
         default=20,
         title="叫醒提问冷却（分钟）",
-        description="两次「要叫醒吗」提问之间的最短间隔，避免同一晚被连续追问，0-720",
+        description="两次「要叫醒吗」提问之间的最短间隔，避免同一晚被连续追问，0-720（0 表示不限，即 1.2.5 的行为）",
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(
                 zh_CN="叫醒提问冷却（分钟）", en_US="Wake Offer Cooldown (min)"
             ),
             i18n_description=i18n.i18n_text(
-                zh_CN="两次「要叫醒吗」提问之间的最短间隔，避免同一晚被连续追问，0-720",
-                en_US="Minimum gap between two wake-up questions, so one night cannot be flooded, 0-720",
+                zh_CN="两次「要叫醒吗」提问之间的最短间隔，避免同一晚被连续追问，0-720（0 表示不限，即 1.2.5 的行为）",
+                en_US="Minimum gap between two wake-up questions, so one night cannot be flooded, 0-720 (0 means no limit, the 1.2.5 behaviour)",
             ),
         ).model_dump(),
     )
@@ -2475,7 +2475,10 @@ if _COMMANDS_AVAILABLE:
         store = _get_store()
         # ``load`` (not ``ensure_loaded``): a channel with no record must read as
         # "not loaded yet" instead of being materialized as a fresh AWAKE row.
-        state = store.get_cached(chat_key) or await store.load(chat_key)
+        try:
+            state = store.get_cached(chat_key) or await store.load(chat_key)
+        except StateProtectedError:
+            return CmdCtl.failed("本频道的睡眠数据无法读取，已按未启用睡眠处理")
         schedule = await _resolve_schedule_for(chat_key)
         persona_name = await _persona_name_for(chat_key)
         return CmdCtl.success(_render_status(state, schedule, persona_name, _utcnow()))
@@ -2488,7 +2491,10 @@ if _COMMANDS_AVAILABLE:
     async def sleep_now_command(context: CommandExecutionContext):
         chat_key = context.chat_key
         store = _get_store()
-        await store.ensure_loaded(chat_key)
+        try:
+            await store.ensure_loaded(chat_key)
+        except StateProtectedError:
+            return CmdCtl.failed("本频道的睡眠数据无法读取，已按未启用睡眠处理")
         now_utc = _utcnow()
         settings = await _settings_for(chat_key)
         schedule = settings.schedule
@@ -2527,7 +2533,10 @@ if _COMMANDS_AVAILABLE:
     async def sleep_wake_command(context: CommandExecutionContext):
         chat_key = context.chat_key
         store = _get_store()
-        state = store.get_cached(chat_key) or await store.ensure_loaded(chat_key)
+        try:
+            state = store.get_cached(chat_key) or await store.ensure_loaded(chat_key)
+        except StateProtectedError:
+            return CmdCtl.failed("本频道的睡眠数据无法读取，已按未启用睡眠处理")
         if state.status == SleepStatus.AWAKE:
             return CmdCtl.failed("本来就是醒着的")
         await _settle_wake(store, chat_key, _utcnow())
@@ -2541,7 +2550,10 @@ if _COMMANDS_AVAILABLE:
     async def sleep_skip_command(context: CommandExecutionContext):
         chat_key = context.chat_key
         store = _get_store()
-        await store.ensure_loaded(chat_key)
+        try:
+            await store.ensure_loaded(chat_key)
+        except StateProtectedError:
+            return CmdCtl.failed("本频道的睡眠数据无法读取，已按未启用睡眠处理")
         sleep_date = await _current_sleep_date(chat_key, _utcnow())
 
         async def _skip(state: ChatSleepState) -> ChatSleepState:
