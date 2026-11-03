@@ -95,6 +95,12 @@ from .schedule import (
 
 logger = logging.getLogger("nekro_auto_sleep")
 
+# How long a deferred notice may wait for the running agent round to finish.
+# The round belongs to the same chat, and a stuck one must not keep a task alive
+# forever; after this the notice is sent anyway.
+_ROUND_WAIT_SECONDS = 120.0
+_deferred_sends: set[asyncio.Task] = set()
+
 
 class _HostLogBridge(logging.Handler):
     """Forward stdlib records from the plugin into the host logger.
@@ -162,6 +168,72 @@ def _remove_log_bridge() -> None:
     if _log_bridge is not None:
         logger.removeHandler(_log_bridge)
         _log_bridge = None
+
+
+async def _wait_for_current_round(chat_key: str) -> None:
+    """Block until the agent round running for this chat has finished.
+
+    The host keeps one task per chat in ``message_service.running_tasks``
+    (verified: ``services/message_service.py:95``, populated at ``:205`` and
+    ``:395``, removed in the ``finally`` at ``:347``). A tool call runs *inside*
+    that task, so it cannot await itself; this is called from a separate task.
+    """
+    try:
+        from nekro_agent.services.message_service import message_service as ms
+
+        task = getattr(ms, "running_tasks", {}).get(chat_key)
+    except Exception as exc:  # noqa: BLE001 - host shapes vary by fork
+        logger.debug("Cannot look up the running round for %s: %s", chat_key, exc)
+        task = None
+
+    if task is None or task.done():
+        # No handle on the round (or it is already over): a short pause still
+        # keeps the ordering right in practice.
+        await asyncio.sleep(0.5)
+        return
+
+    try:
+        await asyncio.wait({task}, timeout=_ROUND_WAIT_SECONDS)
+    except Exception as exc:  # noqa: BLE001 - a stuck round must not leak a task
+        logger.debug("Waiting for the round of %s failed: %s", chat_key, exc)
+
+
+async def _send_after_current_round(chat_key: str, text: str, record: bool) -> None:
+    """Say something once the model has finished speaking."""
+    try:
+        await _wait_for_current_round(chat_key)
+        ctx = await AgentCtx.create_by_chat_key(chat_key)
+        token = current_source.set(SourceType.INTERNAL_WAKE_NOTICE)
+        try:
+            await ctx.send_text(text, record=record)
+        finally:
+            current_source.reset(token)
+        logger.info("%s 已睡下（跟在本轮回复之后）", chat_key)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - background task, nothing to raise to
+        logger.error("Failed to send the sleep notice for %s: %s", chat_key, exc)
+
+
+def _defer_send(chat_key: str, text: str, record: bool) -> asyncio.Task:
+    """Send ``text`` after the current round instead of in the middle of it.
+
+    Sending inline put 【已睡下】 *above* the line it is meant to follow: the
+    model's own reply only goes out when the round ends, but the tool runs
+    before that.
+    """
+    task = asyncio.create_task(_send_after_current_round(chat_key, text, record))
+    _deferred_sends.add(task)
+    task.add_done_callback(_deferred_sends.discard)
+    return task
+
+
+def _cancel_deferred_sends() -> None:
+    """Drop pending notices on shutdown; nothing may outlive the runtime."""
+    for task in list(_deferred_sends):
+        if not task.done():
+            task.cancel()
+    _deferred_sends.clear()
 
 # ---------------------------------------------------------------------------
 # Plugin instance
@@ -1512,10 +1584,10 @@ async def resume_sleep(*call_args: Any, **call_kwargs: Any) -> str:
         nonlocal result_text
         state, action = handle_resume_sleep(state, now_utc, persona_name)
         if isinstance(action, ActionSendResumeSleep):
-            try:
-                await _ctx.send_text(action.text, record=False)
-            except Exception as exc:
-                logger.error("Failed to send resume sleep message: %s", exc)
+            # Deferred, not sent here: this runs mid-round, and the model's own
+            # "我先去睡啦" only goes out when the round ends. Sending inline put
+            # 【已睡下】 above the line it is supposed to follow.
+            _defer_send(chat_key, action.text, record=False)
         result_text = "ok"
         return state
 
@@ -2088,6 +2160,7 @@ async def _stop_runtime() -> None:
 
     _uninstall_wraps()
     _remove_log_bridge()
+    _cancel_deferred_sends()
     lease_ledger.clear()
     chat_key_locks.clear()
     _wake_inject_cache.clear()
