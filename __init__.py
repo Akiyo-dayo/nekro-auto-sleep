@@ -62,10 +62,17 @@ from .models import (
     PLUGIN_KEY,
     ChatSleepState,
     NotificationStatus,
+    ResolvedSchedule,
+    ScheduleOverride,
     SleepStatus,
     SourceType,
 )
-from .persistence import DATA_KEY, SleepStateStore, StateProtectedError
+from .persistence import (
+    DATA_KEY,
+    ScheduleOverrideStore,
+    SleepStateStore,
+    StateProtectedError,
+)
 from .quality import (
     compute_quality,
     compute_streak_note,
@@ -91,6 +98,8 @@ from .schedule import (
     create_config_snapshot,
     current_local_date,
     find_sleep_date_for_now,
+    parse_hhmm,
+    resolve_schedule,
 )
 
 logger = logging.getLogger("nekro_auto_sleep")
@@ -630,6 +639,7 @@ config = plugin.get_config(SleepConfig)
 # ---------------------------------------------------------------------------
 
 _store: SleepStateStore | None = None
+_overrides: "ScheduleOverrideStore | None" = None
 _maintenance_task: asyncio.Task[None] | None = None
 _wake_inject_cache: dict[str, str] = {}
 _installed_wraps: list[tuple[Any, str]] = []
@@ -669,6 +679,7 @@ class ChatSettings:
 
     instance_key: str
     config: Any
+    schedule: ResolvedSchedule
 
 
 async def _channel_for(chat_key: str):
@@ -731,6 +742,37 @@ def _instance_schedule_fields(instance_key: str) -> set[str]:
     return {field for key, field in mapping.items() if key in overrides}
 
 
+def _get_overrides() -> ScheduleOverrideStore:
+    """The schedule-override store, created on first use.
+
+    Separate from ``_store``: overrides must survive a night whose state row
+    failed to validate, so they live under their own keys. Created lazily rather
+    than in ``_start_runtime`` so a host that loads the plugin while disabled
+    still has a working store the moment it is enabled.
+    """
+    global _overrides
+
+    if _overrides is not None:
+        return _overrides
+
+    backend = getattr(plugin, "store", None)
+    if backend is None and _store is not None:
+        # Hosts that only expose the store through the state store: share its
+        # backend rather than writing nowhere.
+        backend = getattr(_store, "_backend", None)
+    if backend is None:
+        raise RuntimeError("plugin store is not available yet")
+
+    _overrides = ScheduleOverrideStore(backend)
+    return _overrides
+
+
+async def _channel_and_preset(chat_key: str) -> tuple[object, object]:
+    """The channel row and the preset it is running, for override targeting."""
+    channel = await _channel_for(chat_key)
+    return channel, getattr(channel, "preset_id", None)
+
+
 def invalidate_settings_cache(chat_key: str | None = None) -> None:
     if chat_key is None:
         _settings_cache.clear()
@@ -738,17 +780,51 @@ def invalidate_settings_cache(chat_key: str | None = None) -> None:
         _settings_cache.pop(chat_key, None)
 
 
+# ``/sleep set`` invalidates the same cache; keep the p0 name usable.
+invalidate_schedule_cache = invalidate_settings_cache
+
+
 async def _settings_for(chat_key: str) -> ChatSettings:
-    """Resolve this channel's effective plugin config (300 s cache)."""
+    """Resolve one channel: channel > preset > instance config > global."""
     cached = _settings_cache.get(chat_key)
     if cached is not None and (time.monotonic() - cached[0]) < _SETTINGS_CACHE_TTL_SECONDS:
         return cached[1]
 
     channel = await _channel_for(chat_key)
     instance_key = str(getattr(channel, "instance_key", "") or "")
-    settings = ChatSettings(instance_key=instance_key, config=_instance_config(instance_key))
+    preset_id = getattr(channel, "preset_id", None)
+    effective = _instance_config(instance_key)
+
+    channel_override: ScheduleOverride | None = None
+    preset_override: ScheduleOverride | None = None
+    try:
+        overrides = _get_overrides()
+        channel_override = await overrides.get_channel(chat_key)
+        preset_override = await overrides.get_preset(preset_id)
+    except Exception as exc:  # noqa: BLE001 - an override must never break a tick
+        logger.warning("Cannot load schedule overrides for %s: %s", chat_key, exc)
+
+    schedule = resolve_schedule(
+        timezone=effective.TIMEZONE,
+        sleep_time=effective.SLEEP_TIME,
+        wake_time_start=effective.WAKE_TIME_START,
+        wake_time_end=effective.WAKE_TIME_END,
+        preset_override=preset_override,
+        channel_override=channel_override,
+    )
+    for field in _instance_schedule_fields(instance_key):
+        if schedule.sources.get(field) == "global":
+            schedule.sources[field] = "instance"
+
+    settings = ChatSettings(
+        instance_key=instance_key, config=effective, schedule=schedule
+    )
     _settings_cache[chat_key] = (time.monotonic(), settings)
     return settings
+
+
+async def _resolve_schedule_for(chat_key: str) -> ResolvedSchedule:
+    return (await _settings_for(chat_key)).schedule
 
 
 def _cfg(settings: ChatSettings) -> Any:
@@ -1144,13 +1220,30 @@ def _has_permission(chat_key: str) -> bool:
     return lease_ledger.has_active_for_chat(chat_key)
 
 
-def _make_config_snapshot(cfg: Any = None) -> Any:
+def _make_config_snapshot(
+    cfg: Any = None,
+    schedule: ResolvedSchedule | None = None,
+) -> Any:
+    """Build the per-cycle config snapshot.
+
+    ``schedule`` is the channel's resolved schedule (channel/preset/instance
+    overrides already applied). Omitted — which is how the older tests and any
+    external caller invoke this — it falls back to the raw config values, i.e.
+    exactly the pre-1.3.0 behaviour.
+    """
     cfg = cfg if cfg is not None else config
+    if schedule is None:
+        schedule = ResolvedSchedule(
+            timezone=cfg.TIMEZONE,
+            sleep_time=cfg.SLEEP_TIME,
+            wake_time_start=cfg.WAKE_TIME_START,
+            wake_time_end=cfg.WAKE_TIME_END,
+        )
     return create_config_snapshot(
-        timezone=cfg.TIMEZONE,
-        sleep_time=cfg.SLEEP_TIME,
-        wake_time_start=cfg.WAKE_TIME_START,
-        wake_time_end=cfg.WAKE_TIME_END,
+        timezone=schedule.timezone,
+        sleep_time=schedule.sleep_time,
+        wake_time_start=schedule.wake_time_start,
+        wake_time_end=schedule.wake_time_end,
         wake_random_step_minutes=cfg.WAKE_RANDOM_STEP_MINUTES,
         near_wake_ratio=cfg.NEAR_WAKE_RATIO,
         wake_confirm_window_seconds=cfg.WAKE_CONFIRM_WINDOW_SECONDS,
@@ -1226,7 +1319,8 @@ async def _maybe_send_bedtime(
         )
         return
     cfg = (await _settings_for(chat_key)).config
-    local_date = last_seen_at.astimezone(ZoneInfo(cfg.TIMEZONE)).date().isoformat()
+    schedule = await _resolve_schedule_for(chat_key)
+    local_date = last_seen_at.astimezone(ZoneInfo(schedule.timezone)).date().isoformat()
     if local_date != sleep_date:
         logger.debug(
             "Bedtime greeting suppressed for %s: no user activity on %s (last seen %s)",
@@ -1316,12 +1410,13 @@ def _compensate_sleep_if_due(
     now_utc: datetime,
     tz: ZoneInfo,
     cfg: Any = None,
+    schedule: ResolvedSchedule | None = None,
 ) -> ChatSleepState:
     """Enter the currently active sleep cycle even after a delayed check/reload."""
     if state.status != SleepStatus.AWAKE:
         return state
 
-    snapshot = _make_config_snapshot(cfg)
+    snapshot = _make_config_snapshot(cfg, schedule)
     sleep_date = find_sleep_date_for_now(
         now_utc,
         tz,
@@ -1330,6 +1425,11 @@ def _compensate_sleep_if_due(
         snapshot.wake_time_end,
     )
     if sleep_date is None:
+        return state
+    if state.skip_sleep_date == sleep_date.isoformat():
+        # `/sleep skip`: the operator asked for a night off. Checked here as well
+        # as in the maintenance loop so a message at 23:30 cannot put the chat to
+        # sleep behind the operator's back.
         return state
 
     candidate = transition_to_sleep(
@@ -1363,7 +1463,8 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage, *_args: Any, **_k
     user_id = _get_user_id(message)
     settings = await _settings_for(chat_key)
     cfg = settings.config
-    tz = ZoneInfo(cfg.TIMEZONE)
+    schedule = settings.schedule
+    tz = ZoneInfo(schedule.timezone)
     from_own_bot = await _is_own_bot(message)
 
     async def _process(state: ChatSleepState) -> ChatSleepState:
@@ -1394,6 +1495,7 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage, *_args: Any, **_k
                 now_utc,
                 tz,
                 cfg,
+                schedule,
             )
             if state.status == SleepStatus.AWAKE:
                 _result_signal = MsgSignal.CONTINUE
@@ -1757,11 +1859,12 @@ async def _maintain_chat(
 
     settings = await _settings_for(chat_key)
     cfg = settings.config
+    schedule = settings.schedule
     if tz is None:
-        tz = ZoneInfo(cfg.TIMEZONE)
+        tz = ZoneInfo(schedule.timezone)
 
     if state.status == SleepStatus.AWAKE:
-        snapshot = _make_config_snapshot(cfg)
+        snapshot = _make_config_snapshot(cfg, schedule)
         sleep_date = find_sleep_date_for_now(
             now_utc,
             tz,
@@ -1769,8 +1872,13 @@ async def _maintain_chat(
             snapshot.wake_time_start,
             snapshot.wake_time_end,
         )
-        if sleep_date is not None:
-            await _check_sleep_transition(store, chat_key, now_utc, tz, cfg)
+        if sleep_date is not None and state.skip_sleep_date == sleep_date.isoformat():
+            # `/sleep skip`: the operator asked for a night off. The marker is
+            # compared against the date that owns *this* window, so it expires
+            # by itself when tomorrow's window opens.
+            logger.debug("%s 今夜已设置不入睡，跳过补偿", chat_key)
+        elif sleep_date is not None:
+            await _check_sleep_transition(store, chat_key, now_utc, tz, cfg, schedule)
 
     elif state.status == SleepStatus.ASLEEP:
         if state.pending_wake_offers and any(
@@ -1808,19 +1916,22 @@ async def _check_sleep_transition(
     now_utc: datetime,
     tz: ZoneInfo,
     cfg: Any = None,
+    schedule: ResolvedSchedule | None = None,
 ) -> None:
     """Compensate AWAKE -> ASLEEP for the active scheduled sleep cycle."""
     if store.is_protected(chat_key):
         return
 
-    if cfg is None:
-        cfg = (await _settings_for(chat_key)).config
+    if cfg is None or schedule is None:
+        settings = await _settings_for(chat_key)
+        cfg = cfg if cfg is not None else settings.config
+        schedule = schedule if schedule is not None else settings.schedule
 
     before = store.get_cached(chat_key)
     was_awake = before is not None and before.status == SleepStatus.AWAKE
 
     async def _sleep(s: ChatSleepState) -> ChatSleepState:
-        return _compensate_sleep_if_due(s, now_utc, tz, cfg)
+        return _compensate_sleep_if_due(s, now_utc, tz, cfg, schedule)
 
     try:
         await store.with_state(chat_key, _sleep)
@@ -2142,7 +2253,7 @@ async def _start_runtime() -> None:
 
 async def _stop_runtime() -> None:
     """Stop plugin runtime components idempotently without deleting persisted state."""
-    global _store, _maintenance_task, _is_runtime_active
+    global _store, _maintenance_task, _is_runtime_active, _overrides
 
     _is_runtime_active = False
 
@@ -2167,6 +2278,7 @@ async def _stop_runtime() -> None:
     _persona_cache.clear()
     invalidate_settings_cache()
     invalidate_own_accounts_cache()
+    _overrides = None
 
     if _store is not None:
         _store.clear_all()
@@ -2193,3 +2305,355 @@ async def handle_disabled(*_args: Any, **_kwargs: Any) -> None:
 @plugin.mount_cleanup_method()
 async def cleanup(*_args: Any, **_kwargs: Any) -> None:
     await _stop_runtime()
+
+
+# ---------------------------------------------------------------------------
+# Operator commands: /sleep status|now|wake|skip|set|unset
+# ---------------------------------------------------------------------------
+
+try:
+    from nekro_agent.services.command.base import CommandPermission
+    from nekro_agent.services.command.ctl import CmdCtl
+    from nekro_agent.services.command.schemas import Arg, CommandExecutionContext
+
+    _COMMANDS_AVAILABLE = True
+except ImportError:  # pragma: no cover - hosts without the command system
+    _COMMANDS_AVAILABLE = False
+    logger.info("Command system not found; /sleep commands are not registered")
+
+
+def _utcnow() -> datetime:
+    return datetime.now(ZoneInfo("UTC"))
+
+
+def _fmt_local(dt: datetime, tz_name: str) -> str:
+    """Render an aware UTC datetime as HH:MM in the cycle timezone."""
+    try:
+        return dt.astimezone(ZoneInfo(tz_name)).strftime("%H:%M")
+    except Exception:
+        return dt.astimezone(ZoneInfo("UTC")).strftime("%H:%M UTC")
+
+
+def _fmt_duration(seconds: float) -> str:
+    from .engine import format_sleep_duration
+
+    return format_sleep_duration(max(0.0, seconds))
+
+
+def _render_status(
+    state: ChatSleepState | None,
+    schedule: ResolvedSchedule,
+    persona_name: str,
+    now_utc: datetime,
+) -> str:
+    """Everything an operator needs to answer "why did it do that"."""
+    tz_name = schedule.timezone
+    marks = {
+        "global": "全局",
+        "instance": "实例",
+        "preset": "人设",
+        "channel": "本频道",
+    }
+    origin = "、".join(
+        f"{field}={marks.get(src, src)}"
+        for field, src in schedule.sources.items()
+        if src != "global"
+    )
+    lines = [
+        f"【{persona_name} · 睡眠状态】",
+        f"作息：{schedule.sleep_time} → {schedule.wake_time_start}~{schedule.wake_time_end}"
+        f"（{tz_name}）" + (f"　覆盖：{origin}" if origin else ""),
+    ]
+
+    if state is None:
+        lines.append("当前：尚未装载（本频道还没有睡眠记录）")
+        return "\n".join(lines)
+
+    status_text = {
+        SleepStatus.AWAKE: "醒着",
+        SleepStatus.ASLEEP: "睡着",
+        SleepStatus.AWAKE_EARLY: "被提前叫醒",
+    }.get(state.status, str(state.status))
+
+    cycle = state.cycle
+    if cycle is not None and state.status != SleepStatus.AWAKE:
+        slept = _fmt_duration(
+            sum(
+                ((seg.close_at or now_utc) - seg.open_at).total_seconds()
+                for seg in cycle.sleep_segments
+            )
+        )
+        lines.append(
+            f"当前：{status_text}（{_fmt_local(cycle.sleep_at, tz_name)} 就寝，"
+            f"计划 {_fmt_local(cycle.planned_wake_at, tz_name)} 起床，已睡 {slept}）"
+        )
+    else:
+        lines.append(f"当前：{status_text}")
+
+    if state.skip_sleep_date:
+        lines.append(f"今夜：已设置不睡（{state.skip_sleep_date}）")
+    elif cycle is not None:
+        lines.append(
+            f"今夜：已提示 {state.offers_sent_tonight}/"
+            f"{cycle.config_snapshot.max_offers_per_night} 次"
+        )
+
+    if cycle is not None:
+        calls = sum(1 for a in cycle.wake_attempts if not a.is_confirmed)
+        wakes = sum(1 for a in cycle.wake_attempts if a.is_confirmed)
+        lines.append(f"本夜记录：没理会的呼叫 {calls} 次，真被叫醒 {wakes} 次")
+
+    if state.quality_history:
+        last_date = sorted(state.quality_history, reverse=True)[0]
+        lines.append(f"上一夜：{state.quality_history[last_date]}%（{last_date}）")
+
+    return "\n".join(lines)
+
+
+_OVERRIDE_FIELDS = {
+    "tz": "timezone",
+    "timezone": "timezone",
+    "bed": "sleep_time",
+    "sleep": "sleep_time",
+    "wake-start": "wake_time_start",
+    "wake-end": "wake_time_end",
+}
+
+
+def _validate_override(field: str, value: str) -> str | None:
+    """Return an error message, or None when the value is usable."""
+    if field == "timezone":
+        try:
+            ZoneInfo(value)
+        except Exception:
+            return f"时区 {value!r} 无法识别，需要 IANA 名称，例如 Asia/Tokyo"
+        return None
+    try:
+        parse_hhmm(value)
+    except Exception:
+        return f"{value!r} 不是 HH:MM 格式"
+    return None
+
+
+async def _current_sleep_date(chat_key: str, now_utc: datetime) -> str:
+    """The local date of the night `now` belongs to (tonight, if it is daytime)."""
+    schedule = await _resolve_schedule_for(chat_key)
+    tz = ZoneInfo(schedule.timezone)
+    found = find_sleep_date_for_now(
+        now_utc, tz, schedule.sleep_time, schedule.wake_time_start, schedule.wake_time_end
+    )
+    if found is not None:
+        return found.isoformat()
+    return now_utc.astimezone(tz).date().isoformat()
+
+
+async def _persona_name_for(chat_key: str) -> str:
+    """The persona name for status output, falling back to the configured one."""
+    try:
+        ctx = await AgentCtx.create_by_chat_key(chat_key)
+        return await _get_persona_name(ctx)
+    except Exception as exc:  # noqa: BLE001 - a status line must not fail
+        logger.debug("Cannot resolve persona for %s: %s", chat_key, exc)
+        return config.FALLBACK_PERSONA_NAME
+
+
+if _COMMANDS_AVAILABLE:
+    sleep_group = plugin.mount_command_group(
+        name="sleep",
+        description="自动睡眠：查看状态、临时调整作息",
+        permission=CommandPermission.SUPER_USER,
+        category="plugin",
+    )
+
+    @sleep_group.command(
+        name="status",
+        description="查看当前睡眠状态",
+        permission=CommandPermission.SUPER_USER,
+    )
+    async def sleep_status_command(context: CommandExecutionContext):
+        chat_key = context.chat_key
+        store = _get_store()
+        # ``load`` (not ``ensure_loaded``): a channel with no record must read as
+        # "not loaded yet" instead of being materialized as a fresh AWAKE row.
+        state = store.get_cached(chat_key) or await store.load(chat_key)
+        schedule = await _resolve_schedule_for(chat_key)
+        persona_name = await _persona_name_for(chat_key)
+        return CmdCtl.success(_render_status(state, schedule, persona_name, _utcnow()))
+
+    @sleep_group.command(
+        name="now",
+        description="立刻入睡",
+        permission=CommandPermission.SUPER_USER,
+    )
+    async def sleep_now_command(context: CommandExecutionContext):
+        chat_key = context.chat_key
+        store = _get_store()
+        await store.ensure_loaded(chat_key)
+        now_utc = _utcnow()
+        settings = await _settings_for(chat_key)
+        schedule = settings.schedule
+        sleep_date = await _current_sleep_date(chat_key, now_utc)
+        snap = _make_config_snapshot(settings.config, schedule)
+        started = False
+
+        async def _sleep(state: ChatSleepState) -> ChatSleepState:
+            nonlocal started
+            if state.status != SleepStatus.AWAKE:
+                return state
+            started = True
+            return transition_to_sleep(
+                state,
+                now_utc,
+                snap,
+                sleep_date_local=sleep_date,
+                sleep_at_override=now_utc,
+            )
+
+        try:
+            state = await store.with_state(chat_key, _sleep)
+        except StateProtectedError:
+            return CmdCtl.failed("本频道的睡眠数据无法读取，已按未启用睡眠处理")
+        if not started:
+            return CmdCtl.failed(f"当前状态是 {state.status.value}，不能直接入睡")
+        wake_at = state.cycle.planned_wake_at if state.cycle else None
+        when = _fmt_local(wake_at, schedule.timezone) if wake_at else "?"
+        return CmdCtl.success(f"已入睡，计划 {when} 自然醒")
+
+    @sleep_group.command(
+        name="wake",
+        description="立刻起床并结算这一夜",
+        permission=CommandPermission.SUPER_USER,
+    )
+    async def sleep_wake_command(context: CommandExecutionContext):
+        chat_key = context.chat_key
+        store = _get_store()
+        state = store.get_cached(chat_key) or await store.ensure_loaded(chat_key)
+        if state.status == SleepStatus.AWAKE:
+            return CmdCtl.failed("本来就是醒着的")
+        await _settle_wake(store, chat_key, _utcnow())
+        return CmdCtl.success("已起床并结算")
+
+    @sleep_group.command(
+        name="skip",
+        description="今晚不入睡",
+        permission=CommandPermission.SUPER_USER,
+    )
+    async def sleep_skip_command(context: CommandExecutionContext):
+        chat_key = context.chat_key
+        store = _get_store()
+        await store.ensure_loaded(chat_key)
+        sleep_date = await _current_sleep_date(chat_key, _utcnow())
+
+        async def _skip(state: ChatSleepState) -> ChatSleepState:
+            return state.model_copy(update={"skip_sleep_date": sleep_date})
+
+        try:
+            await store.with_state(chat_key, _skip)
+        except StateProtectedError:
+            return CmdCtl.failed("本频道的睡眠数据无法读取，已按未启用睡眠处理")
+        return CmdCtl.success(f"今晚（{sleep_date}）不入睡，明晚恢复")
+
+    @sleep_group.command(
+        name="set",
+        description="设置本频道或当前人设的作息覆盖",
+        usage="/sleep set <tz|bed|wake-start|wake-end> <值> [scope=channel|preset]",
+        permission=CommandPermission.SUPER_USER,
+    )
+    async def sleep_set_command(
+        context: CommandExecutionContext,
+        field: str = Arg("要改的字段", positional=True, choices=sorted(_OVERRIDE_FIELDS)),
+        value: str = Arg("新的值", positional=True),
+        scope: str = Arg("作用范围", default="channel", choices=["channel", "preset"]),
+    ):
+        key = _OVERRIDE_FIELDS.get(field)
+        if key is None:
+            return CmdCtl.failed(
+                f"未知字段 {field!r}，可用：{'、'.join(sorted(_OVERRIDE_FIELDS))}"
+            )
+        error = _validate_override(key, value)
+        if error:
+            return CmdCtl.failed(error)
+
+        chat_key = context.chat_key
+        overrides = _get_overrides()
+        if scope == "preset":
+            preset_id = (await _channel_and_preset(chat_key))[1]
+            if preset_id is None:
+                return CmdCtl.failed("取不到当前人设，无法按人设设置")
+            current = await overrides.get_preset(preset_id) or ScheduleOverride()
+            await overrides.set_preset(preset_id, current.model_copy(update={key: value}))
+            invalidate_settings_cache()
+            return CmdCtl.success(f"已为人设 {preset_id} 设置 {field} = {value}")
+
+        current = await overrides.get_channel(chat_key) or ScheduleOverride()
+        await overrides.set_channel(chat_key, current.model_copy(update={key: value}))
+        invalidate_settings_cache(chat_key)
+        return CmdCtl.success(f"已为本频道设置 {field} = {value}")
+
+    @sleep_group.command(
+        name="unset",
+        description="清除作息覆盖",
+        usage="/sleep unset [scope=channel|preset]",
+        permission=CommandPermission.SUPER_USER,
+    )
+    async def sleep_unset_command(
+        context: CommandExecutionContext,
+        scope: str = Arg("作用范围", default="channel", choices=["channel", "preset"]),
+    ):
+        chat_key = context.chat_key
+        overrides = _get_overrides()
+        if scope == "preset":
+            preset_id = (await _channel_and_preset(chat_key))[1]
+            if preset_id is None:
+                return CmdCtl.failed("取不到当前人设")
+            await overrides.set_preset(preset_id, ScheduleOverride())
+            invalidate_settings_cache()
+            return CmdCtl.success(f"已清除人设 {preset_id} 的作息覆盖")
+
+        await overrides.set_channel(chat_key, ScheduleOverride())
+        invalidate_settings_cache(chat_key)
+        return CmdCtl.success("已清除本频道的作息覆盖")
+
+    _SUBCOMMANDS = {
+        "status": "sleep_status_command",
+        "now": "sleep_now_command",
+        "wake": "sleep_wake_command",
+        "skip": "sleep_skip_command",
+        "set": "sleep_set_command",
+        "unset": "sleep_unset_command",
+    }
+
+    @plugin.mount_command(
+        name="sleep",
+        description="自动睡眠（等价于 /sleep.<子命令>）",
+        permission=CommandPermission.SUPER_USER,
+        usage="/sleep status | now | wake | skip | set <字段> <值> [scope] | unset [scope]",
+    )
+    async def sleep_dispatch_command(
+        context: CommandExecutionContext,
+        action: str = Arg("子命令", positional=True, default="status"),
+        first: str = Arg("子命令的第一个参数", positional=True, default=""),
+        second: str = Arg("子命令的第二个参数", positional=True, default=""),
+        third: str = Arg("子命令的第三个参数", positional=True, default=""),
+    ):
+        """Accept the spacing people actually type.
+
+        The host splits a command line at the first space only
+        (``adapters/interface/base.py:447``), so a group registered as
+        ``sleep.status`` is reachable only as ``/sleep.status``: typing
+        ``/sleep status`` resolves the command name "sleep", finds nothing and
+        answers with silence. This forwards the spaced form to the same
+        handlers.
+        """
+        name = (action or "status").strip().lstrip(".")
+        handler_name = _SUBCOMMANDS.get(name)
+        if handler_name is None:
+            return CmdCtl.failed(f"未知子命令 {name!r}，可用：{'、'.join(_SUBCOMMANDS)}")
+
+        handler = globals()[handler_name]
+        args = [a for a in (first, second, third) if a]
+        try:
+            return await handler(context, *args)
+        except TypeError as exc:
+            logger.warning("Bad arguments for /sleep %s: %s", name, exc)
+            return CmdCtl.failed(f"/sleep {name} 的参数不对：{exc}")

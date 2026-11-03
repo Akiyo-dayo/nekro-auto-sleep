@@ -14,12 +14,19 @@ from typing import Any, Protocol
 
 from pydantic import ValidationError
 
-from .models import READABLE_SCHEMA_VERSION, SCHEMA_VERSION, ChatSleepState
+from .models import (
+    READABLE_SCHEMA_VERSION,
+    SCHEMA_VERSION,
+    ChatSleepState,
+    ScheduleOverride,
+)
 
 logger = logging.getLogger("nekro_auto_sleep.persistence")
 
 DATA_KEY = "state.v1"
 CHAT_KEYS_INDEX_KEY = "chat_keys.v1"
+CHANNEL_OVERRIDE_KEY = "schedule_override.v1"
+PRESET_OVERRIDE_PREFIX = "preset_schedule.v1."
 
 
 class StateProtectedError(RuntimeError):
@@ -71,6 +78,60 @@ class StoreBackend(Protocol):
     async def delete(
         self, chat_key: str = "", user_key: str = "", store_key: str = ""
     ) -> int: ...
+
+
+class ScheduleOverrideStore:
+    """Per-channel and per-preset schedule overrides.
+
+    Kept apart from the nightly state on purpose: overrides outlive cycles, and
+    losing one because a night's state failed to validate would silently move a
+    channel back to the global bedtime.
+    """
+
+    def __init__(self, backend: StoreBackend) -> None:
+        self._backend = backend
+
+    @staticmethod
+    def _preset_key(preset_id: object) -> str:
+        return f"{PRESET_OVERRIDE_PREFIX}{preset_id}"
+
+    async def _load(self, chat_key: str, store_key: str) -> ScheduleOverride | None:
+        raw = await self._backend.get(chat_key=chat_key, store_key=store_key)
+        if not raw:
+            return None
+        try:
+            return ScheduleOverride.model_validate_json(raw)
+        except Exception as exc:  # noqa: BLE001 - a bad override is not fatal
+            logger.error(
+                "Corrupted schedule override at %s/%s: %s", chat_key, store_key, exc
+            )
+            return None
+
+    async def _save(
+        self, chat_key: str, store_key: str, override: ScheduleOverride
+    ) -> None:
+        if override.is_empty():
+            await self._backend.delete(chat_key=chat_key, store_key=store_key)
+            return
+        await self._backend.set(
+            chat_key=chat_key, store_key=store_key, value=override.model_dump_json()
+        )
+
+    async def get_channel(self, chat_key: str) -> ScheduleOverride | None:
+        return await self._load(chat_key, CHANNEL_OVERRIDE_KEY)
+
+    async def set_channel(self, chat_key: str, override: ScheduleOverride) -> None:
+        await self._save(chat_key, CHANNEL_OVERRIDE_KEY, override)
+
+    async def get_preset(self, preset_id: object) -> ScheduleOverride | None:
+        if preset_id is None:
+            return None
+        return await self._load("", self._preset_key(preset_id))
+
+    async def set_preset(self, preset_id: object, override: ScheduleOverride) -> None:
+        if preset_id is None:
+            return
+        await self._save("", self._preset_key(preset_id), override)
 
 
 class SleepStateStore:

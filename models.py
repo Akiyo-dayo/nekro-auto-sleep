@@ -156,6 +156,34 @@ class PendingWakeOffer(BaseModel):
         return v
 
 
+class ScheduleOverride(BaseModel):
+    """A partial schedule that shadows the configured one.
+
+    Every field is optional: an override says only what it wants to change, so a
+    channel can move its bedtime without also pinning its timezone.
+    """
+
+    timezone: str | None = None
+    sleep_time: str | None = None
+    wake_time_start: str | None = None
+    wake_time_end: str | None = None
+
+    def is_empty(self) -> bool:
+        return not any(
+            (self.timezone, self.sleep_time, self.wake_time_start, self.wake_time_end)
+        )
+
+
+class ResolvedSchedule(BaseModel):
+    """The schedule actually in force for one chat, plus where it came from."""
+
+    timezone: str
+    sleep_time: str
+    wake_time_start: str
+    wake_time_end: str
+    sources: dict[str, str] = Field(default_factory=dict)
+
+
 class ChatSleepState(BaseModel):
     """Top-level persisted state for one chat_key.
 

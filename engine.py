@@ -89,8 +89,14 @@ def create_sleep_cycle(
     chat_key: str,
     sleep_date_local: str,
     config_snapshot: ConfigSnapshot,
+    sleep_at_override: datetime | None = None,
 ) -> SleepCycle:
-    """Create a new SleepCycle with pre-computed random wake time."""
+    """Create a new SleepCycle with pre-computed random wake time.
+
+    ``sleep_at_override`` lets ``/sleep now`` start the night at the current
+    instant instead of the configured bedtime, while the cycle still knows the
+    schedule it belongs to.
+    """
     from datetime import date as date_type
 
     sd = date_type.fromisoformat(sleep_date_local)
@@ -103,6 +109,8 @@ def create_sleep_cycle(
         config_snapshot.wake_time_start,
         config_snapshot.wake_time_end,
     )
+    if sleep_at_override is not None:
+        sleep_at = sleep_at_override
 
     planned_wake = pick_wake_time(
         chat_key,
@@ -166,17 +174,22 @@ def transition_to_sleep(
     now_utc: datetime,
     config_snapshot: ConfigSnapshot,
     sleep_date_local: str | None = None,
+    sleep_at_override: datetime | None = None,
 ) -> ChatSleepState:
     """AWAKE -> ASLEEP: create a cycle and open a segment at ``now_utc``.
 
     ``sleep_date_local`` lets delayed compensation retain the date that owns a
     cross-midnight sleep window instead of incorrectly creating tonight's cycle.
+    ``sleep_at_override`` starts the night now (``/sleep now``) rather than at
+    the configured bedtime.
     """
     if sleep_date_local is None:
         tz = ZoneInfo(config_snapshot.timezone)
         sleep_date_local = now_utc.astimezone(tz).date().isoformat()
 
-    cycle = create_sleep_cycle(state.chat_key, sleep_date_local, config_snapshot)
+    cycle = create_sleep_cycle(
+        state.chat_key, sleep_date_local, config_snapshot, sleep_at_override
+    )
     state = state.model_copy(
         update={
             "status": SleepStatus.ASLEEP,
