@@ -187,6 +187,9 @@ def transition_to_sleep(
             "offers_sent_tonight": 0,
             "last_offer_at": None,
             "idle_sleep_deadline": None,
+            # A new night: nobody has woken the bot in *this* cycle yet.
+            "woken_at": None,
+            "woken_by": None,
         }
     )
     state = open_sleep_segment(state, now_utc)
@@ -207,6 +210,11 @@ def transition_to_awake_early(
             "status": SleepStatus.AWAKE_EARLY,
             "pending_wake_offers": {},
             "idle_sleep_deadline": deadline,
+            # Remembered so messages from this person keep the bot up without
+            # them having to @ it on every line, while the rest of the group
+            # cannot push the deadline forward all night.
+            "woken_at": now_utc,
+            "woken_by": user_id,
         }
     )
     return state
@@ -227,6 +235,8 @@ def transition_to_awake(
             "status": SleepStatus.AWAKE,
             "idle_sleep_deadline": None,
             "pending_wake_offers": {},
+            "woken_at": None,
+            "woken_by": None,
         }
     )
     return state
@@ -241,6 +251,8 @@ def transition_resume_sleep(
         update={
             "status": SleepStatus.ASLEEP,
             "idle_sleep_deadline": None,
+            "woken_at": None,
+            "woken_by": None,
         }
     )
     state = open_sleep_segment(state, now_utc)

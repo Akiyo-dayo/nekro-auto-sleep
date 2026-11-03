@@ -1305,7 +1305,17 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage, *_args: Any, **_k
                 _sleep_date = state.cycle.sleep_date
 
         if state.status == SleepStatus.AWAKE_EARLY:
-            state = refresh_idle_deadline(state, now_utc)
+            # "Still needed" means somebody is talking *to it*: a message aimed
+            # at the bot, or anything from the person who woke it — they are by
+            # definition mid-conversation and should not have to @ it every
+            # line. Refreshing on every message in the room instead meant a
+            # group chatting among itself at 2am pushed the deadline forward
+            # forever: woken at 23:01 and still up three hours later.
+            engaged = _is_valid_call(message, persona_name, cfg) or (
+                state.woken_by is not None and user_id == state.woken_by
+            )
+            if engaged:
+                state = refresh_idle_deadline(state, now_utc)
             _result_signal = MsgSignal.CONTINUE
             return state
 
