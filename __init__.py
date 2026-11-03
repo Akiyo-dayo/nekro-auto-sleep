@@ -174,7 +174,15 @@ plugin = NekroPlugin(
     version="1.2.5",
     author="Akiyo_dayo",
     url="https://github.com/Akiyo-dayo/NekroAgent_ByAkiyo",
-    allow_sleep=True,
+    # Never dormant, on purpose. With ``allow_sleep=True`` the host puts a
+    # plugin to sleep after a few rounds (``services/plugin/prompt_activation.py``
+    # ``is_sleep_effective`` / ``is_sleeping``), and a sleeping plugin discloses
+    # no methods at all — including ``get_sleep_report``, which must stay
+    # reachable at any hour. Disclosing methods by context is done below with
+    # ``collect_available_methods`` instead, which costs the same tokens and
+    # keeps the report available.
+    allow_sleep=False,
+    sleep_brief="让 Bot 按作息入睡与起床；被提前叫醒后可用 resume_sleep 睡回去，随时可查睡眠报告。",
     i18n_name=i18n.i18n_text(
         zh_CN="自动睡眠",
         en_US="Auto Sleep",
@@ -188,6 +196,25 @@ plugin = NekroPlugin(
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+
+
+def _mount_collect_methods():
+    """``plugin.mount_collect_methods()`` when the host has it, else a no-op.
+
+    Verified present in the audited host at ``services/plugin/base.py:980``
+    (``mount_collect_methods``), with ``collect_available_methods`` honoured by
+    ``base.py:947``. Older hosts and the test doubles predate it; without the
+    hook every sandbox method is exposed all the time, which is exactly the
+    1.2.5 behaviour, so falling back is safe rather than degraded.
+    """
+    mount = getattr(plugin, "mount_collect_methods", None)
+    if callable(mount):
+        return mount()
+
+    def decorator(func):
+        return func
+
+    return decorator
 
 
 @plugin.mount_config()
@@ -1437,8 +1464,15 @@ async def inject_sleep_status(ctx: AgentCtx, *_args: Any, **_kwargs: Any) -> str
 
 
 # ---------------------------------------------------------------------------
-# Sandbox method: resume_sleep
+# Sandbox methods
 # ---------------------------------------------------------------------------
+#
+# Both functions are named exactly what the model calls. The host derives the
+# sandbox name from ``func.__name__`` (verified: ``services/plugin/base.py``
+# renders ``method.func.__name__`` in the prompt and ``services/sandbox/
+# ext_caller.py`` registers the container proxy by it), so the old
+# ``*_tool`` suffix leaked into the prompt and the model had to call
+# ``resume_sleep_tool()`` — a name nothing else in the docs mentioned.
 
 
 @plugin.mount_sandbox_method(
@@ -1446,11 +1480,20 @@ async def inject_sleep_status(ctx: AgentCtx, *_args: Any, **_kwargs: Any) -> str
     "resume_sleep",
     "主动重新进入睡眠（仅在被提前叫醒后、计划起床前可用）",
 )
-async def resume_sleep_tool(*call_args: Any, **call_kwargs: Any) -> str:
-    """Transition this chat from AWAKE_EARLY back to ASLEEP before planned wake.
+async def resume_sleep(*call_args: Any, **call_kwargs: Any) -> str:
+    """回去继续睡（仅在被提前叫醒之后、计划起床时间之前可用）
 
-    The host normally passes ctx positionally; pulling it from either args or
-    kwargs keeps the tool resilient to sandbox call-shape changes.
+    这是唯一能让你重新睡下的方式：只在回复里说「我去睡了」不会改变任何状态，
+    对方下一句话你依然是醒着的。
+
+    Returns:
+        str: 执行结果说明
+
+    Example:
+        ```python
+        # 对方说「你去睡吧」「不用管我了」「晚安」
+        resume_sleep()
+        ```
     """
     if not _is_plugin_active():
         raise RuntimeError("自动睡眠插件当前未启用，无法执行重新入睡操作")
@@ -1484,7 +1527,7 @@ async def resume_sleep_tool(*call_args: Any, **call_kwargs: Any) -> str:
         logger.info("Cannot resume sleep for %s: %s", chat_key, exc)
         return f"无法重新入睡：{exc}"
     except Exception as exc:
-        logger.error("Error in resume_sleep_tool for %s: %s", chat_key, exc)
+        logger.error("Error in resume_sleep for %s: %s", chat_key, exc)
         return f"重新入睡失败：{exc}"
 
     return result_text
@@ -1500,8 +1543,18 @@ async def resume_sleep_tool(*call_args: Any, **call_kwargs: Any) -> str:
     "get_sleep_report",
     "查询本会话当前的睡眠状态与最近的睡眠质量记录（近7天）",
 )
-async def get_sleep_report_tool(*call_args: Any, **call_kwargs: Any) -> str:
-    """Report the chat's current sleep status and recent quality history."""
+async def get_sleep_report(*call_args: Any, **call_kwargs: Any) -> str:
+    """查询本会话当前的睡眠状态与最近的睡眠质量记录（近 7 天）
+
+    Returns:
+        str: 当前状态与最近几天的睡眠质量
+
+    Example:
+        ```python
+        # 对方问「你昨晚睡得好吗」
+        get_sleep_report()
+        ```
+    """
     if not _is_plugin_active():
         raise RuntimeError("自动睡眠插件当前未启用，无法查询睡眠报告")
     _ctx: AgentCtx = call_args[0] if call_args else call_kwargs.get("ctx")
@@ -1539,6 +1592,44 @@ async def get_sleep_report_tool(*call_args: Any, **call_kwargs: Any) -> str:
         tier_name, _, _ = quality_tier(q)
         lines.append(f"- {date_str}：{q}%（{tier_name}）")
     return "\n".join(lines)
+
+
+@_mount_collect_methods()
+async def collect_available_methods(_ctx: AgentCtx) -> list:
+    """Disclose only what is meaningful right now.
+
+    ``get_sleep_report`` is always safe to offer. ``resume_sleep`` only means
+    something while the bot is up before its alarm; registered unconditionally
+    it sat in every prompt around the clock and the model could call it at three
+    in the afternoon only to get a ValueError back.
+
+    The host drops the whole block when a resident plugin discloses no methods
+    (``services/plugin/prompt_activation.py``), so returning an empty list hides
+    the plugin's methods without hiding the plugin.
+    """
+    if not _is_plugin_active() or _store is None:
+        return []
+
+    available: list = [get_sleep_report]
+
+    chat_key = getattr(_ctx, "chat_key", None)
+    if not chat_key:
+        return available
+
+    state = _store.get_cached(chat_key)
+    if state is None or state.status != SleepStatus.AWAKE_EARLY:
+        return available
+    if state.cycle is not None and datetime.now(ZoneInfo("UTC")) >= state.cycle.planned_wake_at:
+        return available
+    available.append(resume_sleep)
+    return available
+
+
+# Backwards-compatible module-level names. The sandbox name the model sees comes
+# from ``func.__name__``, so these are plain aliases, not wrappers: same object,
+# same behaviour, old name still importable for docs and external scripts.
+resume_sleep_tool = resume_sleep
+get_sleep_report_tool = get_sleep_report
 
 
 # ---------------------------------------------------------------------------
