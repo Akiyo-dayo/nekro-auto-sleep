@@ -106,6 +106,45 @@ class TestHostLogBridge:
         logging.getLogger("nekro_auto_sleep").info("tick2")
         assert recorder.lines == []
 
+    async def test_start_up_logs_reach_the_host(self, wired, monkeypatch):
+        """The bridge is up before the store prewarms and the install dir is checked.
+
+        1.3.0 installed it after ``initialize``: every "v2 row migrated" INFO
+        from prewarming was emitted with no handler attached, so a real install
+        could not tell whether the migration ran.
+        """
+        plugin_mod, recorder = wired
+
+        async def _noop(*args, **kwargs):
+            return None
+
+        class _PrewarmingStore:
+            def __init__(self, backend) -> None:
+                pass
+
+            async def initialize(self, discover_legacy_chat_keys=None) -> None:
+                logging.getLogger("nekro_auto_sleep.persistence").info("prewarmed")
+
+            def clear_all(self) -> None:
+                pass
+
+        def _check_dir() -> None:
+            logging.getLogger("nekro_auto_sleep").error("install dir checked")
+
+        monkeypatch.setattr(plugin_mod, "_install_wraps", lambda: True)
+        monkeypatch.setattr(plugin_mod, "_maintenance_loop", _noop)
+        monkeypatch.setattr(plugin_mod, "_check_install_dir_name", _check_dir)
+        monkeypatch.setattr(plugin_mod, "SleepStateStore", _PrewarmingStore)
+        monkeypatch.setattr(plugin_mod, "_discover_legacy_chat_keys", _noop)
+        monkeypatch.setattr(plugin_mod, "_store", None)
+
+        await plugin_mod._start_runtime()
+        try:
+            assert ("error", "install dir checked") in recorder.lines
+            assert ("info", "prewarmed") in recorder.lines
+        finally:
+            await plugin_mod._stop_runtime()
+
     def test_existing_log_text_is_unchanged(self, wired):
         """The bridge forwards, it does not rewrite: the message text is verbatim."""
         plugin_mod, recorder = wired

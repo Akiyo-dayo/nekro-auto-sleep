@@ -252,7 +252,7 @@ plugin = NekroPlugin(
     name="自动睡眠",
     module_name="nekro_auto_sleep",
     description="为每个会话提供独立的拟人化睡眠周期：叫醒协议、睡眠质量评分、梦境播报与连续打卡",
-    version="1.3.0",
+    version="1.3.1",
     author="Akiyo_dayo",
     url="https://github.com/Akiyo-dayo/nekro-auto-sleep",
     # Never dormant, on purpose. With ``allow_sleep=True`` the host puts a
@@ -2233,13 +2233,15 @@ async def _start_runtime() -> None:
     """Start plugin runtime components idempotently."""
     global _store, _maintenance_task, _is_runtime_active
 
+    # First, so the install-dir check and the prewarm below (which migrates v2
+    # rows and protects unreadable ones) are visible in the host log.
+    _install_log_bridge()
+
     _check_install_dir_name()
 
     if _store is None:
         _store = SleepStateStore(plugin.store)
         await _store.initialize(_discover_legacy_chat_keys)
-
-    _install_log_bridge()
 
     if not _install_wraps():
         logger.error("Some runtime wraps failed to install; plugin may not fully function")
