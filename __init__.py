@@ -94,6 +94,74 @@ from .schedule import (
 
 logger = logging.getLogger("nekro_auto_sleep")
 
+
+class _HostLogBridge(logging.Handler):
+    """Forward stdlib records from the plugin into the host logger.
+
+    The domain layer logs through stdlib ``logging`` so it stays host-free, while
+    the host logs through loguru and never bridged the two. Without this, every
+    INFO the plugin emitted at runtime went nowhere.
+    """
+
+    _METHODS = {"debug", "info", "warning", "error", "critical"}
+
+    def __init__(self, host_logger: Any) -> None:
+        super().__init__()
+        self._host = host_logger
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            level = record.levelname.lower()
+            if level not in self._METHODS:
+                level = "info"
+
+            # Everything goes through stdlib, including the wiring layer, so
+            # `%s` placeholders are interpolated here by `getMessage()`. Handing
+            # the raw template to loguru instead would print it literally: it
+            # formats with `{}`, not `%`.
+            target = self._host
+            opt = getattr(target, "opt", None)
+            if callable(opt):
+                try:
+                    candidate = opt(depth=6)
+                    if hasattr(candidate, level):
+                        target = candidate
+                except Exception:
+                    pass
+
+            emit = getattr(target, level, None)
+            if emit is not None:
+                emit(record.getMessage())
+        except Exception:  # pragma: no cover - logging must never raise
+            pass
+
+
+_log_bridge: logging.Handler | None = None
+
+
+def _install_log_bridge() -> None:
+    """Route this package into the host log, once (idempotent)."""
+    global _log_bridge
+
+    host_logger = getattr(plugin, "logger", None)
+    if host_logger is None:
+        return
+    if _log_bridge is not None:
+        return
+    _log_bridge = _HostLogBridge(host_logger)
+    logger.addHandler(_log_bridge)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+
+def _remove_log_bridge() -> None:
+    """Detach the host log bridge, if one is installed (idempotent)."""
+    global _log_bridge
+
+    if _log_bridge is not None:
+        logger.removeHandler(_log_bridge)
+        _log_bridge = None
+
 # ---------------------------------------------------------------------------
 # Plugin instance
 # ---------------------------------------------------------------------------
@@ -1779,6 +1847,8 @@ async def _start_runtime() -> None:
         _store = SleepStateStore(plugin.store)
         await _store.initialize(_discover_legacy_chat_keys)
 
+    _install_log_bridge()
+
     if not _install_wraps():
         logger.error("Some runtime wraps failed to install; plugin may not fully function")
 
@@ -1808,6 +1878,7 @@ async def _stop_runtime() -> None:
             logger.warning("Maintenance task stopped with an error: %s", exc)
 
     _uninstall_wraps()
+    _remove_log_bridge()
     lease_ledger.clear()
     chat_key_locks.clear()
     _wake_inject_cache.clear()
