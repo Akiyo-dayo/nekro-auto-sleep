@@ -450,6 +450,14 @@ _persona_cache: dict[str, tuple[float, str]] = {}
 _SETTINGS_CACHE_TTL_SECONDS = 300.0
 _settings_cache: dict[str, tuple[float, "ChatSettings"]] = {}
 
+# Accounts belonging to this deployment's own bots. Two instances sharing a
+# group see each other's messages as ordinary inbound traffic, and the wake-up
+# prompt contains the persona name — which is a wake keyword. Left unguarded,
+# one bot's 【X已经睡了 要叫醒X吗？】 is a valid call to the other, and they
+# answer each other until the wake protocol gives up.
+_OWN_ACCOUNTS_TTL_SECONDS = 300.0
+_own_accounts_cache: tuple[float, frozenset[str]] | None = None
+
 
 @dataclass(frozen=True)
 class ChatSettings:
@@ -550,6 +558,52 @@ async def _settings_for(chat_key: str) -> ChatSettings:
 def _cfg(settings: ChatSettings) -> Any:
     """Read one config field for a channel, without repeating ``.config``."""
     return settings.config
+
+
+async def _own_account_ids() -> frozenset[str]:
+    """Platform account ids of every adapter instance in this deployment.
+
+    ``DBAdapterInstance.provider_account_id`` is the only place the host records
+    which platform account a bot instance speaks as (verified against
+    ``nekro_agent/models/db_adapter_instance.py``). Any failure — model missing,
+    query error, unknown host — means "we know of no own bots", i.e. exactly the
+    1.2.5 behaviour.
+    """
+    global _own_accounts_cache
+
+    cached = _own_accounts_cache
+    if cached is not None and (time.monotonic() - cached[0]) < _OWN_ACCOUNTS_TTL_SECONDS:
+        return cached[1]
+
+    accounts: set[str] = set()
+    try:
+        from nekro_agent.models.db_adapter_instance import DBAdapterInstance
+
+        rows = await DBAdapterInstance.all().values("provider_account_id")
+        accounts = {
+            str(row["provider_account_id"])
+            for row in rows
+            if isinstance(row, dict) and row.get("provider_account_id")
+        }
+    except Exception as exc:  # noqa: BLE001 - host shapes vary by fork
+        logger.debug("Cannot enumerate own bot accounts: %s", exc)
+
+    result = frozenset(accounts)
+    _own_accounts_cache = (time.monotonic(), result)
+    return result
+
+
+def invalidate_own_accounts_cache() -> None:
+    global _own_accounts_cache
+    _own_accounts_cache = None
+
+
+async def _is_own_bot(message: ChatMessage) -> bool:
+    """Whether this message was sent by one of this deployment's bot accounts."""
+    sender = _get_user_id(message)
+    if not sender or sender == "unknown":
+        return False
+    return sender in await _own_account_ids()
 
 
 def _plugin_host_enabled() -> bool:
@@ -1035,11 +1089,29 @@ async def on_user_message(ctx: AgentCtx, message: ChatMessage, *_args: Any, **_k
     settings = await _settings_for(chat_key)
     cfg = settings.config
     tz = ZoneInfo(cfg.TIMEZONE)
+    from_own_bot = await _is_own_bot(message)
 
     async def _process(state: ChatSleepState) -> ChatSleepState:
         nonlocal _result_signal, _result_action, _went_to_sleep, _sleep_date, _last_seen_at
         state.last_seen_at = now_utc
         _last_seen_at = now_utc
+
+        if from_own_bot:
+            # Another instance of ours talking in a shared group. Record that the
+            # channel was active, but never let it call, answer, or keep the bot
+            # awake: one bot's wake prompt contains the other's name, which is a
+            # wake keyword, so unguarded they wake each other in a loop.
+            logger.debug("Ignoring own-bot message in %s", chat_key)
+            if state.status == SleepStatus.AWAKE:
+                _result_signal = MsgSignal.CONTINUE
+            elif state.status == SleepStatus.AWAKE_EARLY:
+                # Not aimed at this bot by definition; no idle refresh either.
+                _result_signal = MsgSignal.CONTINUE
+            elif cfg.HISTORY_MODE == "strict":
+                _result_signal = MsgSignal.BLOCK_ALL
+            else:
+                _result_signal = MsgSignal.BLOCK_TRIGGER
+            return state
 
         if state.status == SleepStatus.AWAKE:
             state = _compensate_sleep_if_due(
@@ -1741,6 +1813,7 @@ async def _stop_runtime() -> None:
     _wake_inject_cache.clear()
     _persona_cache.clear()
     invalidate_settings_cache()
+    invalidate_own_accounts_cache()
 
     if _store is not None:
         _store.clear_all()
