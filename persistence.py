@@ -315,6 +315,20 @@ class SleepStateStore:
         if state.schema_version != SCHEMA_VERSION:
             state = state.model_copy(update={"schema_version": SCHEMA_VERSION})
 
+        # The row key is the truth, not the chat_key stored inside the payload.
+        # The host renames chat_keys (NekroAgent forks with multi-instance
+        # adapters rewrite `onebot_v11-group_X` to `onebot_v11-<inst>-group_X`
+        # and move `plugin_data.target_chat_key` along) without touching the
+        # JSON. Keeping the stale inner key made ``save()`` write to the old
+        # row while the cache for the new key stayed AWAKE forever.
+        if state.chat_key != chat_key:
+            logger.warning(
+                "chat_key=%s 的睡眠状态里记的是旧标识 %s（宿主改过会话标识），已按当前标识读取",
+                chat_key,
+                state.chat_key,
+            )
+            state = state.model_copy(update={"chat_key": chat_key})
+
         self._cache[chat_key] = state
         await self._remember_chat_key(chat_key)
         return state
@@ -375,6 +389,9 @@ class SleepStateStore:
             new_state = await fn(state)
             if chat_key in self._protected:
                 return new_state
+            # Never let a state built elsewhere redirect the write to another row.
+            if new_state.chat_key != chat_key:
+                new_state = new_state.model_copy(update={"chat_key": chat_key})
             self._cache[chat_key] = new_state
             if new_state != old_state:
                 await self.save(new_state)
