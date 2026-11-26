@@ -363,12 +363,161 @@ def set_own_bot_accounts(accounts: Any) -> None:
 
 
 class _ChatMessageRow:
-    def __init__(self, send_timestamp: int) -> None:
+    """One row of the fake ``DBChatMessage`` table."""
+
+    def __init__(
+        self,
+        chat_key: str = "",
+        sender_id: str = "",
+        sender_name: str = "",
+        content_text: str = "",
+        send_timestamp: int = 0,
+        **kwargs: Any,
+    ) -> None:
+        self.chat_key = chat_key
+        self.sender_id = sender_id
+        self.sender_name = sender_name
+        self.content_text = content_text
         self.send_timestamp = send_timestamp
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
+def _chat_message_match(row: Any, field: str, op: str, expected: Any) -> bool:
+    actual = getattr(row, field, None)
+    if op == "":
+        return actual == expected
+    if op == "gte":
+        return actual is not None and actual >= expected
+    if op == "lte":
+        return actual is not None and actual <= expected
+    if op == "startswith":
+        return isinstance(actual, str) and actual.startswith(expected)
+    raise AssertionError(f"unsupported filter suffix {op!r}")
+
+
+class _ChatMessageQuery:
+    """A small peewee-ish query over ``DBChatMessage.rows``.
+
+    Filters are captured and only evaluated when a terminal call (``first`` or
+    ``values``) is awaited, so chaining works the way the plugin expects.
+    """
+
+    def __init__(self, rows: list[Any]) -> None:
+        self._rows = list(rows)
+        self._filters: list[tuple[str, str, Any]] = []
+        self._excludes: list[tuple[str, str, Any]] = []
+
+    def _clone(self) -> "_ChatMessageQuery":
+        query = _ChatMessageQuery(self._rows)
+        query._filters = list(self._filters)
+        query._excludes = list(self._excludes)
+        return query
+
+    @staticmethod
+    def _split(keyword: str) -> tuple[str, str]:
+        field, _, op = keyword.partition("__")
+        return field, op
+
+    def filter(self, **kwargs: Any) -> "_ChatMessageQuery":
+        query = self._clone()
+        for keyword, expected in kwargs.items():
+            field, op = self._split(keyword)
+            query._filters.append((field, op, expected))
+        return query
+
+    def exclude(self, **kwargs: Any) -> "_ChatMessageQuery":
+        query = self._clone()
+        for keyword, expected in kwargs.items():
+            field, op = self._split(keyword)
+            query._excludes.append((field, op, expected))
+        return query
+
+    def _matched(self) -> list[Any]:
+        rows = [
+            row
+            for row in self._rows
+            if all(
+                _chat_message_match(row, field, op, expected)
+                for field, op, expected in self._filters
+            )
+            and not any(
+                _chat_message_match(row, field, op, expected)
+                for field, op, expected in self._excludes
+            )
+        ]
+        return rows
+
+    def order_by(self, *fields: str) -> "_ChatMessageQuery":
+        query = self._clone()
+        rows = query._matched()
+        for field in reversed(fields):
+            descending = field.startswith("-")
+            name = field.lstrip("-+")
+            rows.sort(key=lambda row: getattr(row, name, None), reverse=descending)
+        query._rows = rows
+        query._filters = []
+        query._excludes = []
+        return query
+
+    def limit(self, count: int) -> "_ChatMessageQuery":
+        query = self._clone()
+        if count is not None:
+            query._rows = query._rows[:count]
+        query._filters = []
+        query._excludes = []
+        return query
+
+    async def first(self):
+        rows = self._matched()
+        return rows[0] if rows else None
+
+    def values(self, *fields: str):
+        rows = self._matched()
+
+        async def _values() -> list[dict[str, Any]]:
+            return [
+                {field: getattr(row, field, None) for field in fields} for row in rows
+            ]
+
+        return _values()
 
 
 class DBChatMessage(_ModelStub):
-    rows: list[_ChatMessageRow] = []
+    """In-memory chat history the plugin queries for recent goodnights."""
+
+    rows: list[Any] = []
+    filter_calls = 0
+    fail_filters = False
+
+    @classmethod
+    def filter(cls, **kwargs: Any) -> _ChatMessageQuery:
+        cls.filter_calls += 1
+        if cls.fail_filters:
+            raise RuntimeError("db down")
+        query = _ChatMessageQuery(list(cls.rows))
+        return query.filter(**kwargs)
+
+    @classmethod
+    def all(cls) -> _ChatMessageQuery:
+        return _ChatMessageQuery(list(cls.rows))
+
+
+def set_chat_messages(rows: list[Any]) -> None:
+    """Replace the fake chat table (and reset the query counter)."""
+    DBChatMessage.rows = [
+        _ChatMessageRow(**row) if isinstance(row, dict) else row for row in rows
+    ]
+    DBChatMessage.filter_calls = 0
+
+
+def clear_chat_messages() -> None:
+    set_chat_messages([])
+    DBChatMessage.fail_filters = False
+
+
+def fail_chat_message_queries(fail: bool = True) -> None:
+    DBChatMessage.fail_filters = fail
 
 
 class DBPluginData(_ModelStub):
@@ -497,6 +646,7 @@ def _module(name: str, **attrs: Any) -> types.ModuleType:
 
 def install(*, with_commands: bool = True, with_scope: bool = True) -> Callable[[], None]:
     """Register the stub tree; returns a callable that undoes it."""
+    clear_chat_messages()
     saved = {
         name: sys.modules[name]
         for name in list(sys.modules)

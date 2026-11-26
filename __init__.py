@@ -252,7 +252,7 @@ plugin = NekroPlugin(
     name="自动睡眠",
     module_name="nekro_auto_sleep",
     description="为每个会话提供独立的拟人化睡眠周期：叫醒协议、睡眠质量评分、梦境播报与连续打卡",
-    version="1.3.1",
+    version="1.3.2",
     author="Akiyo_dayo",
     url="https://github.com/Akiyo-dayo/nekro-auto-sleep",
     # Never dormant, on purpose. With ``allow_sleep=True`` the host puts a
@@ -591,6 +591,25 @@ class SleepConfig(ConfigBase):
             i18n_description=i18n.i18n_text(
                 zh_CN="入睡时主动说晚安的概率，0-1；每晚以固定随机种子判定，重启不会重复发送",
                 en_US="Chance of saying goodnight when falling asleep, 0-1; decided per night with a fixed seed so restarts never duplicate",
+            ),
+        ).model_dump(),
+    )
+    BEDTIME_CONSTRAINTS: str = Field(
+        default="不要沿用最近几晚晚安的开头、句式和收尾",
+        title="晚安负面约束",
+        description="晚安由 AI 自由发挥，但必须遵守这里的负面约束；填写后插件会把本频道最近几晚的晚安、以及多个频道反复出现的说法一起给 AI 作参考。多条约束用换行、分号或中文分号分隔；留空表示不加约束，也不提供参考",
+        json_schema_extra=ExtraField(
+            is_textarea=True,
+            placeholder="不要沿用最近几晚晚安的开头、句式和收尾",
+            i18n_title=i18n.i18n_text(zh_CN="晚安负面约束", en_US="Bedtime Negative Constraints"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="晚安由 AI 自由发挥，但必须遵守这里的负面约束；"
+                "填写后插件会把本频道最近几晚的晚安、以及多个频道反复出现的说法一起给 AI 作参考。"
+                "多条约束用换行、分号或中文分号分隔；留空表示不加约束，也不提供参考",
+                en_US="Bedtime messages are freely improvised by AI, but must obey these negative constraints; "
+                "when filled in, the plugin also gives the AI this channel's recent goodnights and phrases "
+                "repeated across multiple channels as reference. "
+                "Separate multiple constraints with newlines or semicolons; leave empty for no constraints and no reference",
             ),
         ).model_dump(),
     )
@@ -1012,9 +1031,8 @@ def _parse_confirm_keywords(cfg: Any = None) -> list[str]:
     return [k.strip() for k in raw.replace("\n", ",").split(",") if k.strip()]
 
 
-def _parse_dream_constraints() -> list[str]:
-    """Parse the configurable negative constraints for dream improvisation."""
-    raw = getattr(config, "DREAM_TOPIC_CONSTRAINTS", "")
+def _parse_constraints(raw: str) -> list[str]:
+    """Split a free-form constraint text into individual constraints."""
     if not raw:
         return []
     return [
@@ -1022,6 +1040,11 @@ def _parse_dream_constraints() -> list[str]:
         for c in raw.replace("；", ";").replace("\n", ";").split(";")
         if c.strip()
     ]
+
+
+def _parse_dream_constraints() -> list[str]:
+    """Parse the configurable negative constraints for dream improvisation."""
+    return _parse_constraints(getattr(config, "DREAM_TOPIC_CONSTRAINTS", ""))
 
 
 def _is_mention_bot(message: ChatMessage, persona_name: str) -> bool:
@@ -1272,6 +1295,190 @@ BEDTIME_GREETS: tuple[str, ...] = (
     "晚安！梦里见（如果你们也来梦里的话）。",
 )
 
+# The exact first line of every bedtime prompt. History collection finds past
+# goodnights by this prefix, so it must never change without updating both.
+BEDTIME_PROMPT_HEAD = "【系统提示：时间已到你的就寝时间，你准备入睡休息。】"
+BEDTIME_LOOKBACK_DAYS = 7  # how far back to look for past goodnights
+BEDTIME_LOOKBACK_PROMPTS = 60  # at most this many past bedtime prompts, all channels
+BEDTIME_REPLY_WINDOW_SECONDS = 600  # first bot message this soon after a prompt is its goodnight
+BEDTIME_OWN_EXAMPLES = 3  # this channel's own past goodnights quoted back
+BEDTIME_SHARED_PHRASES = 8  # cross-channel stock phrases listed
+BEDTIME_REF_CACHE_SECONDS = 1800  # one collection serves a whole bedtime wave
+
+_bedtime_ref_cache: tuple[float, list[tuple[str, str]]] | None = None
+
+
+def invalidate_bedtime_ref_cache() -> None:
+    """Drop the cached bedtime reference collection (tests and plugin stop)."""
+    global _bedtime_ref_cache
+    _bedtime_ref_cache = None
+
+
+def _clean_greeting_text(text: str, max_len: int = 80) -> str:
+    """Strip host markers, collapse whitespace and truncate a greeting line."""
+    if not text:
+        return ""
+    cleaned = re.sub(r"\[@id:[^\]]*?@\]", "", text)
+    cleaned = re.sub(r"\[Image:[^\]]*\]", "", cleaned)
+    cleaned = " ".join(cleaned.split())
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len] + "…"
+    return cleaned
+
+
+def _shared_phrases(
+    entries: list[tuple[str, str]],
+    *,
+    min_len: int = 4,
+    max_len: int = 12,
+    min_channels: int = 2,
+    limit: int = BEDTIME_SHARED_PHRASES,
+) -> list[str]:
+    """Phrases that recur across two or more channels, longest form only.
+
+    Only phrases seen in *different* channels qualify: something a single group
+    happens to repeat must not be pushed into every other group's prompt.
+    """
+    if not entries:
+        return []
+
+    # phrase -> set of channels it appeared in
+    channels: dict[str, set[str]] = {}
+    for chat_key, text in entries:
+        clauses = [
+            part
+            for part in re.split(
+                r"[\s，。！？!?,.、~～…—\-：:；;（）()「」『』“”\"'·]+", text
+            )
+            if part
+        ]
+        seen_in_text: set[str] = set()
+        for clause in clauses:
+            n = len(clause)
+            for start in range(n):
+                for length in range(min_len, max_len + 1):
+                    if start + length > n:
+                        break
+                    seen_in_text.add(clause[start : start + length])
+        for phrase in seen_in_text:
+            channels.setdefault(phrase, set()).add(chat_key)
+
+    kept = {p: len(keys) for p, keys in channels.items() if len(keys) >= min_channels}
+    if not kept:
+        return []
+
+    # Drop a phrase whenever a longer kept phrase contains it and is at least
+    # as widely shared; report only the longest common fragment.
+    survivors = [
+        phrase
+        for phrase, count in kept.items()
+        if not any(
+            len(other) > len(phrase)
+            and phrase in other
+            and other_count >= count
+            for other, other_count in kept.items()
+        )
+    ]
+    survivors.sort(key=lambda p: (-kept[p], -len(p), p))
+
+    # A stem shared more widely than its longer forms survives the pass above
+    # alongside them ("不知不觉" next to "不知不觉已经这个时间了"). Report one
+    # member per family: the most widely shared one wins, and anything that
+    # contains it or sits inside it is dropped, so the slots go to different
+    # stock phrases instead of fragments of the same one.
+    picked: list[str] = []
+    for phrase in survivors:
+        if any(phrase in chosen or chosen in phrase for chosen in picked):
+            continue
+        picked.append(phrase)
+        if len(picked) >= limit:
+            break
+    return picked
+
+
+async def _recent_bedtime_greetings(now_ts: int) -> list[tuple[str, str]]:
+    """Recent goodnights as ``(chat_key, cleaned_text)``, newest first.
+
+    A bedtime prompt is a SYSTEM row; the first own-bot message within the reply
+    window after it is what the model actually said. Any query failure means no
+    reference at all — it must never break the greeting itself.
+    """
+    global _bedtime_ref_cache
+
+    cached = _bedtime_ref_cache
+    if cached is not None and (time.monotonic() - cached[0]) < BEDTIME_REF_CACHE_SECONDS:
+        return list(cached[1])
+
+    entries: list[tuple[str, str]] = []
+    try:
+        from nekro_agent.models.db_chat_message import DBChatMessage
+
+        since = now_ts - BEDTIME_LOOKBACK_DAYS * 86400
+        prompts = await (
+            DBChatMessage.filter(
+                sender_id="-1",
+                sender_name="SYSTEM",
+                send_timestamp__gte=since,
+                content_text__startswith=BEDTIME_PROMPT_HEAD,
+            )
+            .order_by("-send_timestamp")
+            .limit(BEDTIME_LOOKBACK_PROMPTS)
+            .values("chat_key", "send_timestamp")
+        )
+        for row in prompts:
+            reply = await (
+                DBChatMessage.filter(
+                    chat_key=row["chat_key"],
+                    sender_id="-1",
+                    send_timestamp__gte=row["send_timestamp"],
+                    send_timestamp__lte=row["send_timestamp"]
+                    + BEDTIME_REPLY_WINDOW_SECONDS,
+                )
+                .exclude(sender_name="SYSTEM")
+                .order_by("send_timestamp")
+                .first()
+            )
+            if reply is None:
+                continue
+            text = _clean_greeting_text(getattr(reply, "content_text", "") or "")
+            if not text:
+                continue
+            entries.append((str(row["chat_key"]), text))
+    except Exception as exc:  # noqa: BLE001 - reference must never break a greeting
+        logger.debug("Cannot collect recent bedtime greetings: %s", exc)
+        return []
+
+    _bedtime_ref_cache = (time.monotonic(), list(entries))
+    return entries
+
+
+def _build_bedtime_prompt(
+    own_recent: list[str], shared: list[str], constraints: list[str]
+) -> str:
+    """Build the bedtime instruction, with optional anti-repetition references."""
+    lines = [
+        BEDTIME_PROMPT_HEAD,
+        "你要去睡了，走之前在频道里说一声。",
+        "要求：",
+        "1. 用符合你口吻的第一人称，语气、口癖、情绪风格契合你的身份性格设定；",
+        "2. 说什么、怎么说完全由你决定：可以接着刚才的话题说最后一句，"
+        "可以顺手提一件今天的具体小事，也可以三言两语就走。"
+        "不必每次都感叹时间、劝大家早睡、说晚安或好梦，每晚的说法都应该不一样；",
+        "3. 简短自然，直接输出你要说的话，不要携带任何系统标记或多余解释。",
+    ]
+    if own_recent or shared or constraints:
+        lines.append("")
+        lines.append("【参考（只用来避开重复，严禁复述或改写其中的文字）】")
+        if own_recent:
+            quoted = "；".join(f"「{text}」" for text in own_recent)
+            lines.append(f"- 你在这个频道最近几晚说过的晚安：{quoted}")
+        if shared:
+            quoted = "、".join(f"「{phrase}」" for phrase in shared)
+            lines.append(f"- 你最近在多个频道反复用过的说法：{quoted}")
+        if constraints:
+            lines.append(f"- 晚安负面约束（必须遵守）：{'；'.join(constraints)}")
+    return "\n".join(lines)
+
 
 def _deterministic_hit(seed: str, chance: float) -> bool:
     """Stable per-seed probability so a given night never flips on restart."""
@@ -1340,15 +1547,16 @@ async def _maybe_send_bedtime(
         return
 
     if cfg.LLM_GREETINGS_ENABLED and hasattr(ctx, "push_system"):
-        prompt = (
-            "【系统提示：时间已到你的就寝时间，你准备入睡休息。】\n"
-            "请用符合你口吻的第一人称，向频道大家道一声晚安并告知你准备睡了。\n"
-            "要求：\n"
-            "1. 说话的语气、口癖、情绪风格要契合你的身份性格设定；\n"
-            "2. 内容与表达方式完全由你自由创作——可以呼应刚才的聊天话题收尾，也可以只是随性道别，"
-            "不要套用任何固定句式或模板；\n"
-            "3. 简短自然，直接输出你要说的话，不要携带任何系统标记或多余解释。"
-        )
+        constraints = _parse_constraints(getattr(cfg, "BEDTIME_CONSTRAINTS", ""))
+        own_recent: list[str] = []
+        shared: list[str] = []
+        if constraints:
+            entries = await _recent_bedtime_greetings(int(time.time()))
+            own_recent = [
+                text for ck, text in entries if ck == chat_key
+            ][:BEDTIME_OWN_EXAMPLES]
+            shared = _shared_phrases(entries)
+        prompt = _build_bedtime_prompt(own_recent, shared, constraints)
         token = current_source.set(SourceType.INTERNAL_WAKE_NOTICE)
         lease_id = f"bedtime:{chat_key}:{sleep_date}"
         lease_ledger.create(
@@ -2280,6 +2488,7 @@ async def _stop_runtime() -> None:
     _persona_cache.clear()
     invalidate_settings_cache()
     invalidate_own_accounts_cache()
+    invalidate_bedtime_ref_cache()
     _overrides = None
 
     if _store is not None:

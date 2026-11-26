@@ -343,6 +343,48 @@ def test_chat_channel_exposes_instance_key_and_preset_id():
     assert "preset_id" in fields
 
 
+def test_chat_message_fields_and_system_sender_convention():
+    """``_recent_bedtime_greetings`` keys the whole lookup on these facts.
+
+    A bedtime prompt is a ``DBChatMessage`` row with ``sender_id="-1"`` and
+    ``sender_name="SYSTEM"``; the bot's own reply is also ``sender_id="-1"`` but
+    carries the persona name. If either half of the convention moves, the
+    collected "recent goodnights" silently become empty instead of wrong, so
+    this pins both.
+    """
+    cls = _class(_parse("nekro_agent/models/db_chat_message.py"), "DBChatMessage")
+    fields = _class_fields(cls)
+    assert {
+        "chat_key",
+        "sender_id",
+        "sender_name",
+        "content_text",
+        "send_timestamp",
+    } <= fields
+
+    tree = _parse("nekro_agent/services/message_service.py")
+    node = _func(tree, "push_system_message")
+    creates = [
+        call
+        for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "create"
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "DBChatMessage"
+    ]
+    assert creates, "push_system_message no longer records a DBChatMessage"
+    assert any(
+        any(
+            kw.arg == "sender_name"
+            and isinstance(kw.value, ast.Constant)
+            and kw.value.value == "SYSTEM"
+            for kw in call.keywords
+        )
+        for call in creates
+    ), "no DBChatMessage.create(..., sender_name=\"SYSTEM\") in push_system_message"
+
+
 # ---------------------------------------------------------------------------
 # Plugin storage
 # ---------------------------------------------------------------------------
